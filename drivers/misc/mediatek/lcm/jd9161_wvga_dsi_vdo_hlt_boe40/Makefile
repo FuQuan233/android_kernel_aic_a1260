@@ -1,0 +1,1 @@
+obj-y += jd9161_wvga_dsi_vdo_hlt_boe40.o

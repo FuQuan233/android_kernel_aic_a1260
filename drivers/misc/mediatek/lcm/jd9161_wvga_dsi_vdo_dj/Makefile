@@ -1,1 +1,0 @@
-obj-y += jd9161_wvga_dsi_vdo_dj.o

@@ -39,8 +39,8 @@ LCM_DRIVER *lcm_driver_list[] = {
     &jd9161_fwvga_dsi_vdo_dj_lcm_drv,
 #endif
 
-#if defined(JD9161_WVGA_DSI_VDO_DJ)
-    &jd9161_wvga_dsi_vdo_dj_lcm_drv,
+#if defined(JD9161_WVGA_DSI_VDO_HLT_BOE40)
+    &jd9161_wvga_dsi_vdo_hlt_boe40_lcm_drv,
 #endif
 
 #if defined(ILI9806E_FWVGA_DSI_VDO_ZGD)
