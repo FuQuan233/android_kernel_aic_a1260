@@ -3,6 +3,9 @@
 #include <asm/setup.h>
 #include <libfdt.h>
 #include "misc.h"
+#ifdef CONFIG_ARM_APPENDED_DTB_INITRD_FROM_BOOTLOADER
+#include "fdt_bootloader_initrd.h"
+#endif
 
 #if defined(CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_EXTEND)
 #define do_extend_cmdline 1
@@ -140,9 +143,14 @@ int atags_to_fdt(void *atag_list, void *fdt, int total_space)
 	if ((u32)atag_list & 0x3)
 		return 1;
 
-	/* if we get a DTB here we're done already */
-	if (*(__be32 *)atag_list == cpu_to_fdt32(FDT_MAGIC))
-	       return 0;
+	/* An appended tree can keep its bindings and still use LK's ramdisk. */
+	if (*(__be32 *)atag_list == cpu_to_fdt32(FDT_MAGIC)) {
+#ifdef CONFIG_ARM_APPENDED_DTB_INITRD_FROM_BOOTLOADER
+		return fdt_copy_bootloader_initrd(atag_list, fdt, total_space);
+#else
+		return 0;
+#endif
+	}
 
 	/* validate the ATAG */
 	if (atag->hdr.tag != ATAG_CORE ||

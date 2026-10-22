@@ -1470,6 +1470,18 @@ config ARM_ATAG_DTB_COMPAT
 	  bootloaders, this option allows zImage to extract the information
 	  from the ATAG list and store it at run time into the appended DTB.
 
+config ARM_APPENDED_DTB_INITRD_FROM_BOOTLOADER
+	bool "Copy bootloader FDT initrd location into the appended DTB"
+	depends on ARM_ATAG_DTB_COMPAT
+	help
+	  Some legacy bootloaders pass an FDT with the ramdisk location while
+	  the kernel uses its own appended DTB for updated hardware bindings.
+	  Copy linux,initrd-start and linux,initrd-end from that bootloader FDT
+	  into the appended tree. Other properties, including the command line
+	  and reserved memory layout, remain under the appended tree's control.
+
+	  Say Y only when the bootloader supplies a separate FDT in r2.
+
 choice
 	prompt "Kernel command line type"
 	depends on ARM_ATAG_DTB_COMPAT

@@ -496,13 +496,13 @@ AOSP projects in that manifest use ``android-17.0.0_r1``. Repo is configured
 with depth 1, current-branch sync, no tags and Git LFS. Shallow history does
 not reduce the size of the checked-out source and prebuilt toolchains.
 
-The branch still contains the official ``lineage_gsi_arm`` product,
-which explicitly enables 32-bit apps and inherits ARM32 GSI configuration.
-It is the initial native build target for init, Bionic, toybox and adbd.
-The device's legacy header-v0 boot format, appended DTB, fixed GPT layout,
-1.5 GiB system partition and unfinished hardware HALs still need device
-integration before a generated GSI can be used as a bootable phone system.
-No Android 17 userspace image has yet been verified on this board.
+The dedicated device product is ``lineage_a1260`` in
+``~/AIC/lineage24/device/aic/a1260``. It defines Cortex-A7 ARM32, legacy
+header-v0 boot packaging, the appended board DTB and the actual fixed GPT
+sizes. Product/system_ext content lives inside system; vendor is built
+separately from source. A first device boot image has compiled; system,
+vendor and Android hardware services are still being brought up. No
+Android framework startup has yet been verified on this board.
 
 ``arch/arm/configs/wt6580_android17.config`` adds VFP/NEON, SELinux,
 cgroup controllers, PSI, loop/device-mapper/verity and EROFS for APEX,
@@ -529,6 +529,39 @@ selinuxfs mount successfully; SELinux reports permissive mode. All four
 ext4 partitions pass the temporary-file read/write SHA256 test. Repeated
 1 MiB eMMC reads agree, and the DRM color-bar modeset completes. These
 checks validate the kernel prerequisites; they do not start Android init.
+
+External Android ramdisk handover
+---------------------------------
+
+LK passes its own FDT in r2, including ``linux,initrd-start`` and
+``linux,initrd-end``. Using an appended DTB previously discarded those
+values. Merely enabling ATAG compatibility does not copy them from an
+incoming FDT. The stock runtime tree records the ramdisk at ``0x84000000``.
+
+``CONFIG_ARM_APPENDED_DTB_INITRD_FROM_BOOTLOADER`` is an opt-in ARM
+compressed-boot option, depending on ATAG/appended-DTB compatibility. It
+copies only the two initrd properties into the appended tree. Both 32-bit
+and 64-bit encodings are supported; missing, incomplete and inverted
+ranges are handled explicitly. The board's command line, memory map and
+reserved regions stay in the appended tree. This avoids importing the
+legacy kernel's ``androidboot.hardware=mt6580`` and ``vmalloc=496M``.
+
+The A1260 device product enables the option and builds an external Android
+first-stage ramdisk without the diagnostic built-in initramfs. Hardware
+probe build #6 retains diagnostic PID 1 while proving the handover: a file
+present only in the external archive is readable after boot, and the two
+initrd properties appear in the live tree. A statically linked Android 17
+Bionic/toybox binary also executes successfully, including floating-point
+``seq`` output. Android framework startup is not covered by these probes.
+
+The host regression test exercises 32/64-bit addresses, malformed metadata,
+insufficient FDT space and preservation of command line/reserved memory::
+
+  cc -std=c11 -D_DEFAULT_SOURCE -O1 -g -fsanitize=address,undefined \
+    -fno-omit-frame-pointer -I scripts/dtc/libfdt \
+    -I arch/arm/boot/compressed tools/wt6580/test_bootloader_initrd.c \
+    scripts/dtc/libfdt/fdt*.c -o /tmp/test_bootloader_initrd
+  /tmp/test_bootloader_initrd
 
 References
 ----------
