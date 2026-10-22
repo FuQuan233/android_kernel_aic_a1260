@@ -1,0 +1,583 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Copyright © 2026 Google.
+ *
+ */
+#include <asm/kvm_pkvm.h>
+#include <linux/dmar.h>
+#include <linux/pci.h>
+#include "pkvm/mmu.h"
+#include "pkvm/vmx/ept.h"
+#include "pkvm/memory.h"
+#include "pkvm/pkvm.h"
+#include "pkvm/debug.h"
+#include "../iommu.h"
+#include "../pasid.h"
+
+int pkvm_iommu_iec_flush(u64 phys, int index, int mask, bool global)
+{
+	struct intel_iommu *iommu = iommu_from_phys(phys);
+
+	if (!iommu || !iommu->qi)
+		return -EINVAL;
+
+	if (global) {
+		qi_global_iec(iommu);
+		return 0;
+	}
+
+	return qi_flush_iec(iommu, index, mask);
+}
+
+int pkvm_iommu_clear_ce(struct clear_ce_data *data)
+{
+	struct intel_iommu *iommu = iommu_from_phys(data->phys);
+	struct device_domain_info info = { 0 };
+	struct dmar_domain *domain;
+
+	if (!iommu)
+		return -EINVAL;
+
+	if (data->ats_qdep > PCI_ATS_MAX_QDEP)
+		return -EINVAL;
+
+	info.iommu = iommu;
+	info.bus = data->bus;
+	info.devfn = data->devfn;
+	info.ats_qdep = data->ats_qdep;
+
+	pkvm_dbg("%s: dev[%x:%x], ats_qdep: %d\n",
+		 __func__, data->bus, data->devfn, data->ats_qdep);
+	domain_context_clear_one(&info, data->bus, data->devfn, &domain);
+	if (domain)
+		pkvm_put_iommu_domain(domain);
+
+	return 0;
+}
+
+static int accept_page_donation(struct intel_iommu *iommu, u64 *donation_page_gpa)
+{
+	pkvm_spin_lock(&iommu->lock);
+	if (*donation_page_gpa && !iommu->donation_page) {
+		u64 donation_page_pa = pkvm_host_gpa_to_phys(*donation_page_gpa);
+
+		int ret = pkvm_host_donate_hyp_share_ro(donation_page_pa,
+							VTD_PAGE_SIZE, true);
+
+		if (ret) {
+			pkvm_spin_unlock(&iommu->lock);
+			pkvm_err("iommu%d: failed to write protect donated page(err=%d)!\n",
+				 iommu->seq_id, ret);
+			return ret;
+		}
+		iommu->donation_page = __pkvm_va(donation_page_pa);
+		*donation_page_gpa = 0ULL;
+	}
+	pkvm_spin_unlock(&iommu->lock);
+
+	return 0;
+}
+
+static int iommu_set_lm_ce(struct set_lm_ce_data *data)
+{
+	struct intel_iommu *iommu = iommu_from_phys(data->phys);
+	u16 bdf = PCI_DEVID(data->bus, data->devfn);
+	struct device_domain_info info = { 0 };
+	struct dmar_domain *domain;
+	void *pgd;
+	int ret;
+
+	if (!iommu)
+		return -EINVAL;
+
+	if (sm_supported(iommu))
+		return -EINVAL;
+
+	if (data->ats_qdep > PCI_ATS_MAX_QDEP)
+		return -EINVAL;
+
+	if (data->ats_supported && !is_dev_in_satc(bdf))
+		return -EPERM;
+
+	info.bus = data->bus;
+	info.devfn = data->devfn;
+	info.iommu = iommu;
+	info.ats_qdep = data->ats_qdep;
+	info.ats_supported = data->ats_supported;
+	info.ats_enabled = info.ats_supported;
+	pkvm_populate_pfsid(&info);
+
+	ret = accept_page_donation(iommu, &data->donation_page_gpa);
+	if (ret)
+		return ret;
+
+	pgd = pkvm_host_gpa_to_virt(data->pgd_gpa);
+	domain = pkvm_get_iommu_domain(pgd, data->did, iommu);
+	if (!domain) {
+		pkvm_err("%s: Failed to locate domain with pgd: %p\n",
+			 __func__, pgd);
+		return -EINVAL;
+	}
+	if (domain->use_first_level) {
+		pkvm_err("%s: Domain has use_first_level set, expected SL\n", __func__);
+		pkvm_put_iommu_domain(domain);
+		return -EINVAL;
+	}
+
+	pkvm_dbg("%s: dev[%x:%x], did: %d, pgd: %p, agaw: %d\n", __func__,
+		 data->bus, data->devfn, data->did, domain->pgd,
+		 domain->agaw);
+	ret = domain_context_mapping_one(domain, iommu, &info, data->did,
+					 data->bus, data->devfn);
+	if (ret) {
+		pkvm_put_iommu_domain(domain);
+		/*
+		 * If entry already exists, the host expects
+		 * the hypercall to succeed.
+		 */
+		if (ret == -EEXIST)
+			ret = 0;
+	}
+
+	return ret;
+}
+
+int pkvm_iommu_set_lm_ce(struct set_lm_ce_data *in, struct set_lm_ce_data *out)
+{
+	int ret = iommu_set_lm_ce(in);
+
+	*out = *in;
+	return ret;
+}
+
+/*
+ * Size of pasid directory in bytes, given the max pasid number
+ * A pasid directory entry can address 64 pasids and a pasid
+ * directory page holds 512 entries, hence one pasid dir page can
+ * address (64 * 512) entries.
+ * So pasid_dir_size = (max_pasid / (64 * 512)) * PAGE_SIZE
+ *                   => = (max_pasid >> 15) << PAGE_SHIFT
+ */
+#define pasid_dir_size(max_pasid) ((max_pasid) >> (15 - PAGE_SHIFT))
+
+static int iommu_set_sm_ce(struct set_sm_ce_data *data)
+{
+	struct intel_iommu *iommu = iommu_from_phys(data->phys);
+	u16 bdf = PCI_DEVID(data->bus, data->devfn);
+	struct device_domain_info info = { 0 };
+	struct pasid_table table = { 0 };
+	struct pkvm_device dev = { .info = &info };
+	int ret;
+
+	if (!iommu)
+		return -EINVAL;
+
+	if (!sm_supported(iommu))
+		return -EINVAL;
+
+	if (data->ats_qdep > PCI_ATS_MAX_QDEP)
+		return -EINVAL;
+
+	if (data->ats_supported && !is_dev_in_satc(bdf))
+		return -EPERM;
+
+	info.bus = data->bus;
+	info.devfn = data->devfn;
+	info.iommu = iommu;
+	info.ats_qdep = data->ats_qdep;
+	info.ats_supported = data->ats_supported;
+	info.ats_enabled = info.ats_supported;
+	pkvm_populate_pfsid(&info);
+	info.pasid_supported = data->pasid_supported;
+	info.pasid_enabled = data->pasid_enabled;
+	table.table = pkvm_host_gpa_to_virt(data->pasid_table_gpa);
+	table.max_pasid = data->max_pasid;
+	info.pasid_table = &table;
+
+	ret = accept_page_donation(iommu, &data->donation_page_gpa);
+	if (ret)
+		return ret;
+
+	ret = pkvm_host_donate_hyp_share_ro(pkvm_host_gpa_to_phys(data->pasid_table_gpa),
+					    pasid_dir_size(data->max_pasid), true);
+	if (ret) {
+		pkvm_err("failed to write protect pasid dir for dev[%x:%x](err=%d)\n",
+			 data->bus, data->devfn, ret);
+		return ret;
+	}
+
+	__iommu_flush_cache(iommu, table.table, pasid_dir_size(data->max_pasid));
+
+	pkvm_dbg("%s: dev[%x:%x], ats_qdep: %d, pasid_table_gpa: %llx\n", __func__,
+		 data->bus, data->devfn, info.ats_qdep, data->pasid_table_gpa);
+	ret = device_pasid_table_setup(&dev, data->bus, data->devfn);
+
+	if (ret) {
+		pkvm_hyp_donate_host(pkvm_host_gpa_to_phys(data->pasid_table_gpa),
+				     pasid_dir_size(data->max_pasid), false);
+		/*
+		 * If entry already exists, the host expects
+		 * the hypercall to succeed.
+		 */
+		if (ret == -EEXIST)
+			ret = 0;
+	}
+	return ret;
+}
+
+int pkvm_iommu_set_sm_ce(struct set_sm_ce_data *in, struct set_sm_ce_data *out)
+{
+	int ret = iommu_set_sm_ce(in);
+
+	*out = *in;
+	return ret;
+}
+
+static int iommu_pasid_setup_fl(struct pasid_setup_fl_data *data)
+{
+	struct intel_iommu *iommu = iommu_from_phys(data->phys);
+	struct device_domain_info info = { 0 };
+	struct pkvm_device dev = { .info = &info };
+	struct dmar_domain *domain;
+	int flags = 0, level, ret;
+	void *pgd;
+
+	if (!iommu)
+		return -EINVAL;
+
+	if (!sm_supported(iommu))
+		return -EINVAL;
+
+	if (data->ats_qdep > PCI_ATS_MAX_QDEP)
+		return -EINVAL;
+
+	if (data->did == FLPT_DEFAULT_DID) {
+		pkvm_err("%s: First-level setup not allowed for default domain\n", __func__);
+		return -EPERM;
+	}
+
+	if (data->force_snoop && !ecap_sc_support(iommu->ecap)) {
+		pkvm_err("%s: iommu%d does not support snoop control\n",
+			 __func__, iommu->seq_id);
+		return -EINVAL;
+	}
+
+	info.bus = data->bus;
+	info.devfn = data->devfn;
+	info.ats_qdep = data->ats_qdep;
+	info.iommu = iommu;
+
+	ret = accept_page_donation(iommu, &data->donation_page_gpa);
+	if (ret)
+		return ret;
+
+	pgd = pkvm_host_gpa_to_virt(data->fsptptr_gpa);
+	domain = pkvm_get_iommu_domain(pgd, data->did, iommu);
+	if (!domain) {
+		pkvm_err("%s: Failed to locate domain with pgd: %p\n",
+			 __func__, pgd);
+		return -EINVAL;
+	}
+
+	ret = -EINVAL;
+	if (!domain->use_first_level) {
+		pkvm_err("%s: Domain did %d does not use first-level translation\n",
+			 __func__, data->did);
+		goto put_domain;
+	}
+
+	level = agaw_to_level(domain->agaw);
+	if (level != 4 && level != 5) {
+		pkvm_err("%s: Domain has invalid level %d\n",
+			 __func__, level);
+		goto put_domain;
+	}
+
+	pkvm_dbg("%s: dev[%x:%x], pasid: %x, fsptptr_gpa: %llx, did: %d\n", __func__,
+		 data->bus, data->devfn, data->pasid, data->fsptptr_gpa, data->did);
+
+	if (data->force_snoop)
+		flags |= PASID_FLAG_PAGE_SNOOP;
+	if (level == 5)
+		flags |= PASID_FLAG_FL5LP;
+	ret = intel_pasid_setup_first_level(iommu, domain, &dev,
+					    __pkvm_pa(pgd),
+					    data->pasid, data->did, flags);
+
+put_domain:
+	if (ret)
+		pkvm_put_iommu_domain(domain);
+
+	return ret;
+}
+
+int pkvm_iommu_pasid_setup_fl(struct pasid_setup_fl_data *in, struct pasid_setup_fl_data *out)
+{
+	int ret = iommu_pasid_setup_fl(in);
+
+	*out = *in;
+	return ret;
+}
+
+static int iommu_pasid_setup_sl(struct pasid_setup_sl_data *data)
+{
+	struct intel_iommu *iommu = iommu_from_phys(data->phys);
+	struct device_domain_info info = { 0 };
+	struct pkvm_device dev = { .info = &info };
+	struct dmar_domain *domain;
+	void *pgd;
+	int ret;
+
+	if (!iommu)
+		return -EINVAL;
+
+	if (!sm_supported(iommu))
+		return -EINVAL;
+
+	if (data->ats_qdep > PCI_ATS_MAX_QDEP)
+		return -EINVAL;
+
+	info.bus = data->bus;
+	info.devfn = data->devfn;
+	info.iommu = iommu;
+	info.ats_qdep = data->ats_qdep;
+
+	ret = accept_page_donation(iommu, &data->donation_page_gpa);
+	if (ret)
+		return ret;
+
+	pgd = pkvm_host_gpa_to_virt(data->ssptptr_gpa);
+	domain = pkvm_get_iommu_domain(pgd, data->did, iommu);
+	if (!domain) {
+		pkvm_err("%s: Failed to locate domain with pgd: %p\n",
+			 __func__, pgd);
+		return -EINVAL;
+	}
+	if (domain->use_first_level) {
+		pkvm_err("%s: Domain has use_first_level set, expected SL\n", __func__);
+		pkvm_put_iommu_domain(domain);
+		return -EINVAL;
+	}
+
+	pkvm_dbg("%s: dev[%x:%x], pasid: %x ssptptr_gpa: %llx, did: %d\n", __func__,
+		 data->bus, data->devfn, data->pasid, data->ssptptr_gpa, data->did);
+
+	ret = intel_pasid_setup_second_level(iommu, domain, &dev,
+					     data->did, data->pasid);
+	if (ret)
+		pkvm_put_iommu_domain(domain);
+
+	return ret;
+}
+
+int pkvm_iommu_pasid_setup_sl(struct pasid_setup_sl_data *in, struct pasid_setup_sl_data *out)
+{
+	int ret = iommu_pasid_setup_sl(in);
+
+	*out = *in;
+	return ret;
+}
+
+int pkvm_iommu_pasid_teardown(struct pasid_teardown_data *data)
+{
+	struct intel_iommu *iommu = iommu_from_phys(data->phys);
+	struct device_domain_info info = { 0 };
+	struct pkvm_device dev = { .info = &info };
+	struct dmar_domain *domain;
+
+	if (!iommu)
+		return -EINVAL;
+
+	if (!sm_supported(iommu))
+		return -EINVAL;
+
+	if (data->ats_qdep > PCI_ATS_MAX_QDEP)
+		return -EINVAL;
+
+	info.bus = data->bus;
+	info.devfn = data->devfn;
+	info.ats_qdep = data->ats_qdep;
+	info.iommu = iommu;
+
+	pkvm_dbg("%s: dev[%x:%x], pasid: %x, ats_qdep: %d\n", __func__,
+		 data->bus, data->devfn, data->pasid, data->ats_qdep);
+	intel_pasid_tear_down_entry(iommu, &dev, data->pasid, false, &domain);
+	if (domain)
+		pkvm_put_iommu_domain(domain);
+
+	return 0;
+}
+
+static int __validate_domain_params(struct intel_iommu *iommu, struct alloc_domain_data *data)
+{
+	int iommu_superpage = iommu_superpage_capability(iommu, data->use_first_level);
+	int gaw = agaw_to_width(iommu->agaw);
+	int ret = -EINVAL;
+
+	if (gaw > cap_mgaw(iommu->cap))
+		gaw = cap_mgaw(iommu->cap);
+
+	if (data->iommu_superpage != iommu_superpage) {
+		pkvm_err("%s: invalid iommu_superpage(%u) from host!\n",
+			 __func__, data->iommu_superpage);
+	} else if (data->iommu_coherency != iommu_paging_structure_coherency(iommu)) {
+		pkvm_err("%s: invalid iommu_coherency(%u) from host!\n",
+			 __func__, data->iommu_coherency);
+	} else if (data->agaw != iommu->agaw) {
+		pkvm_err("%s: invalid agaw(%u) from host!\n", __func__, data->agaw);
+	} else if (data->gaw != gaw) {
+		pkvm_err("%s: invalid gaw(%u) from host!\n", __func__, data->gaw);
+	} else if (data->max_addr != __DOMAIN_MAX_ADDR(data->gaw)) {
+		pkvm_err("%s: invalid max_addr(%llx) from host!\n",
+			 __func__, data->max_addr);
+	} else {
+		ret = 0;
+	}
+
+	return ret;
+}
+
+int pkvm_iommu_alloc_domain(struct alloc_domain_data *data)
+{
+	struct dmar_domain *domain;
+	struct intel_iommu *iommu;
+	void *pgd;
+	int ret;
+	bool need_iotlb_sync_map;
+
+	iommu = iommu_from_phys(data->phys);
+	if (!iommu)
+		return -EINVAL;
+
+	ret = __validate_domain_params(iommu, data);
+	if (ret)
+		return ret;
+
+	pgd = pkvm_host_gpa_to_virt(data->pgd_gpa);
+	pkvm_dbg("%s: write protecting pgd: %p\n", __func__, pgd);
+	ret = pkvm_host_donate_hyp_share_ro(__pkvm_pa(pgd), VTD_PAGE_SIZE, true);
+	if (ret) {
+		pkvm_err("%s: failed to write protect pgd: %p (err=%d)\n",
+			 __func__, pgd, ret);
+		return ret;
+	}
+
+	need_iotlb_sync_map = cap_caching_mode(iommu->cap) && !data->use_first_level;
+	domain = pkvm_alloc_iommu_domain(data, need_iotlb_sync_map);
+	if (IS_ERR(domain)) {
+		pkvm_err("%s: domain alloc failed for device[%x] (err=%ld)\n",
+			 __func__, data->bdf, PTR_ERR(domain));
+		pkvm_hyp_donate_host(__pkvm_pa(pgd), VTD_PAGE_SIZE, false);
+		return PTR_ERR(domain);
+	}
+
+	domain_flush_cache(domain, pgd, VTD_PAGE_SIZE);
+
+	pkvm_dbg("%s: allocated domain(pgd=%p) for device[%x]\n", __func__,
+		 pgd, data->bdf);
+	return 0;
+}
+
+int pkvm_iommu_free_domain(u64 pgd_gpa, struct pkvm_memcache *mc)
+{
+	memset(mc, 0, sizeof(*mc));
+	return pkvm_free_iommu_domain(pgd_gpa, mc);
+}
+
+int pkvm_iommu_modify_irte(struct modify_irte_data *data)
+{
+	struct irte modified = { .low = data->irte_lo, .high = data->irte_hi };
+	struct intel_iommu *iommu = iommu_from_phys(data->phys);
+	unsigned long unpin_pda_pa = -1UL;
+	struct irte *irte;
+	int ret = 0;
+
+	if (!iommu)
+		return -EINVAL;
+
+	if (data->index >= SZ_1M / sizeof(struct irte)) {
+		pkvm_err("iommu%d: modify_irte: index %u out of range\n",
+			 iommu->seq_id, data->index);
+		return -EINVAL;
+	}
+
+	if (modified.pst == 1) {
+		/* Posted Mode RsvdZ Bits: 2-7, 12-13, 24-37, 84-95 */
+		if (modified.p_res0 || modified.p_res1 ||
+		    modified.p_res2 || modified.p_res3)
+			return -EINVAL;
+	} else {
+		/* Remapping mode RsvdZ Bits: 12-14, 24-31, 84-127 */
+		if (modified.__res1 || modified.r_res1 ||
+		    modified.__res3)
+			return -EINVAL;
+	}
+
+	pkvm_spin_lock(&iommu->lock);
+
+	if (!iommu->ir_table) {
+		pkvm_err("iommu%d: modify_irte: IR table not set up\n", iommu->seq_id);
+		ret = -EINVAL;
+		goto unlock;
+	}
+
+	/*
+	 * If the new IRTE is in posted mode, pin the PDA page before writing
+	 * the IRTE to prevent the host from donating it to a guest after the
+	 * IRTE is in place.
+	 */
+	if (modified.pst == 1) {
+		unsigned long pda_pa = ((u64)modified.pda_h << 32) | ((u64)modified.pda_l << 6);
+
+		ret = pkvm_host_use_dma(PAGE_ALIGN_DOWN(pda_pa), PAGE_SIZE);
+		if (ret) {
+			pkvm_err("iommu%d: modify_irte: index[%u] pinning PDA[%lx] failed(err=%d)\n",
+				 iommu->seq_id, data->index, pda_pa, ret);
+			goto unlock;
+		}
+	}
+
+	/*
+	 * If the existing IRTE was in posted mode, get the old PDA to
+	 * unpin after successful update and cache invalidation.
+	 */
+	irte = &iommu->ir_table[data->index];
+	if (irte->pst == 1)
+		unpin_pda_pa = ((u64)irte->pda_h << 32) | ((u64)irte->pda_l << 6);
+
+	if ((irte->pst == 1) || (modified.pst == 1)) {
+		u128 old = irte->irte;
+
+		/*
+		 * The 128-bit IRTE must be updated atomically, as hardware reads
+		 * it concurrently. We hold iommu->lock and IRTEs are only written
+		 * by software, so the compare can never fail; a failure would mean
+		 * a locking/invariant bug, so treat it as fatal.
+		 */
+		BUG_ON(!try_cmpxchg128(&irte->irte, &old, modified.irte));
+	} else {
+		WRITE_ONCE(irte->low, modified.low);
+		WRITE_ONCE(irte->high, modified.high);
+	}
+
+	__iommu_flush_cache(iommu, irte, sizeof(*irte));
+
+unlock:
+	pkvm_spin_unlock(&iommu->lock);
+
+	if (!ret)
+		ret = qi_flush_iec(iommu, data->index, 0);
+
+	/*
+	 * Only release the old PDA once both the IRTE update and the IEC flush
+	 * have succeeded. If the flush failed the IOMMU may still hold a cached
+	 * IRTE referencing this page; unpinning it would let the host reclaim
+	 * and donate it to a guest/pKVM while the IOMMU can still post interrupts
+	 * into it, corrupting protected memory. Keeping it pinned on failure is
+	 * leak-safe.
+	 */
+	if (!ret && unpin_pda_pa != -1UL)
+		pkvm_host_unuse_dma(PAGE_ALIGN_DOWN(unpin_pda_pa), PAGE_SIZE);
+
+	return ret;
+}

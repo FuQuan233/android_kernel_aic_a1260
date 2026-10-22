@@ -1,0 +1,33 @@
+# See http://go/approve-abi-break
+
+type 'enum attr_idn' changed
+  enumerator 'QUERY_ATTR_IDN_TX_EQ_GN_SETTINGS' (71) was added
+  ... 1 other enumerator(s) added
+
+type 'struct readahead_control' changed
+  member 'u64 __kabi_reserved1' was removed
+  member 'union { unsigned long _max_index; struct { u64 __kabi_reserved1; }; union { }; }' was added
+
+type 'struct arch_tlbflush_unmap_batch' changed
+  member 'cpumask_var_t cpumask' was removed
+  member 'union { struct { u64 __donotuse_b448672457; }; struct { cpumask_var_t __kabi_renamedcpumask; }; union { }; }' was added
+
+type 'struct ufshcd_tx_eq_params' changed
+  member 'union { bool from_dt; unsigned char __kabi_ignored1; }' was added
+
+type 'struct task_struct' changed
+  member 'u64 __kabi_reserved1' was removed
+  member 'union { struct { unsigned int user_dumpable:1; }; struct { u64 __kabi_reserved1; }; union { }; }' was added
+
+type 'struct fscrypt_operations' changed
+  member 'u64 __kabi_reserved1' was removed
+  member 'union { unsigned int(* get_devices_new)(struct super_block*, struct block_device**); struct { u64 __kabi_reserved1; }; union { }; }' was added
+
+type 'struct pkvm_module_ops' changed
+  member 'u64 __kabi_reserved1' was removed
+  member 'union { int(* host_stage2_set_owned)(u64, u64, bool); struct { u64 __kabi_reserved1; }; union { }; }' was added
+
+type 'struct net_device_ops' changed
+  member 'u64 __kabi_reserved1' was removed
+  member 'union { const struct apf_ops* apf_ops; struct { u64 __kabi_reserved1; }; union { }; }' was added
+

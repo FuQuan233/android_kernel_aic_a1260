@@ -1,0 +1,154 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+#ifndef __KVM_HYP_MEMORY_H
+#define __KVM_HYP_MEMORY_H
+
+#include <asm/kvm_mmu.h>
+#include <asm/page.h>
+
+#include <linux/types.h>
+#include <nvhe/refcount.h>
+
+/*
+ * Bits 0-1 are used to encode the memory ownership state of each page from the
+ * point of view of a pKVM "component" (host, hyp, guest, ... see enum
+ * pkvm_component_id):
+ *   00: The page is owned and exclusively accessible by the component;
+ *   01: The page is owned and accessible by the component, but is also
+ *       accessible by another component;
+ *   10: The page is accessible but not owned by the component;
+ * The storage of this state depends on the component: either in the
+ * hyp_vmemmap for the host and hyp states or in PTE software bits for guests.
+ */
+enum pkvm_page_state {
+	PKVM_PAGE_OWNED			= 0ULL,
+	PKVM_PAGE_SHARED_OWNED		= BIT(0),
+	PKVM_PAGE_SHARED_BORROWED	= BIT(1),
+
+	/*
+	 * 'Meta-states' are not stored directly in PTE SW bits for guest
+	 * states, but inferred from the context (e.g. invalid PTE entries).
+	 * For the host and hyp, meta-states are stored directly in the
+	 * struct hyp_page.
+	 */
+	PKVM_NOPAGE			= BIT(0) | BIT(1),
+	PKVM_MODULE_OWNED_PAGE		= BIT(2),
+	PKVM_MODULE_SHARED_OWNED_PAGE	= BIT(3),
+
+	/*
+	 * Meta-states which aren't encoded directly in the PTE's SW bits (or
+	 * the hyp_vmemmap entry for the host)
+	 */
+	PKVM_PAGE_RESTRICTED_PROT	= BIT(4),
+	PKVM_MMIO			= BIT(5),
+	PKVM_ACCEPT_MODULE_OWNED	= BIT(6),
+};
+#define PKVM_PAGE_STATE_MASK		(BIT(0) | BIT(1))
+
+#define PKVM_PAGE_STATE_PROT_MASK	(KVM_PGTABLE_PROT_SW0 | KVM_PGTABLE_PROT_SW1)
+static inline enum kvm_pgtable_prot pkvm_mkstate(enum kvm_pgtable_prot prot,
+						 enum pkvm_page_state state)
+{
+	prot &= ~PKVM_PAGE_STATE_PROT_MASK;
+	prot |= FIELD_PREP(PKVM_PAGE_STATE_PROT_MASK, state);
+	return prot;
+}
+
+static inline enum pkvm_page_state pkvm_getstate(enum kvm_pgtable_prot prot)
+{
+	return FIELD_GET(PKVM_PAGE_STATE_PROT_MASK, prot);
+}
+
+struct hyp_page {
+	u16 refcount;
+	u8 order;
+
+	/* Host state. Guarded by the host stage-2 lock. */
+	unsigned __host_state : 4;
+
+	/*
+	 * Complement of the hyp state. Guarded by the hyp stage-1 lock. We use
+	 * the complement so that the initial 0 in __hyp_state_comp (due to the
+	 * entire vmemmap starting off zeroed) encodes PKVM_NOPAGE.
+	 */
+	unsigned __hyp_state_comp : 4;
+
+	union {
+		u32 host_share_guest_count;
+
+		/* When the page is hyp owned, a tag may be added */
+		u32 tag;
+	};
+};
+
+extern u64 __hyp_vmemmap;
+#define hyp_vmemmap ((struct hyp_page *)__hyp_vmemmap)
+
+#define hyp_phys_to_pfn(phys)	((phys) >> PAGE_SHIFT)
+#define hyp_pfn_to_phys(pfn)	((phys_addr_t)((pfn) << PAGE_SHIFT))
+
+static inline struct hyp_page *hyp_phys_to_page(phys_addr_t phys)
+{
+	BUILD_BUG_ON(sizeof(struct hyp_page) != sizeof(u64));
+	return &hyp_vmemmap[hyp_phys_to_pfn(phys)];
+}
+
+#define hyp_virt_to_page(virt)	hyp_phys_to_page(__hyp_pa(virt))
+#define hyp_virt_to_pfn(virt)	hyp_phys_to_pfn(__hyp_pa(virt))
+
+#define hyp_page_to_pfn(page)	((struct hyp_page *)(page) - hyp_vmemmap)
+#define hyp_page_to_phys(page)  hyp_pfn_to_phys((hyp_page_to_pfn(page)))
+#define hyp_page_to_virt(page)	__hyp_va(hyp_page_to_phys(page))
+#define hyp_page_to_pool(page)	(((struct hyp_page *)page)->pool)
+
+static inline enum pkvm_page_state get_host_state(struct hyp_page *p)
+{
+	return p->__host_state;
+}
+
+static inline void set_host_state(struct hyp_page *p, enum pkvm_page_state state)
+{
+	p->__host_state = state;
+}
+
+static inline enum pkvm_page_state get_hyp_state(struct hyp_page *p)
+{
+	return p->__hyp_state_comp ^ PKVM_PAGE_STATE_MASK;
+}
+
+static inline void set_hyp_state(struct hyp_page *p, enum pkvm_page_state state)
+{
+	p->__hyp_state_comp = state ^ PKVM_PAGE_STATE_MASK;
+}
+
+/*
+ * Refcounting wrappers for 'struct hyp_page'.
+ */
+static inline int hyp_page_count(void *addr)
+{
+	struct hyp_page *p = hyp_virt_to_page(addr);
+
+	/* Callers shouldn't see the extra reference held by page_alloc.c */
+	return hyp_refcount_get(p->refcount) - 1;
+}
+
+static inline void hyp_page_ref_inc(struct hyp_page *p)
+{
+	hyp_refcount_inc(p->refcount);
+}
+
+static inline void hyp_page_ref_dec(struct hyp_page *p)
+{
+	hyp_refcount_dec(p->refcount);
+}
+
+/*
+ * page_alloc.c takes an extra reference on freshly-allocated pages,
+ * hence we initialise the reference count to 2.
+ */
+#define HYP_PAGE_INIT_REFCOUNT 2
+
+static inline void hyp_set_page_refcounted(struct hyp_page *p)
+{
+	hyp_refcount_set(p->refcount, HYP_PAGE_INIT_REFCOUNT);
+}
+#endif /* __KVM_HYP_MEMORY_H */

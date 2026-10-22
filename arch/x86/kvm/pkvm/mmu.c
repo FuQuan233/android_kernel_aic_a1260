@@ -1,0 +1,1982 @@
+// SPDX-License-Identifier: GPL-2.0
+#include <linux/kvm_host.h>
+#include <linux/pgtable.h>
+#include <asm/kvm_pkvm.h>
+#include <asm/pkvm_spinlock.h>
+#include "debug.h"
+#include "early_alloc.h"
+#include "gfp.h"
+#include "mmu.h"
+#include "pgtable.h"
+#include "pkvm.h"
+
+static struct pkvm_pgtable hyp_mmu;
+static struct pkvm_pool hyp_mmu_pool;
+
+static struct pkvm_pgtable host_mmu;
+static pkvm_spinlock_t host_mmu_lock;
+
+static const struct pkvm_pgtable_ops *guest_mmu_pgt_ops;
+static struct pkvm_pgtable_cap guest_mmu_pgt_cap;
+
+static DEFINE_PER_CPU(struct pkvm_vm *, __current_vm);
+#define current_vm (*this_cpu_ptr(&__current_vm))
+
+static void *hyp_mmu_zalloc_page(struct pkvm_memcache *mc)
+{
+	return pkvm_alloc_pages(&hyp_mmu_pool, 0);
+}
+
+static void hyp_mmu_get_page(void *vaddr)
+{
+	pkvm_get_page(&hyp_mmu_pool, vaddr);
+}
+
+static void hyp_mmu_put_page(void *vaddr)
+{
+	pkvm_put_page(&hyp_mmu_pool, vaddr);
+}
+
+static int hyp_mmu_page_count(void *vaddr)
+{
+	return pkvm_page_count(vaddr);
+}
+
+static const struct pkvm_pgtable_mm_ops hyp_mmu_mm_ops = {
+	.zalloc_page = hyp_mmu_zalloc_page,
+	.get_page = hyp_mmu_get_page,
+	.put_page = hyp_mmu_put_page,
+	.page_count = hyp_mmu_page_count,
+};
+
+static bool hyp_mmu_pte_present(void *ptep)
+{
+	return pte_present(*(pte_t *)ptep);
+}
+
+static bool hyp_mmu_pte_annotated(void *ptep)
+{
+	/* Hypervisor mmu is not used to store annotations */
+	return false;
+}
+
+static bool hyp_mmu_pte_huge(void *ptep)
+{
+	return pte_huge(*(pte_t *)ptep);
+}
+
+static void hyp_mmu_pte_mkhuge(void *ptep)
+{
+	pte_t *ptep_ptr = (pte_t *)ptep;
+
+	*ptep_ptr = pte_mkhuge(*ptep_ptr);
+}
+
+static unsigned long hyp_mmu_pte_to_phys(void *ptep)
+{
+	return native_pte_val(*(pte_t *)ptep) & PTE_PFN_MASK;
+}
+
+static u64 hyp_mmu_pte_to_prot(void *ptep)
+{
+	return (u64)pte_flags(pte_clear_flags(*(pte_t *)ptep, _PAGE_PSE));
+}
+
+static int hyp_mmu_vaddr_to_index(unsigned long vaddr, int level)
+{
+	return (vaddr >> page_level_shift(level)) & ((1UL << PTE_SHIFT) - 1);
+}
+
+static unsigned long hyp_mmu_level_to_size(int level)
+{
+	return page_level_size(level);
+}
+
+static u64 hyp_mmu_level_to_mask(int level)
+{
+	return page_level_mask(level);
+}
+
+static bool hyp_mmu_pte_is_leaf(void *ptep, int level)
+{
+	return level == PG_LEVEL_4K || !hyp_mmu_pte_present(ptep) || hyp_mmu_pte_huge(ptep);
+}
+
+static int hyp_mmu_pte_size(int level)
+{
+	return PAGE_SIZE / PTRS_PER_PTE;
+}
+
+static int hyp_mmu_pte_count(int level)
+{
+	return PTRS_PER_PTE;
+}
+
+static void hyp_mmu_pte_set(void *ptep, u64 pte)
+{
+	native_set_pte((pte_t *)ptep, native_make_pte(pte));
+}
+
+static u64 hyp_mmu_pte_get(void *ptep)
+{
+	return READ_ONCE(*(pte_t *)ptep).pte;
+}
+
+static void hyp_mmu_flush_tlb(struct pkvm_pgtable *pgt,
+			      unsigned long vaddr, unsigned long size)
+{
+	/*
+	 * The pKVM hypervisor will map all valid memory in its MMU during the
+	 * init phase and won't change or unmap at the running time. So there is
+	 * no usages to change a present leaf in the hyp_mmu. Put a BUG here in
+	 * case anything is missed.
+	 */
+	BUG();
+}
+
+static const struct pkvm_pgtable_ops hyp_mmu_pgt_ops = {
+	.pte_present = hyp_mmu_pte_present,
+	.pte_annotated = hyp_mmu_pte_annotated,
+	.pte_huge = hyp_mmu_pte_huge,
+	.pte_mkhuge = hyp_mmu_pte_mkhuge,
+	.pte_to_phys = hyp_mmu_pte_to_phys,
+	.pte_to_prot = hyp_mmu_pte_to_prot,
+	.vaddr_to_index = hyp_mmu_vaddr_to_index,
+	.level_to_size = hyp_mmu_level_to_size,
+	.level_to_mask = hyp_mmu_level_to_mask,
+	.pte_is_leaf = hyp_mmu_pte_is_leaf,
+	.pte_size = hyp_mmu_pte_size,
+	.pte_count = hyp_mmu_pte_count,
+	.pte_set = hyp_mmu_pte_set,
+	.pte_get = hyp_mmu_pte_get,
+	.flush_tlb = hyp_mmu_flush_tlb,
+};
+
+static int fix_hyp_mmu_refcnt_walker(struct pkvm_pgtable_visit_ctx *ctx,
+				     unsigned long walk_flags,
+				     void *const arg)
+{
+	if (!ctx->pgt->pgt_ops->pte_present(ctx->ptep))
+		return 0;
+
+	/*
+	 * Fix-up the refcount for the page-table pages as the early allocator
+	 * was unable to access the pkvm_vmemmap and so the buddy allocator has
+	 * initialized the refcount to '1'.
+	 */
+	hyp_mmu_get_page(ctx->ptep);
+
+	return 0;
+}
+
+static int fix_hyp_mmu_page_refcnt(void)
+{
+	struct pkvm_pgtable_walker walker = {
+		.cb = fix_hyp_mmu_refcnt_walker,
+		.arg = NULL,
+		.walk_flags = PKVM_PGTABLE_WALK_LEAF | PKVM_PGTABLE_WALK_TABLE_POST,
+	};
+	unsigned long size;
+
+#ifdef CONFIG_PKVM_X86_DEBUG
+	/*
+	 * Only the memory addresses under VMALLOC_START are mapped by the
+	 * pKVM hypervisor itself, thus only need to fix vmemmap for this
+	 * range.
+	 */
+	size = VMALLOC_START & ~hyp_mmu.pgt_ops->level_to_mask(hyp_mmu.cap.level + 1);
+#else
+	/*
+	 * Calculate the max address space, then walk the [0, size) address
+	 * range to fixup refcount of every page-table page.
+	 */
+	size = pkvm_pgtable_max_size(&hyp_mmu);
+#endif
+
+	return pkvm_pgtable_walk(&hyp_mmu, 0, size, &walker);
+}
+
+static void pkvm_host_mmu_lock(void)
+{
+	pkvm_spin_lock(&host_mmu_lock);
+}
+
+static void pkvm_host_mmu_unlock(void)
+{
+	pkvm_spin_unlock(&host_mmu_lock);
+}
+
+static void set_host_mem_pgstate(unsigned long phys, unsigned long size,
+				 enum pkvm_page_state state,
+				 enum pkvm_owner_id owner)
+{
+	for_each_pkvm_page(page, phys, size) {
+		page->host_state = state;
+		page->owner = owner;
+	}
+}
+
+static int check_host_mem_pgstate_mask(unsigned long phys, unsigned long size,
+				       u64 states, enum pkvm_owner_id owner,
+				       bool check_zero_refcnt)
+{
+	if (!is_memory_range(phys, size))
+		return -EINVAL;
+
+	for_each_pkvm_page(page, phys, size) {
+		if (!((1 << page->host_state) & states))
+			return -EPERM;
+		if (page->owner != owner)
+			return -EPERM;
+		if (check_zero_refcnt && page->refcount)
+			return -EPERM;
+	}
+
+	return 0;
+}
+
+static int check_host_mem_pgstate(unsigned long phys, unsigned long size,
+				  enum pkvm_page_state state,
+				  enum pkvm_owner_id owner,
+				  bool check_zero_refcnt)
+{
+	return check_host_mem_pgstate_mask(phys, size, 1 << state, owner,
+					   check_zero_refcnt);
+}
+
+static u64 host_mmu_pte_prot(bool write, bool mmio)
+{
+	return host_mmu.pgt_ops->calc_pte_perm(true, write, true) |
+	       host_mmu.pgt_ops->calc_pte_memtype(mmio);
+}
+
+static int verify_host_mmu_pgstate_walker(struct pkvm_pgtable_visit_ctx *ctx,
+					  unsigned long walk_flags,
+					  void *const arg)
+{
+	const struct pkvm_pgtable_ops *pgt_ops = ctx->pgt->pgt_ops;
+	unsigned long phys = ctx->addr, size;
+
+	size = pgt_ops->level_to_size(ctx->level);
+
+	if (pgt_ops->pte_present(ctx->ptep)) {
+		BUG_ON(pgt_ops->pte_to_phys(ctx->ptep) != ctx->addr);
+
+		/* A present pte could map either memory pages or MMIO pages. */
+		if (is_mmio_range(phys, size)) {
+			enum pkvm_page_state state = pkvm_pte_pgstate(ctx->pgt, ctx->ptep);
+
+			/*
+			 * Mapped host-owned MMIO pages must already be effectively set
+			 * to the desired state PKVM_PAGE_OWNED, since corresponding pte
+			 * bits are zero.
+			 * Except for ramoops pages which are explicitly set to
+			 * PKVM_PAGE_SHARED_BORROWED.
+			 */
+			BUG_ON(state != PKVM_PAGE_OWNED &&
+			       state != PKVM_PAGE_SHARED_BORROWED);
+		} else {
+			/*
+			 * Must be normal memory pages, not pvmfw pages, since
+			 * pvmfw is unmapped.
+			 */
+			BUG_ON(!is_memory_range(phys, size));
+			/*
+			 * Mapped host-owned memory pages must already be effectively set
+			 * to the desired state (PKVM_PAGE_OWNED, PKVM_ID_HOST), since
+			 * corresponding pkvm_page struct fields are zero-initialized.
+			 *
+			 * Page refcounts are expected to be zero, since the host is not
+			 * requesting DMA-mapping its pages at this point yet.
+			 */
+			BUG_ON(check_host_mem_pgstate(phys, size, PKVM_PAGE_OWNED,
+						      PKVM_ID_HOST, true));
+		}
+	} else {
+		if (is_mmio_range(phys, size)) {
+			/*
+			 * All MMIO pages are initially owned by the host. A non-present
+			 * pte means that the MMIO page was not mapped initially in
+			 * pkvm_host_mmu_init() (it may be mapped later on the first host
+			 * access). However, its desired state (PKVM_PAGE_OWNED,
+			 * PKVM_ID_HOST) must already be effectively set since the pte
+			 * is zeroed.
+			 */
+			BUG_ON(pkvm_pte_pgstate(ctx->pgt, ctx->ptep) != PKVM_PAGE_OWNED);
+			BUG_ON(pkvm_pte_owner_id(ctx->pgt, ctx->ptep) != PKVM_ID_HOST);
+		} else if (is_memory_range(phys, size)) {
+			/*
+			 * Unmapped (hyp-owned) memory pages ownership must already be
+			 * set up by host_mmu_unmap().
+			 *
+			 * Page refcounts may already be non-zero, as the hypervisor is
+			 * already using its pages for allocating page tables.
+			 */
+			BUG_ON(check_host_mem_pgstate(phys, size, PKVM_PAGE_NONE,
+						      PKVM_ID_HYP, false));
+		} else if (is_pvmfw_range(phys, size)) {
+			/*
+			 * pvmfw pages ownership must already be set up by
+			 * host_mmu_unmap().
+			 */
+			BUG_ON(pkvm_pte_owner_id(ctx->pgt, ctx->ptep) != PKVM_ID_HYP);
+		} else {
+			/*
+			 * There is a theoretical possibility that none of the above
+			 * three conditions holds, when a zeroed PTE represents a huge
+			 * page overlapping both a MMIO region that is not mapped in the
+			 * host MMU yet and a hypervisor-owned memory region that was
+			 * unmapped by host_mmu_unmap(). Don't BUG_ON in this legitimate
+			 * edge case.
+			 */
+		}
+	}
+
+	return 0;
+}
+
+static int verify_host_mmu_pgstate(void)
+{
+	struct pkvm_pgtable_walker walker = {
+		.cb = verify_host_mmu_pgstate_walker,
+		.arg = NULL,
+		.walk_flags = PKVM_PGTABLE_WALK_LEAF,
+	};
+
+	return pkvm_pgtable_walk(&host_mmu, 0, pkvm_pgtable_max_size(&host_mmu),
+				 &walker);
+}
+
+static int host_mmu_map(unsigned long phys, unsigned long size, bool mmio)
+{
+	/* The vaddr == phys for the host MMU */
+	return pkvm_pgtable_map(&host_mmu, phys, phys, size,
+				host_mmu_pte_prot(true, mmio), NULL);
+}
+
+static int host_mmu_unmap(unsigned long phys, unsigned long size)
+{
+	if (is_pvmfw_range(phys, size)) {
+		/*
+		 * pvmfw memory is reserved in e820 so it has no pkvm_page struct,
+		 * so store its page owner info in the PTEs similarly to MMIO.
+		 */
+		return pkvm_pgtable_set_owner(&host_mmu, phys, size, PKVM_ID_HYP);
+	}
+
+	BUG_ON(!is_memory_range(phys, size));
+
+	set_host_mem_pgstate(phys, size, PKVM_PAGE_NONE, PKVM_ID_HYP);
+	return pkvm_pgtable_unmap(&host_mmu, phys, phys, size);
+}
+
+static void *guest_mmu_zalloc_page(struct pkvm_memcache *mc)
+{
+	struct pkvm_page *p;
+	void *page;
+
+	page = pkvm_alloc_pages(&current_vm->mmu_pool, 0);
+	if (page)
+		return page;
+
+	if (!mc)
+		return NULL;
+
+	page = pop_pkvm_memcache_page(mc, pkvm_phys_to_virt);
+	if (!page)
+		return page;
+
+	memset(page, 0, PAGE_SIZE);
+	p = pkvm_virt_to_page(page);
+	pkvm_set_page_refcounted(p);
+
+	return page;
+}
+
+static void guest_mmu_get_page(void *vaddr)
+{
+	pkvm_get_page(&current_vm->mmu_pool, vaddr);
+}
+
+static void guest_mmu_put_page(void *vaddr)
+{
+	pkvm_put_page(&current_vm->mmu_pool, vaddr);
+}
+
+static int guest_mmu_page_count(void *vaddr)
+{
+	return pkvm_page_count(vaddr);
+}
+
+static const struct pkvm_pgtable_mm_ops guest_mmu_mm_ops = {
+	.zalloc_page = guest_mmu_zalloc_page,
+	.get_page = guest_mmu_get_page,
+	.put_page = guest_mmu_put_page,
+	.page_count = guest_mmu_page_count,
+};
+
+static void pkvm_guest_mmu_lock(struct pkvm_vm *vm)
+{
+	pkvm_spin_lock(&vm->mmu_lock);
+	current_vm = vm;
+}
+
+static void pkvm_guest_mmu_unlock(struct pkvm_vm *vm)
+{
+	current_vm = NULL;
+	pkvm_spin_unlock(&vm->mmu_lock);
+}
+
+static u64 guest_mmu_pte_prot(struct kvm_vcpu *vcpu, unsigned long gpa,
+			      bool writable, enum pkvm_page_state state)
+{
+	struct pkvm_vm *pkvm_vm = to_pkvm_vcpu(vcpu)->pkvm_vm;
+	u64 prot;
+
+	prot = pkvm_vm->mmu.pgt_ops->calc_pte_perm(true, writable, true);
+	prot |= pkvm_vm->mmu.pgt_ops->pte_mk_pgstate(state);
+
+	/* memory type bits */
+	prot |= kvm_x86_call(get_mt_mask)(vcpu, gpa >> PAGE_SHIFT, false);
+
+	return prot;
+}
+
+static void drain_pool(struct pkvm_pool *pool, struct pkvm_memcache *host_mc)
+{
+	struct pkvm_page *page;
+	void *p;
+
+	p = pkvm_alloc_pages(pool, 0);
+	while (p) {
+		page = pkvm_virt_to_page(p);
+
+		/* Don't expect the pool to have greater order pages. */
+		WARN_ON(page->order);
+
+		pkvm_page_ref_dec(page);
+
+		push_pkvm_memcache_page(host_mc, p, pkvm_virt_to_host_gpa);
+
+		/*
+		 * Pages stored in pool are zeroed by __pkvm_attach_page so do
+		 * not repeat this step before donation.
+		 */
+		pkvm_hyp_donate_host(__pkvm_pa(p), PAGE_SIZE, false);
+
+		p = pkvm_alloc_pages(pool, 0);
+	}
+}
+
+static int host_reclaim_guest_walker(struct pkvm_pgtable_visit_ctx *ctx,
+				     unsigned long walk_flags,
+				     void *const arg)
+{
+	const struct pkvm_pgtable_ops *pgt_ops = ctx->pgt->pgt_ops;
+	struct kvm *kvm = pgt_to_kvm(ctx->pgt);
+	unsigned long phys, size;
+	void *ptep = ctx->ptep;
+
+	if (!pgt_ops->pte_present(ptep)) {
+		/* Guest may only share its pages, not donate them. */
+		BUG_ON(pgt_ops->pte_annotated(ptep));
+
+		return 0;
+	}
+
+	phys = pgt_ops->pte_to_phys(ptep);
+	size = pgt_ops->level_to_size(ctx->level);
+
+	switch (pkvm_pte_pgstate(ctx->pgt, ptep)) {
+	case PKVM_PAGE_OWNED:
+		BUG_ON(!pkvm_is_protected_vm(kvm));
+		BUG_ON(check_host_mem_pgstate(phys, size, PKVM_PAGE_NONE,
+					      PKVM_ID_GUEST, true));
+		/*
+		 * This must be a protected VM's page. Clear its contents
+		 * before returning it to host.
+		 */
+		pkvm_clear_memory(__pkvm_va(phys), size);
+		break;
+	case PKVM_PAGE_SHARED_OWNED:
+		BUG_ON(!pkvm_is_protected_vm(kvm));
+		BUG_ON(check_host_mem_pgstate(phys, size, PKVM_PAGE_SHARED_BORROWED,
+					      PKVM_ID_GUEST, true));
+		/*
+		 * Still must be a protected VM's page, but already shared
+		 * with the host => no need to clear.
+		 */
+		break;
+	case PKVM_PAGE_SHARED_BORROWED:
+		BUG_ON(pkvm_is_protected_vm(kvm));
+		BUG_ON(check_host_mem_pgstate(phys, size, PKVM_PAGE_SHARED_OWNED,
+					      PKVM_ID_HOST, false));
+		break;
+	default:
+		BUG();
+	}
+
+	if (pkvm_is_protected_vm(kvm)) {
+		/*
+		 * pkvm_pgtable_map() shouldn't fail here unless there is a bug.
+		 * See also comment in pkvm_hyp_donate_host().
+		 */
+		BUG_ON(pkvm_pgtable_map(&host_mmu, phys, phys, size,
+					host_mmu_pte_prot(true, false), NULL));
+
+		for_each_pkvm_page(page, phys, size) {
+			BUG_ON(page->host_share_hyp_count);
+			BUG_ON(page->host_share_guest_count);
+
+			page->host_state = PKVM_PAGE_OWNED;
+			page->owner = PKVM_ID_HOST;
+		}
+	} else {
+		for_each_pkvm_page(page, phys, size) {
+			BUG_ON(page->host_share_hyp_count);
+			BUG_ON(!page->host_share_guest_count);
+
+			if (!--page->host_share_guest_count)
+				page->host_state = PKVM_PAGE_OWNED;
+		}
+	}
+
+	return 0;
+}
+
+static void host_reclaim_guest_pages(struct pkvm_vm *pkvm_vm)
+{
+	struct pkvm_pgtable_walker walker = {
+		.cb = host_reclaim_guest_walker,
+		.arg = NULL,
+		.walk_flags = PKVM_PGTABLE_WALK_LEAF,
+	};
+
+	/*
+	 * We're not gonna unmap the reclaimed pages from the guest MMU.
+	 * There is no need to, since the guest's vCPUs have been already
+	 * torn down and thus cannot run anymore.
+	 *
+	 * Note that the TLBs were not flushed during the vCPUs teardown,
+	 * and we're not gonna flush them now either, but that is fine too.
+	 * A pCPU's TLB will be flushed next time when loading any VM's
+	 * vCPU on that pCPU.
+	 *
+	 * Also no need to lock the guest mmu_lock, since no one else is
+	 * using the guest page table at this point. And even no need to
+	 * set the current_vm, as we are not gonna make any modifications
+	 * to the guest page table.
+	 */
+	pkvm_host_mmu_lock();
+	pkvm_pgtable_walk(&pkvm_vm->mmu, 0, pkvm_pgtable_max_size(&pkvm_vm->mmu),
+			  &walker);
+	pkvm_host_mmu_unlock();
+}
+
+/*
+ * Allows modifying the page table while iterating.
+ * Assumes that [vaddr, vaddr + size) is fully mapped without holes,
+ * returns -EPERM otherwise.
+ */
+static int for_each_contig_range(struct pkvm_pgtable *pgt,
+				 unsigned long vaddr, unsigned long size,
+				 int (*cb)(unsigned long vaddr,
+					   unsigned long phys,
+					   unsigned long size,
+					   u64 prot, void *arg),
+				 void *arg)
+{
+	unsigned long cur_vaddr, cur_size, phys;
+	u64 prot;
+	int ret;
+
+	while (size) {
+		pkvm_pgtable_lookup_range(pgt, vaddr, size, &cur_vaddr,
+					  &cur_size, &phys, &prot);
+		if (cur_size == 0 || cur_vaddr != vaddr)
+			return -EPERM;
+
+		ret = cb(cur_vaddr, phys, cur_size, prot, arg);
+		if (ret)
+			return ret;
+
+		vaddr += cur_size;
+		size -= cur_size;
+	}
+
+	return 0;
+}
+
+struct check_walk_data {
+	enum pkvm_page_state expected_state;
+	enum pkvm_page_state (*get_page_state)(struct pkvm_pgtable *pgt, void *ptep);
+};
+
+static int check_pgstate_walker(struct pkvm_pgtable_visit_ctx *ctx,
+				unsigned long walk_flags,
+				void *const arg)
+{
+	struct check_walk_data *data = arg;
+	enum pkvm_page_state state = data->get_page_state(ctx->pgt, ctx->ptep);
+
+	return state == data->expected_state ? 0 : -EPERM;
+}
+
+static int __check_pgstate(struct pkvm_pgtable *pgt, unsigned long vaddr,
+			   unsigned long size, struct check_walk_data *data)
+{
+	struct pkvm_pgtable_walker walker = {
+		.cb = check_pgstate_walker,
+		.arg = data,
+		.walk_flags = PKVM_PGTABLE_WALK_LEAF,
+	};
+
+	return pkvm_pgtable_walk(pgt, vaddr, size, &walker);
+}
+
+static enum pkvm_page_state host_get_mmio_page_state(struct pkvm_pgtable *pgt, void *ptep)
+{
+	if (pgt->pgt_ops->pte_annotated(ptep))
+		return PKVM_PAGE_NONE;
+
+	return pgt->pgt_ops->pte_pgstate(ptep);
+}
+
+static enum pkvm_page_state guest_get_page_state(struct pkvm_pgtable *pgt, void *ptep)
+{
+	if (!pgt->pgt_ops->pte_present(ptep))
+		return PKVM_PAGE_NONE;
+
+	return pgt->pgt_ops->pte_pgstate(ptep);
+}
+
+static int check_host_mmio_pgstate(unsigned long phys, unsigned long size,
+				   enum pkvm_page_state expected_state)
+{
+	struct check_walk_data data = {
+		.expected_state = expected_state,
+		.get_page_state = host_get_mmio_page_state,
+	};
+
+	return __check_pgstate(&host_mmu, phys, size, &data);
+}
+
+static int check_guest_pgstate(struct pkvm_vm *pkvm_vm,
+			       unsigned long gpa, unsigned long size,
+			       enum pkvm_page_state expected_state)
+{
+	struct check_walk_data data = {
+		.expected_state = expected_state,
+		.get_page_state = guest_get_page_state,
+	};
+
+	return __check_pgstate(&pkvm_vm->mmu, gpa, size, &data);
+}
+
+static int __check_guest_host_state(unsigned long gpa, unsigned long hpa,
+				    unsigned long size, u64 prot, void *arg)
+{
+	enum pkvm_page_state host_state = *(enum pkvm_page_state *)arg;
+	enum pkvm_owner_id owner = (host_state == PKVM_PAGE_OWNED ||
+				    host_state == PKVM_PAGE_SHARED_OWNED) ?
+				   PKVM_ID_HOST : PKVM_ID_GUEST;
+
+	return check_host_mem_pgstate(hpa, size, host_state, owner, false);
+}
+
+static int check_guest_host_state(struct pkvm_vm *pkvm_vm,
+				  unsigned long gpa, unsigned long size,
+				  enum pkvm_page_state guest_state,
+				  enum pkvm_page_state host_state)
+{
+	int ret;
+
+	ret = check_guest_pgstate(pkvm_vm, gpa, size, guest_state);
+	if (ret)
+		return ret;
+
+	return for_each_contig_range(&pkvm_vm->mmu, gpa, size,
+				     __check_guest_host_state, &host_state);
+}
+
+static int __host_unshare_guest(unsigned long gpa, unsigned long hpa,
+				unsigned long size, u64 prot, void *arg)
+{
+	struct pkvm_vm *pkvm_vm = to_pkvm((struct kvm *)arg);
+	int ret;
+
+	ret = pkvm_pgtable_unmap(&pkvm_vm->mmu, gpa, hpa, size);
+	if (ret)
+		return ret;
+
+	for_each_pkvm_page(page, hpa, size) {
+		BUG_ON(!page->host_share_guest_count);
+		BUG_ON(page->host_share_hyp_count);
+		BUG_ON(page->owner != PKVM_ID_HOST);
+
+		if (!--page->host_share_guest_count)
+			page->host_state = PKVM_PAGE_OWNED;
+	}
+
+	return 0;
+}
+
+static int __guest_share_host(unsigned long gpa, unsigned long hpa,
+			      unsigned long size, u64 prot, void *arg)
+{
+	struct kvm_vcpu *vcpu = arg;
+	struct pkvm_vm *pkvm_vm = to_pkvm_vcpu(vcpu)->pkvm_vm;
+
+	prot = pkvm_pte_set_pgstate(prot, &pkvm_vm->mmu, PKVM_PAGE_SHARED_OWNED);
+	BUG_ON(pkvm_pgtable_map(&pkvm_vm->mmu, gpa, hpa, size, prot,
+				&vcpu->arch.pkvm.guest_mmu_memcache));
+
+	BUG_ON(pkvm_pgtable_map(&host_mmu, hpa, hpa, size,
+				host_mmu_pte_prot(true, false), NULL));
+	set_host_mem_pgstate(hpa, size, PKVM_PAGE_SHARED_BORROWED, PKVM_ID_GUEST);
+
+	return 0;
+}
+
+static int __guest_unshare_host(unsigned long gpa, unsigned long hpa,
+				unsigned long size, u64 prot, void *arg)
+{
+	struct kvm_vcpu *vcpu = arg;
+	struct pkvm_vm *pkvm_vm = to_pkvm_vcpu(vcpu)->pkvm_vm;
+
+	BUG_ON(pkvm_pgtable_unmap(&host_mmu, hpa, hpa, size));
+	set_host_mem_pgstate(hpa, size, PKVM_PAGE_NONE, PKVM_ID_GUEST);
+
+	prot = pkvm_pte_set_pgstate(prot, &pkvm_vm->mmu, PKVM_PAGE_OWNED);
+	BUG_ON(pkvm_pgtable_map(&pkvm_vm->mmu, gpa, hpa, size, prot,
+				&vcpu->arch.pkvm.guest_mmu_memcache));
+
+	return 0;
+}
+
+static bool gpa_range_overlaps_pvmfw(struct kvm *kvm,
+				     unsigned long gpa, unsigned long size,
+				     unsigned long *gpa_offset,
+				     unsigned long *pvmfw_offset,
+				     unsigned long *ovlp_size)
+{
+	struct kvm_pkvm_vm *pkvm = &kvm->arch.pkvm;
+	unsigned long start, end;
+
+	if (!pkvm_vm_has_pvmfw(kvm))
+		return false;
+
+	/* intersection between [gpa, gpa + size) and pvmfw region */
+	start = max(gpa, pkvm->pvmfw_load_addr);
+	end = min(gpa + size, pkvm->pvmfw_load_addr + pvmfw_size);
+
+	if (end <= start)
+		return false;
+
+	*gpa_offset = start - gpa;
+	*pvmfw_offset = start - pkvm->pvmfw_load_addr;
+	*ovlp_size = end - start;
+	return true;
+}
+
+static bool is_valid_addr_range(unsigned long addr, unsigned long size, bool page_aligned)
+{
+	if (!size || addr + size < addr || PAGE_ALIGN(addr + size) < (addr + size))
+		return false;
+
+	return page_aligned ? PAGE_ALIGNED(addr) && PAGE_ALIGNED(size) : true;
+}
+
+static bool is_valid_pa_range(unsigned long addr, unsigned long size, bool page_aligned)
+{
+	return is_valid_addr_range(addr, size, page_aligned) &&
+	       addr + size < MAXMEM;
+}
+
+static int need_memcache_topup(struct pkvm_memcache *mc, unsigned long size,
+			       unsigned long *need_pages)
+{
+	/* Assume the worst case. */
+	unsigned long min_pages = __pkvm_pgtable_max_pages(size >> PAGE_SHIFT);
+
+	if (mc->count < min_pages) {
+		*need_pages = min_pages;
+		return -E2BIG;
+	}
+
+	return 0;
+}
+
+int pkvm_hyp_mmu_init(void *pool_base, unsigned long pool_pages)
+{
+	struct pkvm_pgtable_cap cap = {
+		.level = pgtable_l5_enabled() ? 5 : 4,
+		.allowed_pgsz = (1 << PG_LEVEL_2M) | (1 << PG_LEVEL_4K),
+		.table_prot = (u64)_KERNPG_TABLE_NOENC,
+	};
+
+	if (boot_cpu_has(X86_FEATURE_GBPAGES))
+		cap.allowed_pgsz |= 1 << PG_LEVEL_1G;
+
+	pkvm_early_alloc_init(pool_base, pool_pages << PAGE_SHIFT);
+
+	return pkvm_pgtable_init(&hyp_mmu, cap, &pkvm_early_alloc_mm_ops, &hyp_mmu_pgt_ops);
+}
+
+int pkvm_hyp_mmu_switch_to_buddy(void *pool_base, unsigned long pool_pages)
+{
+	unsigned long reserved_pages;
+	int ret;
+
+	/* Get the early alloc used pages and reserve them in hyp_mmu_pool */
+	if (hyp_mmu.mm_ops != &pkvm_early_alloc_mm_ops)
+		return -EINVAL;
+
+	reserved_pages = pkvm_early_alloc_nr_used_pages();
+	/* Enable buddy allocator */
+	ret = pkvm_pool_init(&hyp_mmu_pool, __pkvm_pa(pool_base) >> PAGE_SHIFT,
+			     pool_pages, reserved_pages);
+	if (ret)
+		return ret;
+
+	if (reserved_pages) {
+		/*
+		 * As the early alloc mm_ops was used to allocate mmu
+		 * page-table pages, the refcount of each page-table pages
+		 * was not maintained at that time. This should be fixed.
+		 */
+		ret = fix_hyp_mmu_page_refcnt();
+		if (ret)
+			return ret;
+	}
+
+	hyp_mmu.mm_ops = &hyp_mmu_mm_ops;
+	return 0;
+}
+
+void pkvm_hyp_mmu_load(void)
+{
+	native_write_cr3(hyp_mmu.root_pa);
+}
+
+int pkvm_hyp_mmu_finalize(hyp_mmu_finalize_fn_t fn)
+{
+	return fn ? fn(&hyp_mmu) : 0;
+}
+
+int pkvm_hyp_mmu_map(unsigned long vaddr, unsigned long phys,
+		     unsigned long size, u64 prot)
+{
+	if (WARN_ON(!__is_canonical_address(vaddr, boot_cpu_data.x86_virt_bits)))
+		return -EINVAL;
+	vaddr &= (1ULL << boot_cpu_data.x86_virt_bits) - 1;
+
+	return pkvm_pgtable_map(&hyp_mmu, vaddr, phys, size, prot, NULL);
+}
+
+#ifdef CONFIG_PKVM_X86_DEBUG
+void pkvm_hyp_mmu_clone_host(unsigned long start_vaddr)
+{
+	int i = hyp_mmu_vaddr_to_index(start_vaddr, hyp_mmu.cap.level);
+	u64 *host_cr3 = __pkvm_va(__native_read_cr3() & PAGE_MASK);
+	u64 *ptep = __pkvm_va(hyp_mmu.root_pa);
+
+	for (; i < PTRS_PER_PTE; i++)
+		ptep[i] = host_cr3[i];
+}
+#endif
+
+int pkvm_host_mmu_init(void *pool_base, unsigned long pool_pages,
+		       const struct pkvm_mem_info infos[], int nr_infos,
+		       host_mmu_init_fn_t fn)
+{
+	struct memblock_region *reg;
+	unsigned long phys;
+	int ret, i;
+
+	pkvm_spin_lock_init(&host_mmu_lock);
+
+	if (!fn)
+		return -EOPNOTSUPP;
+
+	ret = fn(&host_mmu, pool_base, pool_pages);
+	if (ret)
+		return ret;
+
+	/* Map memory blocks with RWX permissions */
+	for (i = 0; i < pkvm_memblock_nr; i++) {
+		reg = &pkvm_memory[i];
+		ret = host_mmu_map((unsigned long)reg->base,
+				   (unsigned long)reg->size, false);
+		if (ret)
+			return ret;
+
+	}
+
+	/* Map holes between memblocks as MMIO with RWX permissions */
+	for (i = phys = 0; i < pkvm_memblock_nr; i++, phys = reg->base + reg->size) {
+		reg = &pkvm_memory[i];
+		ret = host_mmu_map(phys, (unsigned long)reg->base - phys, true);
+		if (ret)
+			return ret;
+	}
+
+	/*
+	 * Unmap the memory range in the pkvm_mem_info, which includes the pkvm
+	 * TEXT/DATA and its reserved memory, to protect the pKVM hypervisor
+	 * from the host VM.
+	 */
+	for (i = 0; i < nr_infos; i++) {
+#ifdef CONFIG_PKVM_X86_DEBUG
+		/*
+		 * Only keep the pKVM TEXT/DATA mapped in the host mmu to allow
+		 * the host to access pKVM's text and data for debugging, and
+		 * unmap all the other regions i.e., pKVM reserved memory region
+		 * which the host doesn't need to access.
+		 */
+		if (infos[i].type != PKVM_TEXT_DATA) {
+			ret = host_mmu_unmap(infos[i].pa, infos[i].size);
+			if (ret)
+				return ret;
+		}
+#else
+		ret = host_mmu_unmap(infos[i].pa, infos[i].size);
+		if (ret)
+			return ret;
+#endif
+	}
+
+	/* Unmap pvmfw memory to protect it from the host */
+	if (pvmfw_present) {
+		ret = host_mmu_unmap(pvmfw_base, pvmfw_size);
+		if (ret)
+			return ret;
+	}
+
+	/*
+	 * Ramoops memory is reserved in e820 so it is treated as MMIO by default,
+	 * whereas it is used by the hypervisor as well. Mark it as shared-borrowed
+	 * to prevent donating it to the hypervisor as MMIO.
+	 */
+	if (pkvm_ramoops_console_size) {
+		u64 prot = host_mmu.pgt_ops->pte_mk_pgstate(PKVM_PAGE_SHARED_BORROWED) |
+			   host_mmu_pte_prot(true, false);
+
+		ret = pkvm_pgtable_map(&host_mmu, pkvm_ramoops_console_pa,
+				       pkvm_ramoops_console_pa, pkvm_ramoops_console_size,
+				       prot, NULL);
+		if (ret)
+			return ret;
+	}
+
+	return verify_host_mmu_pgstate();
+}
+
+int pkvm_host_mmu_finalize(host_mmu_finalize_fn_t fn)
+{
+	return fn ? fn(&host_mmu) : 0;
+}
+
+int pkvm_host_mmu_handle_fault(unsigned long gpa)
+{
+	struct range range, cur;
+	int level, ret;
+	u64 pte;
+
+	/*
+	 * All the memory and MMIO holes have already been mapped in the host MMU
+	 * during initialization, except for the MMIO in the high-end addresses.
+	 * Handle MMIO only.
+	 */
+	if (pkvm_find_addr_range(gpa, &range)) {
+		pkvm_err_ratelimited("Host access to protected memory at 0x%lx\n", gpa);
+		return -EPERM;
+	}
+
+	pkvm_host_mmu_lock();
+
+	ret = pkvm_pgtable_lookup(&host_mmu, gpa, &pte, &level);
+	if (ret) {
+		pkvm_host_mmu_unlock();
+		return ret;
+	}
+
+	if (host_mmu.pgt_ops->pte_present(&pte)) {
+		/*
+		 * Some other CPU has just mapped this gpa in the host MMU. Vmenter
+		 * the host VM and retry.
+		 */
+		pkvm_host_mmu_unlock();
+		return 0;
+	}
+
+	if (host_mmu.pgt_ops->pte_annotated(&pte)) {
+		pkvm_err_ratelimited("Host access to %s at 0x%lx\n",
+				     is_pvmfw(gpa) ? "pvmfw memory" : "protected MMIO",
+				     gpa);
+		pkvm_host_mmu_unlock();
+		return -EPERM;
+	}
+
+	ret = -EFAULT;
+	BUG_ON(level > host_mmu.cap.level);
+	/*
+	 * Based on the looked up level, find out the maximum possible page-size
+	 * aligned address range which contains the GPA address for installing
+	 * the MMIO mapping, to minimize memory consumption.
+	 */
+	for (; level > PG_LEVEL_NONE; level--) {
+		unsigned long size;
+
+		if (!((1 << level) & host_mmu.cap.allowed_pgsz))
+			continue;
+
+		size = host_mmu.pgt_ops->level_to_size(level);
+		cur.start = ALIGN_DOWN(gpa, size);
+		cur.end = cur.start + size - 1;
+
+		if (range_contains(&range, &cur)) {
+			/*
+			 * TODO: In case the host mmu free pages are not
+			 * enough, -ENOMEM will be returned. This could be
+			 * handled by unmaping some other MMIO mapped for the
+			 * host VM to reclaim some mmu pages and try again.
+			 */
+			ret = host_mmu_map(cur.start, size, true);
+			break;
+		}
+	}
+
+	if (ret)
+		pkvm_err("No valid range found to map host GPA 0x%lx, err %d\n", gpa, ret);
+
+	pkvm_host_mmu_unlock();
+	return ret;
+}
+
+void pkvm_guest_mmu_setup(const struct pkvm_pgtable_ops *pgt_ops,
+			  struct pkvm_pgtable_cap pgt_cap)
+{
+	guest_mmu_pgt_ops = pgt_ops;
+	guest_mmu_pgt_cap = pgt_cap;
+}
+
+int pkvm_guest_mmu_max_level(void)
+{
+	return guest_mmu_pgt_cap.level;
+}
+
+int pkvm_guest_mmu_init(struct pkvm_vm *pkvm_vm, phys_addr_t pgd_pa)
+{
+	struct kvm_pkvm_vm *shared_pkvm = &pkvm_vm->shared_kvm->arch.pkvm;
+	int ret;
+
+	if (!PAGE_ALIGNED(pgd_pa))
+		return -EINVAL;
+
+	/*
+	 * The donated page will be cleared when allocating it from the pool,
+	 * before using it for the root pgd. Thus no need to clear it now.
+	 */
+	ret = pkvm_host_donate_hyp(pgd_pa, PAGE_SIZE, false);
+	if (ret)
+		return ret;
+
+	ret = pkvm_pool_init(&pkvm_vm->mmu_pool, pkvm_phys_to_pfn(pgd_pa), 1, 0);
+	if (ret)
+		goto undonate;
+
+	pkvm_spin_lock_init(&pkvm_vm->mmu_lock);
+
+	current_vm = pkvm_vm;
+	ret = pkvm_pgtable_init(&pkvm_vm->mmu, guest_mmu_pgt_cap,
+				&guest_mmu_mm_ops, guest_mmu_pgt_ops);
+	current_vm = NULL;
+	if (ret)
+		goto undonate;
+
+	init_pkvm_mmu_memcache(&shared_pkvm->guest_mmu_teardown_mc);
+
+	return 0;
+
+undonate:
+	pkvm_hyp_donate_host(pgd_pa, PAGE_SIZE, false);
+	return ret;
+}
+
+void pkvm_guest_mmu_destroy(struct pkvm_vm *pkvm_vm)
+{
+	struct kvm_pkvm_vm *shared_pkvm = &pkvm_vm->shared_kvm->arch.pkvm;
+
+	host_reclaim_guest_pages(pkvm_vm);
+
+	current_vm = pkvm_vm;
+	pkvm_pgtable_destroy(&pkvm_vm->mmu);
+	current_vm = NULL;
+
+	/*
+	 * Drain per VM pool after destroying the page-table so the pool
+	 * contains all pages freed during that step.
+	 */
+	drain_pool(&pkvm_vm->mmu_pool, &shared_pkvm->guest_mmu_teardown_mc);
+}
+
+int pkvm_guest_mmu_refill_memcache(struct pkvm_vcpu *pkvm_vcpu)
+{
+	struct kvm_vcpu *vcpu = &pkvm_vcpu->vcpu;
+	struct pkvm_memcache *host_mc;
+
+	host_mc = &pkvm_vcpu->shared_vcpu->arch.pkvm.guest_mmu_memcache;
+
+	return pkvm_refill_memcache(&vcpu->arch.pkvm.guest_mmu_memcache,
+				    READ_ONCE(host_mc->count), host_mc);
+}
+
+void pkvm_guest_mmu_free_memcache(struct pkvm_vcpu *pkvm_vcpu)
+{
+	struct kvm_pkvm_vm *shared_pkvm = &pkvm_vcpu->pkvm_vm->shared_kvm->arch.pkvm;
+	struct pkvm_memcache *vcpu_mc = &pkvm_vcpu->vcpu.arch.pkvm.guest_mmu_memcache;
+	void *addr;
+
+	while (vcpu_mc->count) {
+		/* Drain hyp owned memcache and push pages to the teardown memcache */
+		addr = pop_pkvm_memcache_page(vcpu_mc, pkvm_phys_to_virt);
+
+		/*
+		 * Since pages comes from non-used memcache, there is no need to
+		 * zero them before pushing to teardown_mc (which host can
+		 * access after donating them back to the host in next step).
+		 *
+		 * Assume that the host frees all vCPUs sequentially, so no need
+		 * to take a lock to protect the host's guest_mmu_teardown_mc from
+		 * concurrent access.
+		 */
+		push_pkvm_memcache_page(&shared_pkvm->guest_mmu_teardown_mc, addr,
+					pkvm_virt_to_host_gpa);
+		pkvm_hyp_donate_host(__pkvm_pa(addr), PAGE_SIZE, false);
+	}
+}
+
+/**
+ * pkvm_host_donate_hyp() - Donate memory pages from host to hypervisor.
+ * @phys:	Physical address of the memory region to donate.
+ * @size:	Size of the memory region to donate.
+ * @clear:	If true, clear the memory region after donating.
+ *
+ * The donation transfers ownership of the memory pages in range
+ * [@phys, @phys + @size) from the host to the hypervisor, thus protecting them
+ * from accessing by the host. The @phys and @size are required to be PAGE_SIZE
+ * aligned (@size is also required to be non-zeroed value).
+ *
+ * The donated memory pages are annotated with PKVM_ID_HYP owner id in the host
+ * mmu, and page states are updated to PKVM_PAGE_NONE, to indicate the ownership
+ * has been transferred to the hypervisor.
+ *
+ * Returns: 0 on success, or a negative error code on failure.
+ */
+int pkvm_host_donate_hyp(unsigned long phys, unsigned long size, bool clear)
+{
+	int ret;
+
+	if (!is_valid_pa_range(phys, size, true))
+		return -EINVAL;
+
+	pkvm_host_mmu_lock();
+
+	ret = check_host_mem_pgstate(phys, size, PKVM_PAGE_OWNED, PKVM_ID_HOST, true);
+	if (ret)
+		goto unlock;
+
+	/* The vaddr == phys for the host MMU. */
+	ret = pkvm_pgtable_unmap(&host_mmu, phys, phys, size);
+	/*
+	 * pkvm_pgtable_unmap() shouldn't fail here unless there is a bug.
+	 * Furthermore, if it fails, it means some (maybe not all) pages in the
+	 * range remain mapped in the host mmu, whereas their state will be
+	 * changed to PKVM_PAGE_NONE below, causing an inconsistency between the
+	 * page state and the mapping, which may lead to unexpected behavior. So
+	 * panic if it fails.
+	 */
+	BUG_ON(ret);
+
+	set_host_mem_pgstate(phys, size, PKVM_PAGE_NONE, PKVM_ID_HYP);
+unlock:
+	pkvm_host_mmu_unlock();
+
+	if (!ret && clear) {
+		/*
+		 * No need to flush CPU cache, like what pkvm_clear_memory()
+		 * does, as the pKVM hypervisor doesn't access memory via
+		 * non-coherent DMA (actually there is no DMA in the pKVM
+		 * hypervisor).
+		 */
+		memset(__pkvm_va(phys), 0, size);
+	}
+
+	return ret;
+}
+
+/*
+ * pkvm_host_donate_hyp_share_ro() - Donate host memory to the hypervisor and
+ *				     re-map it back as read-only.
+ * @phys:	Physical base address of the memory region to donate.
+ * @size:	Size of the memory region in bytes.
+ * @clear:	If true, zero-initialize the memory region during donation.
+ *
+ * This function transfers ownership of the physical memory range [@phys, @phys + @size)
+ * from the host to the hypervisor. While the hypervisor becomes the primary owner,
+ * the memory is mapped back into the host's page tables with Read-Only (RO)
+ * permissions. This ensures the host can still read the data but is prevented
+ * from modifying it.
+ *
+ * Constraints:
+ * - @phys and @size must be PAGE_SIZE aligned.
+ * - @size must be non-zero.
+ *
+ * Return: 0 on success, negative error code on failure.
+ */
+int pkvm_host_donate_hyp_share_ro(unsigned long phys, unsigned long size, bool clear)
+{
+	int ret;
+
+	if (!is_valid_pa_range(phys, size, true))
+		return -EINVAL;
+
+	pkvm_host_mmu_lock();
+
+	ret = check_host_mem_pgstate(phys, size, PKVM_PAGE_OWNED, PKVM_ID_HOST, true);
+	if (ret)
+		goto unlock;
+
+	/* The vaddr == phys for the host MMU. */
+	ret = pkvm_pgtable_map(&host_mmu, phys, phys, size,
+			       host_mmu_pte_prot(false, false), NULL);
+	BUG_ON(ret);
+
+	set_host_mem_pgstate(phys, size, PKVM_PAGE_SHARED_BORROWED, PKVM_ID_HYP);
+unlock:
+	pkvm_host_mmu_unlock();
+
+	if (!ret && clear) {
+		/*
+		 * No need to flush CPU cache, like what pkvm_clear_memory()
+		 * does, as the pKVM hypervisor doesn't access memory via
+		 * non-coherent DMA (actually there is no DMA in the pKVM
+		 * hypervisor).
+		 */
+		memset(__pkvm_va(phys), 0, size);
+	}
+
+	return ret;
+}
+
+/**
+ * pkvm_hyp_donate_host() - Donate memory pages from hypervisor to host.
+ * @phys:	Physical address of the memory region to donate.
+ * @size:	Size of the memory region to donate.
+ * @clear:	If true, clear the memory region before donating.
+ *
+ * The donation transfers ownership of the memory pages in range
+ * [@phys, @phys + @size) from the hypervisor to the host, thus allowing the
+ * host to access those pages. The @phys and @size are required to be PAGE_SIZE
+ * aligned (@size is also required to be non-zeroed value).
+ *
+ * The donated memory pages are mapped in the host mmu with read/write/exec
+ * permission and WB memory type in the host mmu, with the page states being
+ * updated to PKVM_PAGE_OWNED to indicate the ownership has been transferred to
+ * the host.
+ */
+void pkvm_hyp_donate_host(unsigned long phys, unsigned long size, bool clear)
+{
+	u64 expected_pgstates = (1 << PKVM_PAGE_NONE) | (1 << PKVM_PAGE_SHARED_BORROWED);
+	void *va = __pkvm_va(phys);
+	int ret;
+
+	if (!is_valid_pa_range(phys, size, true)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (clear)
+		pkvm_clear_memory(va, size);
+
+	pkvm_host_mmu_lock();
+
+	ret = check_host_mem_pgstate_mask(phys, size, expected_pgstates, PKVM_ID_HYP,
+					  false);
+	if (ret)
+		goto unlock;
+
+	/*
+	 * pkvm_pgtable_map() shouldn't fail here unless there is a bug.
+	 * Furthermore, if it fails, it means some (maybe not all) pages in the
+	 * range remain not mapped in the host mmu, whereas their state will be
+	 * changed to PKVM_PAGE_OWNED below, causing an inconsistency between
+	 * the page state and the mapping, which may lead to unexpected
+	 * behavior. So panic if it fails.
+	 */
+	BUG_ON(ret = pkvm_pgtable_map(&host_mmu, phys, phys, size,
+				      host_mmu_pte_prot(true, false), NULL));
+
+	set_host_mem_pgstate(phys, size, PKVM_PAGE_OWNED, PKVM_ID_HOST);
+unlock:
+	pkvm_host_mmu_unlock();
+out:
+	/*
+	 * pkvm_hyp_donate_host() is only used by the pKVM hypervisor itself,
+	 * not on the host behalf, so it is supposed to be called with correct
+	 * parameters, and only for pages that are known to be owned by the
+	 * hypervisor. So any error here means a pKVM bug.
+	 */
+	BUG_ON(ret);
+}
+
+/**
+ * pkvm_host_donate_hyp_mmio() - Donate MMIO pages from host to hypervisor
+ * @phys:	Physical address of the MMIO region to donate.
+ * @size:	Size of the MMIO region to donate.
+ *
+ * This operation transfers ownership of the MMIO pages in range
+ * [@phys, @phys + @size) from the host to the hypervisor thereby revoking host
+ * access.
+ * @phys and @size are required to be PAGE_SIZE aligned (@size is also required
+ * to be non-zeroed value) to make sure the caller is aware that only PAGE_SIZE
+ * aligned memory range can be donated.
+ *
+ * Returns: 0 on success, or a negative error code on failure.
+ */
+int pkvm_host_donate_hyp_mmio(unsigned long phys, unsigned long size)
+{
+	int ret;
+
+	if (!is_valid_pa_range(phys, size, true))
+		return -EINVAL;
+
+	if (!is_mmio_range(phys, size))
+		return -EINVAL;
+
+	pkvm_host_mmu_lock();
+
+	ret = check_host_mmio_pgstate(phys, size, PKVM_PAGE_OWNED);
+	if (ret)
+		goto unlock;
+
+	/* The vaddr == phys for the host MMU. */
+	ret = pkvm_pgtable_set_owner(&host_mmu, phys, size, PKVM_ID_HYP);
+	if (ret)
+		goto unlock;
+
+	ret = pkvm_hyp_mmu_map((unsigned long)__pkvm_va(phys), phys, size,
+			       (u64)pgprot_val(PAGE_KERNEL_IO_NOCACHE));
+	if (ret) {
+		WARN_ON(ret != -ENOMEM);
+		/*
+		 * TODO: clean up on failure: unmap any pages we've mapped in
+		 * the hyp mmu (if mapping failed in the middle) and restore
+		 * host ownership.
+		 * This would require, in particular, implementing TLB shootdown
+		 * for the hyp mmu.
+		 */
+	}
+unlock:
+	pkvm_host_mmu_unlock();
+	return ret;
+}
+
+/**
+ * pkvm_host_share_hyp() - Shares host pages with the pKVM hypervisor.
+ * @phys:	Physical address of the memory region to share.
+ * @size:	Size of the memory region to share.
+ *
+ * The sharing transfers the memory pages in range [@phys, @phys + @size) which
+ * are exclusively owned by the host to shared-owned by the host and the pKVM
+ * hypervisor. The host_share_hyp_count counters of those memory pages are
+ * incremented. If a memory page is already shared-owned, page state will not be
+ * changed but only the counter will be incremented. @phys and @size are not
+ * required to be PAGE_SIZE aligned (@size is required to be non-zeroed value)
+ * to support sharing arbitrary unaligned memory regions.
+ *
+ * Returns: 0 on success, or a negative error code on failure.
+ */
+int pkvm_host_share_hyp(unsigned long phys, unsigned long size)
+{
+	int ret;
+
+	if (!is_valid_pa_range(phys, size, false) || !is_memory_range(phys, size))
+		return -EINVAL;
+
+	pkvm_host_mmu_lock();
+
+	for_each_pkvm_page(page, phys, size) {
+		switch (page->host_state) {
+		case PKVM_PAGE_OWNED:
+			BUG_ON(page->owner != PKVM_ID_HOST);
+			BUG_ON(page->host_share_hyp_count);
+			BUG_ON(page->host_share_guest_count);
+			continue;
+		case PKVM_PAGE_SHARED_OWNED:
+			BUG_ON(page->owner != PKVM_ID_HOST);
+			if (page->host_share_hyp_count == U16_MAX) {
+				ret = -ENOSPC;
+				goto unlock;
+			}
+
+			/*
+			 * Allow sharing an already shared page as long as it is
+			 * shared with the hypervisor, not with a guest.
+			 */
+			if (page->host_share_hyp_count) {
+				BUG_ON(page->host_share_guest_count);
+				continue;
+			}
+
+			fallthrough;
+		default:
+			ret = -EPERM;
+			goto unlock;
+		}
+	}
+
+	for_each_pkvm_page(page, phys, size) {
+		page->host_state = PKVM_PAGE_SHARED_OWNED;
+		page->host_share_hyp_count++;
+	}
+
+	ret = 0;
+
+unlock:
+	pkvm_host_mmu_unlock();
+
+	return ret;
+}
+
+/**
+ * pkvm_host_unshare_hyp() - Un-share host pages with the pKVM hypervisor.
+ * @phys:	Physical address of the memory region to unshare.
+ * @size:	Size of the memory region to unshare.
+ *
+ * Decrements the host_share_hyp_count counter for the memory pages in range
+ * [@phys, @phys + @size) which are shared-owned owned by the host and the pKVM
+ * hypervisor, and if a page's host_share_hyp_count becomes zero, then changes
+ * this page's state to make it exclusively owned by the host. @phys and @size
+ * are not required to be PAGE_SIZE aligned (@size is required to be non-zeroed
+ * value), to support unsharing arbitrary unaligned memory regions.
+ */
+void pkvm_host_unshare_hyp(unsigned long phys, unsigned long size)
+{
+	int ret;
+
+	if (!is_valid_pa_range(phys, size, false)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	pkvm_host_mmu_lock();
+
+	ret = check_host_mem_pgstate(phys, size, PKVM_PAGE_SHARED_OWNED, PKVM_ID_HOST,
+				     false);
+	if (ret)
+		goto unlock;
+
+	for_each_pkvm_page(page, phys, size) {
+		/*
+		 * Even if host_share_hyp_count is 0 because the page is
+		 * shared with a guest, not with the hypervisor, it still
+		 * means a pKVM bug, since pkvm_host_unshare_hyp() is only
+		 * used by pKVM itself, for pages that are known to be
+		 * shared with the hypervisor.
+		 */
+		BUG_ON(!page->host_share_hyp_count);
+		if (--page->host_share_hyp_count)
+			continue;
+
+		page->host_state = PKVM_PAGE_OWNED;
+	}
+unlock:
+	pkvm_host_mmu_unlock();
+out:
+	/*
+	 * pkvm_host_unshare_hyp() is only used by the pKVM hypervisor itself,
+	 * not on the host behalf, so it is supposed to be called with correct
+	 * parameters, and only for pages that are known to be shared with the
+	 * hypervisor. So any error here means a pKVM bug.
+	 */
+	BUG_ON(ret);
+}
+
+/**
+ * pkvm_host_donate_guest() - Donate memory pages from host to guest.
+ * @vcpu:	Guest's vCPU in whose context the donation is requested.
+ * @gpa:	Guest physical address of the memory region to donate.
+ * @hpa:	Host physical address of the memory region to donate.
+ * @size:	Size of the memory region to donate.
+ *
+ * Maps the GPA range [@gpa, @gpa + @size) to the physical memory range
+ * [@hpa, @hpa + @size) in the guest mmu and transfers ownership of the pages in
+ * this range from the host to the guest, thus protecting them from accessing by
+ * the host. The guest must be a protected VM. The @gpa, @hpa and @size are
+ * required to be PAGE_SIZE aligned (@size is also required to be non-zero).
+ *
+ * The donated memory pages are annotated with PKVM_ID_GUEST owner id in the
+ * host mmu, and page states are updated to PKVM_PAGE_NONE, to indicate the
+ * ownership has been transferred to a guest.
+ *
+ * Returns: 0 on success, or a negative error code on failure.
+ */
+int pkvm_host_donate_guest(struct kvm_vcpu *vcpu, unsigned long gpa,
+			   unsigned long hpa, unsigned long size)
+{
+	u64 prot = guest_mmu_pte_prot(vcpu, gpa, true, PKVM_PAGE_OWNED);
+	struct pkvm_vm *pkvm_vm = to_pkvm_vcpu(vcpu)->pkvm_vm;
+	unsigned long gpa_offset, pvmfw_offset, load_size;
+	int ret;
+
+	if (!is_valid_addr_range(gpa, size, true) ||
+	    !is_valid_pa_range(hpa, size, true))
+		return -EINVAL;
+
+	if (WARN_ON_ONCE(!pkvm_is_protected_vcpu(vcpu)))
+		return -EPERM;
+
+	/* If the VM is not finalized yet, we don't know if we need to load pvmfw. */
+	if (!smp_load_acquire(&pkvm_vm->kvm.arch.pkvm.finalized))
+		return -EPERM;
+
+	pkvm_host_mmu_lock();
+	pkvm_guest_mmu_lock(pkvm_vm);
+
+	ret = check_host_mem_pgstate(hpa, size, PKVM_PAGE_OWNED, PKVM_ID_HOST, true);
+	if (ret)
+		goto unlock;
+
+	ret = check_guest_pgstate(pkvm_vm, gpa, size, PKVM_PAGE_NONE);
+	if (ret)
+		goto unlock;
+
+	/* The vaddr == phys for the host MMU. */
+	ret = pkvm_pgtable_unmap(&host_mmu, hpa, hpa, size);
+	/*
+	 * pkvm_pgtable_unmap() shouldn't fail here unless there is a bug.
+	 * See also comment in pkvm_host_donate_hyp().
+	 */
+	BUG_ON(ret);
+
+	set_host_mem_pgstate(hpa, size, PKVM_PAGE_NONE, PKVM_ID_GUEST);
+
+	if (gpa_range_overlaps_pvmfw(&pkvm_vm->kvm, gpa, size, &gpa_offset,
+				     &pvmfw_offset, &load_size)) {
+		/*
+		 * Make sure pvmfw is loaded into the guest memory pages after
+		 * enabling protection of these pages from the host, not before.
+		 */
+		smp_wmb();
+
+		memcpy(__pkvm_va(hpa + gpa_offset),
+		       __pkvm_va(pvmfw_base + pvmfw_offset),
+		       load_size);
+
+		/*
+		 * Make sure pvmfw is loaded into the guest memory pages before
+		 * mapping these pages for the guest, not after, to prevent the
+		 * guest from seeing old contents of these pages on another CPU.
+		 */
+		smp_wmb();
+	}
+
+	ret = pkvm_pgtable_map(&pkvm_vm->mmu, gpa, hpa, size, prot,
+			       &vcpu->arch.pkvm.guest_mmu_memcache);
+unlock:
+	pkvm_guest_mmu_unlock(pkvm_vm);
+	pkvm_host_mmu_unlock();
+
+	return ret;
+}
+
+/**
+ * pkvm_host_share_guest() - Share host pages with a guest.
+ * @vcpu:	Guest's vCPU in whose context the sharing is requested.
+ * @gpa:	Guest physical address of the memory region to share.
+ * @hpa:	Host physical address of the memory region to share.
+ * @size:	Size of the memory region to share.
+ * @writable:	If true, share with RWX permissions; if false, with RX.
+ *
+ * Maps the GPA range [@gpa, @gpa + @size) to the physical memory range
+ * [@hpa, @hpa + @size) in the guest mmu and changes the ownership state of
+ * the pages in this range from exclusively owned by the host to shared with the
+ * guest. The host_share_guest_count counters of the memory pages are
+ * incremented. If a memory page is already shared with a guest, page state will
+ * not be changed but only the counter will be incremented. The guest must be a
+ * non-protected VM. The @gpa, @hpa and @size are required to be PAGE_SIZE
+ * aligned (@size is also required to be non-zero).
+ *
+ * Returns: 0 on success, or a negative error code on failure.
+ */
+int pkvm_host_share_guest(struct kvm_vcpu *vcpu, unsigned long gpa,
+			  unsigned long hpa, unsigned long size,
+			  bool writable)
+{
+	u64 prot = guest_mmu_pte_prot(vcpu, gpa, writable,
+				      PKVM_PAGE_SHARED_BORROWED);
+	struct pkvm_vm *pkvm_vm = to_pkvm_vcpu(vcpu)->pkvm_vm;
+	int ret;
+
+	if (!is_valid_addr_range(gpa, size, true) ||
+	    !is_valid_pa_range(hpa, size, true) ||
+	    !is_memory_range(hpa, size))
+		return -EINVAL;
+
+	if (WARN_ON_ONCE(pkvm_is_protected_vcpu(vcpu)))
+		return -EPERM;
+
+	pkvm_host_mmu_lock();
+	pkvm_guest_mmu_lock(pkvm_vm);
+
+	ret = check_guest_pgstate(pkvm_vm, gpa, size, PKVM_PAGE_NONE);
+	if (ret)
+		goto unlock;
+
+	for_each_pkvm_page(page, hpa, size) {
+		switch (page->host_state) {
+		case PKVM_PAGE_OWNED:
+			BUG_ON(page->owner != PKVM_ID_HOST);
+			BUG_ON(page->host_share_guest_count);
+			BUG_ON(page->host_share_hyp_count);
+			continue;
+		case PKVM_PAGE_SHARED_OWNED:
+			BUG_ON(page->owner != PKVM_ID_HOST);
+			if (page->host_share_guest_count == U16_MAX) {
+				ret = -ENOSPC;
+				goto unlock;
+			}
+			/*
+			 * Allow sharing an already shared page as long as it is
+			 * shared with a guest, not with the hypervisor.
+			 */
+			if (page->host_share_guest_count) {
+				BUG_ON(page->host_share_hyp_count);
+				continue;
+			}
+
+			fallthrough;
+		default:
+			ret = -EPERM;
+			goto unlock;
+		}
+	}
+
+	for_each_pkvm_page(page, hpa, size) {
+		page->host_state = PKVM_PAGE_SHARED_OWNED;
+		page->host_share_guest_count++;
+	}
+
+	ret = pkvm_pgtable_map(&pkvm_vm->mmu, gpa, hpa, size, prot,
+			       &vcpu->arch.pkvm.guest_mmu_memcache);
+unlock:
+	pkvm_guest_mmu_unlock(pkvm_vm);
+	pkvm_host_mmu_unlock();
+
+	return ret;
+}
+
+/**
+ * pkvm_host_unshare_guest() - Un-share host pages with a guest.
+ * @kvm:	Guest VM to unshare the host pages with.
+ * @gpa:	Address of the guest physical address region to unshare.
+ * @size:	Size of the guest physical address region to unshare.
+ *
+ * Removes mappings for the GPA range [@gpa, @gpa + @size) in the guest mmu,
+ * decrements the host_share_guest_count counters of the physical memory pages
+ * which were mapped by this GPA range, and if a page's host_share_guest_count
+ * becomes zero, changes this page's state to exclusively owned by the host.
+ * The guest must be a non-protected VM. The @gpa and @size are required to be
+ * PAGE_SIZE aligned.
+ *
+ * Returns: 0 on success, or a negative error code on failure.
+ */
+int pkvm_host_unshare_guest(struct kvm *kvm, unsigned long gpa,
+			    unsigned long size)
+{
+	struct pkvm_vm *pkvm_vm = to_pkvm(kvm);
+	int ret;
+
+	if (!is_valid_addr_range(gpa, size, true))
+		return -EINVAL;
+
+	pkvm_host_mmu_lock();
+	pkvm_guest_mmu_lock(pkvm_vm);
+
+	ret = check_guest_host_state(pkvm_vm, gpa, size,
+				     PKVM_PAGE_SHARED_BORROWED,
+				     PKVM_PAGE_SHARED_OWNED);
+	if (ret)
+		goto unlock;
+
+	ret = for_each_contig_range(&pkvm_vm->mmu, gpa, size,
+				    __host_unshare_guest, kvm);
+unlock:
+	pkvm_guest_mmu_unlock(pkvm_vm);
+	pkvm_host_mmu_unlock();
+
+	return ret;
+}
+
+/**
+ * pkvm_host_test_clear_young_guest() - Test and optionally clear the access
+ *					flag in guest PTEs for host pages
+ *					shared with a guest.
+ * @kvm:	Guest VM.
+ * @gpa:	Address of the guest physical address region to test/clear the
+ *		access flag.
+ * @size:	Size of the guest physical address region to test/clear the
+ *		access flag.
+ * @mkold:	If true, clear the access flag if it is set.
+ *
+ * Checks if any of the pages mapped in the GPA range [@gpa, @gpa + @size) in
+ * the guest mmu are young, i.e. have the access bit set in their PTEs. If
+ * @mkold is true, also clears this bit for all those pages. The guest must be
+ * a non-protected VM.  The @gpa and @size are required to be PAGE_SIZE aligned.
+ *
+ * Does not flush the TLB after clearing the access flag. It is the caller's
+ * responsibility to flush the TLB when needed.
+ *
+ * Returns: 1 if any of the pages in the range had the access flag set, 0 if
+ * none of the pages had it set, or a negative error code on failure.
+ */
+int pkvm_host_test_clear_young_guest(struct kvm *kvm, unsigned long gpa,
+				     unsigned long size, bool mkold)
+{
+	struct pkvm_vm *pkvm_vm = to_pkvm(kvm);
+	int ret;
+
+	if (!is_valid_addr_range(gpa, size, true))
+		return -EINVAL;
+
+	if (WARN_ON_ONCE(pkvm_is_protected_vm(kvm)))
+		return -EPERM;
+
+	pkvm_guest_mmu_lock(pkvm_vm);
+	ret = pkvm_pgtable_test_clear_young(&pkvm_vm->mmu, gpa, size, mkold);
+	pkvm_guest_mmu_unlock(pkvm_vm);
+
+	return ret;
+}
+
+/**
+ * pkvm_guest_share_host() - Share guest pages with the host.
+ * @vcpu:	Guest's vCPU in whose context the sharing is requested.
+ * @gpa:	Guest physical address of the memory region to share.
+ * @size:	Size of the memory region to share.
+ * @need_mc_pages: To return the required number of pages in memcache.
+ *
+ * Changes the ownership state of the pages mapped by the GPA range [@gpa,
+ * @gpa + @size) in the guest mmu from exclusively owned by the guest to shared
+ * with the host, thus allowing the host to access them, with RWX permissions.
+ * The guest must be a protected VM and the pages in the range must have been
+ * previously donated to this guest. The @gpa and @size are required to be
+ * PAGE_SIZE aligned.
+ *
+ * If the return value is -E2BIG, it indicates that there are not enough pages
+ * in the guest mmu memcache, as pkvm_guest_share_host() may need to allocate
+ * additional pages for guest page table in order to split a huge mapping into
+ * smaller ones. In this case the required number of pages is returned in
+ * @need_mc_pages. Otherwise @need_mc_pages is not updated.
+ *
+ * Returns: 0 on success, or a negative error code on failure.
+ */
+int pkvm_guest_share_host(struct kvm_vcpu *vcpu, unsigned long gpa,
+			  unsigned long size, unsigned long *need_mc_pages)
+{
+	struct pkvm_vm *pkvm_vm = to_pkvm_vcpu(vcpu)->pkvm_vm;
+	int ret;
+
+	if (!is_valid_addr_range(gpa, size, true))
+		return -EINVAL;
+
+	pkvm_host_mmu_lock();
+	pkvm_guest_mmu_lock(pkvm_vm);
+
+	ret = check_guest_host_state(pkvm_vm, gpa, size, PKVM_PAGE_OWNED,
+				     PKVM_PAGE_NONE);
+	if (ret)
+		goto unlock;
+
+	ret = need_memcache_topup(&vcpu->arch.pkvm.guest_mmu_memcache,
+				  size, need_mc_pages);
+	if (ret)
+		goto unlock;
+
+	for_each_contig_range(&pkvm_vm->mmu, gpa, size, __guest_share_host,
+			      vcpu);
+unlock:
+	pkvm_guest_mmu_unlock(pkvm_vm);
+	pkvm_host_mmu_unlock();
+
+	return ret;
+}
+
+/**
+ * pkvm_guest_unshare_host() - Un-share guest pages with the host.
+ * @vcpu:	Guest's vCPU in whose context the unsharing is requested.
+ * @gpa:	Guest physical address of the memory region to unshare.
+ * @size:	Size of the memory region to unshare.
+ * @need_mc_pages: To return the required number of pages in memcache.
+ *
+ * Changes the ownership state of the pages mapped by the GPA range [@gpa,
+ * @gpa + @size) in the guest mmu from shared with the host to exclusively
+ * owned by the guest, thus protecting them from accessing by the host.
+ * The guest must be a protected VM and the pages in the range must have been
+ * previously donated to this guest and then shared by it with the host.
+ * The @gpa and @size are required to be PAGE_SIZE aligned.
+ *
+ * If the return value is -E2BIG, it indicates that there are not enough pages
+ * in the guest mmu memcache, as pkvm_guest_unshare_host() may need to allocate
+ * additional pages for guest page table in order to split a huge mapping into
+ * smaller ones. In this case the required number of pages is returned in
+ * @need_mc_pages. Otherwise @need_mc_pages is not updated.
+ *
+ * Returns: 0 on success, or a negative error code on failure.
+ */
+int pkvm_guest_unshare_host(struct kvm_vcpu *vcpu, unsigned long gpa,
+			    unsigned long size, unsigned long *need_mc_pages)
+{
+	struct pkvm_vm *pkvm_vm = to_pkvm_vcpu(vcpu)->pkvm_vm;
+	int ret;
+
+	if (!is_valid_addr_range(gpa, size, true))
+		return -EINVAL;
+
+	pkvm_host_mmu_lock();
+	pkvm_guest_mmu_lock(pkvm_vm);
+
+	ret = check_guest_host_state(pkvm_vm, gpa, size, PKVM_PAGE_SHARED_OWNED,
+				     PKVM_PAGE_SHARED_BORROWED);
+	if (ret)
+		goto unlock;
+
+	ret = need_memcache_topup(&vcpu->arch.pkvm.guest_mmu_memcache,
+				  size, need_mc_pages);
+	if (ret)
+		goto unlock;
+
+	for_each_contig_range(&pkvm_vm->mmu, gpa, size, __guest_unshare_host,
+			      vcpu);
+unlock:
+	pkvm_guest_mmu_unlock(pkvm_vm);
+	pkvm_host_mmu_unlock();
+
+	return ret;
+}
+
+/**
+ * pkvm_host_use_dma() - Pin host pages to be used for DMA.
+ * @phys:	Physical address of the memory region to pin.
+ * @size:	Size of the memory region to pin.
+ *
+ * Validates if the host is allowed to use the pages in range [@phys, @phys + @size)
+ * for DMA, and if so, pins those pages, i.e. increments their refcounts in the
+ * pkvm vmemmap, to indicate that the pages are used by the host for DMA. This will
+ * disallow donating those pages, thus ensuring protection of pVM memory and
+ * hypervisor memory from DMA from devices controlled by the host.
+ *
+ * Both PKVM_PAGE_OWNED and PKVM_PAGE_SHARED_OWNED pages (host owner) are
+ * accepted. SHARED_OWNED pages are already protected against guest donation by
+ * their page state, but the refcount is incremented for symmetry.
+ *
+ * Returns: 0 on success, or a negative error code on failure.
+ */
+int pkvm_host_use_dma(unsigned long phys, unsigned long size)
+{
+	int ret;
+
+	if (!is_valid_pa_range(phys, size, true))
+		return -EINVAL;
+
+	pkvm_host_mmu_lock();
+
+	if (is_memory_range(phys, size)) {
+		ret = check_host_mem_pgstate_mask(phys, size,
+						  BIT(PKVM_PAGE_OWNED) |
+						  BIT(PKVM_PAGE_SHARED_OWNED),
+						  PKVM_ID_HOST, false);
+		if (ret)
+			goto unlock;
+
+		for_each_pkvm_page(page, phys, size)
+			pkvm_page_ref_inc(page);
+	} else if (is_mmio_range(phys, size)) {
+		unsigned long addr;
+		u64 prot;
+
+		/*
+		 * Host may need to DMA-map reserved memory (e.g. RMRRs on Intel)
+		 * which is treated as MMIO by pKVM. Allow it, as long as the host is
+		 * allowed to access this memory. Cannot pin it, since MMIO pages are
+		 * not tracked in pkvm's vmemmap and thus have no refcount. Instead,
+		 * taint these pages by marking them as shared borrowed, thus
+		 * permanently prevent donating these pages later.
+		 */
+		for (addr = phys; addr < phys + size; addr += PAGE_SIZE) {
+			ret = check_host_mmio_pgstate(addr, PAGE_SIZE,
+						      PKVM_PAGE_SHARED_BORROWED);
+			/* Page already borrowed */
+			if (!ret)
+				continue;
+			ret = check_host_mmio_pgstate(addr, PAGE_SIZE, PKVM_PAGE_OWNED);
+			if (ret)
+				goto unlock;
+		}
+
+		prot = host_mmu.pgt_ops->pte_mk_pgstate(PKVM_PAGE_SHARED_BORROWED) |
+		       host_mmu_pte_prot(true, true);
+
+		ret = pkvm_pgtable_map(&host_mmu, phys, phys, size, prot, NULL);
+		WARN_ON_ONCE(ret && ret != -ENOMEM);
+	} else {
+		/*
+		 * For simplicity don't support DMA-mapping a range which is a mix of
+		 * both normal and reserved/MMIO pages.
+		 */
+		ret = -EINVAL;
+	}
+unlock:
+	pkvm_host_mmu_unlock();
+
+	return ret;
+}
+
+/**
+ * pkvm_host_unuse_dma() - Unpin host pages that were previously pinned for DMA.
+ * @phys:	Physical address of the memory region to unpin.
+ * @size:	Size of the memory region to unpin.
+ *
+ * Unpins the pages in range [@phys, @phys + @size) that were previously pinned
+ * via pkvm_host_use_dma(). Once pkvm_host_unuse_dma() is called for the given
+ * page as many times as pkvm_host_use_dma() was called for it, its refcount
+ * drops back to zero, indicating that the page is not used for the host DMA
+ * anymore and thus is allowed to be donated.
+ */
+void pkvm_host_unuse_dma(unsigned long phys, unsigned long size)
+{
+	if (WARN_ON_ONCE(!is_valid_pa_range(phys, size, true)))
+		return;
+
+	if (is_mmio_range(phys, size))
+		return;
+
+	if (WARN_ON_ONCE(!is_memory_range(phys, size)))
+		return;
+
+	pkvm_host_mmu_lock();
+
+	/* Stay paranoid */
+	if (WARN_ON_ONCE(check_host_mem_pgstate_mask(phys, size,
+						     BIT(PKVM_PAGE_OWNED) |
+						     BIT(PKVM_PAGE_SHARED_OWNED),
+						     PKVM_ID_HOST, false)))
+		goto unlock;
+
+	for_each_pkvm_page(page, phys, size)
+		pkvm_page_ref_dec(page);
+unlock:
+	pkvm_host_mmu_unlock();
+}
