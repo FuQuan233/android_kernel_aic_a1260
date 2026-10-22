@@ -178,7 +178,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix='arm-bpf-atomic-') as temp:
         temp = Path(temp)
         for frame in (False, True):
-            source, binary = temp / 'emitter.c', temp / 'emitter.so'
+            # dlopen caches a loaded path, so each frame layout needs its own
+            # library name to execute the newly compiled emitter.
+            source = temp / f'emitter-{int(frame)}.c'
+            binary = temp / f'emitter-{int(frame)}.so'
             source.write_text(harness(frame))
             subprocess.run(['cc', '-shared', '-fPIC', '-O2', '-Wall', '-Werror',
                             '-I' + str(ROOT / 'arch/arm/net'), str(source), '-o', str(binary)], check=True)
