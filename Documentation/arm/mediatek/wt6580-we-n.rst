@@ -408,8 +408,8 @@ Diagnostic commands are ``mmcstatus`` (clock/register snapshot),
 The last command opens only ``/dev/mmcblk0`` with ARM EABI
 ``O_RDONLY | O_DIRECT | O_LARGEFILE`` and reads its first MiB twice,
 reporting both CRC32 values. Every 64 KiB read bypasses the page cache;
-no block-write, erase or discard operation is requested. The diagnostic
-PID 1 never mounts an eMMC filesystem. Host tests check ARM open flags,
+no block-write, erase or discard operation is requested. The build #30 diagnostic
+PID 1 does not mount an eMMC filesystem. Host tests check ARM open flags,
 CRC calculation, repeated reads, short I/O, EINTR and descriptor cleanup.
 The MMC core still performs normal card initialization/mode selection.
 
@@ -421,6 +421,70 @@ first-MiB reads both yield CRC32 ``77bb957a`` with host error zero. DRM
 color-bar output remains active with zero RDMA underflow/abnormal counts.
 These checks do not establish write reliability, full-media integrity,
 Android filesystem mounting, suspend-to-RAM or high-speed tuning.
+
+Filesystem and shell environment
+--------------------------------
+
+The default build now includes static BusyBox 1.37.0 and musl 1.2.5,
+built from SHA256-pinned upstream source archives by
+``tools/wt6580/build-userspace.sh`` using Android Clang and compiler-rt.
+Sources, sysroot and binaries stay outside the kernel tree in
+``../out/wt6580-userspace``. No cross GCC or device-side shared libraries
+are required. Set ``USERSPACE=0`` for the smaller diagnostic-only image.
+Both upstream license texts are packaged under ``/usr/share/licenses``.
+
+PID 1 retains the CDC protocol, watchdog feeding, child reaping and reboot
+commands. ``sh COMMAND`` runs a non-interactive BusyBox shell with stdin
+from ``/dev/null`` and stdout/stderr streamed over CDC. It supports pipes,
+redirections and command lists, up to the protocol's 511-character limit.
+It is a new shell for each command; working-directory changes do not
+persist between commands. Output uses a nonblocking pipe reader so idle
+children and USB backpressure do not block PID 1. Completion is reported
+as ``[WT6580 shell exit=N]``. Host integration tests use real fork/exec and
+pipes to check long output, idle children, exit status and orphan reaping.
+
+``storage`` maps the kernel's GPT PARTNAME values to
+``/dev/block/by-name`` and the legacy MediaTek by-name path. Only labels
+that are safe path components are accepted. Partition numbers are not
+hardcoded. ``mountall`` probes the existing filesystems and mounts
+``system``, ``vendor``, ``userdata`` and ``cache`` read/write under
+``/mnt/system``, ``/mnt/vendor``, ``/mnt/data`` and ``/mnt/cache``.
+Mounts are requested explicitly over CDC; boot does not mount them.
+Ext4 ACLs, security xattrs and v2 quota support are enabled. The device's
+userdata requires CONFIG_QUOTA and CONFIG_QFMT_V2; build #31's kernel
+log explicitly identifies those missing options when mount returns EINVAL.
+
+For example::
+
+  storage
+  mountall
+  mounts
+  sh ls -l /mnt/system
+  sh grep '^ro.build.version' /mnt/system/build.prop
+  fsrwtest
+  umountall
+
+``fsrwtest`` creates a new temporary directory on each mounted filesystem,
+writes 262195 bytes of known content, syncs, drops the file cache and
+compares the readback SHA256. The expected digest is
+``2e6deb90b060da3bdd007d7a999786ca60eb7a19dac5bd04869fc1a43c205d84``.
+Only the test file and its newly created directory are removed on exit.
+This validates filesystem writes and readback, not power-loss durability.
+``umountall`` syncs and unmounts these filesystems; reboot commands also
+attempt to unmount them before requesting the watchdog restart. No mkfs,
+partition-table rewrite or automatic filesystem repair is performed.
+
+Hardware build #33 mounts all four ext4 partitions read/write and passes
+``fsrwtest`` on each with the expected digest above. The existing system
+partition's build properties identify Android 10; Android init is not
+started by this diagnostic image. A test file written on userdata is
+read back correctly after ``reboot bootloader``, fastboot reboot and
+remount, then removed. New mount logs show no journal recovery during
+that test. A 35-second shell sleep completes while the watchdog timeout
+is 30 seconds, confirming PID 1 remains responsive to its keepalive work.
+The host error field and DRM underflow/abnormal counters remain zero.
+Existing ext4 mount-count/check warnings remain; this work does not run
+filesystem repair or reset those filesystem health fields.
 
 References
 ----------

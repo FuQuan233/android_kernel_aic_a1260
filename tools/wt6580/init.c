@@ -103,7 +103,7 @@ static long dump_fd = -1;
 static char usb_output[8192];
 static long usb_output_len;
 static long usb_output_pos;
-static char usb_command[64];
+static char usb_command[512];
 static unsigned int usb_command_len;
 static int usb_command_overflow;
 
@@ -134,6 +134,20 @@ static void usb_start_dump(const char *path)
 #include "fbtest.h"
 #include "drmtest.h"
 #include "mmctest.h"
+#include "shell.h"
+
+static void sync_storage(void)
+{
+	static const char * const mounts[] = {
+		"/mnt/data", "/mnt/cache", "/mnt/vendor", "/mnt/system",
+	};
+	unsigned int i;
+
+	syscall5(36, 0, 0, 0, 0, 0);
+	/* Best effort: stop ext4 journals cleanly before the watchdog restart. */
+	for (i = 0; i < sizeof(mounts) / sizeof(mounts[0]); i++)
+		syscall5(52, (long)mounts[i], 0, 0, 0, 0); /* umount2 */
+}
 
 static void usb_execute_command(void)
 {
@@ -143,7 +157,21 @@ static void usb_execute_command(void)
 		usb_reply("\nWT6580 USB CDC debug: help, dmesg, status, cmdline, "
 			  "interrupts, meminfo, fbstatus, fbtest, fbrestore, dsistate, panelid, "
 			  "paneloff, panelon, panelreinit, drmstatus, drmtest, drmoff, mmcstatus, mmcid, partitions, mmcread, reboot, reboot bootloader\n"
+			  "storage, mountall, umountall, mounts, fsrwtest, sh COMMAND\n"
 			  "dmesg replays the kernel ring buffer, including pre-USB logs.\n");
+	} else if (text_equal(usb_command, "storage")) {
+		shell_start("/etc/wt6580-storage.sh scan");
+	} else if (text_equal(usb_command, "mountall")) {
+		shell_start("/etc/wt6580-storage.sh mount");
+	} else if (text_equal(usb_command, "umountall")) {
+		shell_start("/etc/wt6580-storage.sh umount");
+	} else if (text_equal(usb_command, "fsrwtest")) {
+		shell_start("/etc/wt6580-storage.sh test");
+	} else if (text_equal(usb_command, "mounts")) {
+		usb_start_dump("/proc/mounts");
+	} else if (usb_command[0] == 's' && usb_command[1] == 'h' &&
+		   usb_command[2] == ' ' && usb_command[3]) {
+		shell_start(usb_command + 3);
 	} else if (text_equal(usb_command, "mmcstatus")) {
 		usb_start_dump("/sys/bus/platform/devices/11120000.mmc/state");
 	} else if (text_equal(usb_command, "mmcid")) {
@@ -215,7 +243,7 @@ static void usb_execute_command(void)
 	} else if (text_equal(usb_command, "reboot bootloader")) {
 		long fd, ret;
 
-		syscall5(36, 0, 0, 0, 0, 0); /* sync before arming the RTC marker */
+		sync_storage(); /* Unmount before arming the RTC marker. */
 		fd = open_file("/sys/bus/platform/devices/1000f000.reboot-mode/bootloader", 1);
 		if (fd < 0) {
 			usb_reply("\n[WT6580 bootloader mode driver unavailable; reboot cancelled]\n");
@@ -235,7 +263,7 @@ static void usb_execute_command(void)
 	} else if (text_equal(usb_command, "reboot")) {
 		/* Best-effort notice: USB can disconnect before the host reads it. */
 		log_message(usb_fd, "\n[WT6580 rebooting]\n");
-		syscall5(36, 0, 0, 0, 0, 0); /* sync */
+		sync_storage();
 		/* ARM EABI reboot(MAGIC1, MAGIC2, CMD_RESTART, NULL). */
 		syscall5(88, 0xfee1deadUL, 672274793, 0x01234567, 0, 0);
 		usb_reply("\n[WT6580 reboot failed]\n");
@@ -299,14 +327,26 @@ static int usb_poll_console(void)
 		ret = syscall5(3, dump_fd, (long)usb_output, sizeof(usb_output), 0, 0);
 		if (ret > 0) {
 			usb_output_len = ret;
+		} else if (shell_capture && (ret == -11 || ret == -4)) {
+			return 0; /* An idle child pipe stays open; keep feeding the watchdog. */
 		} else if (ret != -32 && ret != -4) {
 			/* EPIPE on /dev/kmsg means records were overwritten: retry. */
 			syscall5(6, dump_fd, 0, 0, 0, 0);
 			dump_fd = -1;
+			if (shell_capture)
+				return 1;
 			usb_reply(ret == 0 || ret == -11 ?
 				  "\n[WT6580 dump complete]\n" :
 				  "\n[WT6580 diagnostic read failed]\n");
 		}
+		return 1;
+	}
+
+	if (shell_capture) {
+		shell_reap();
+		if (shell_running)
+			return 0;
+		shell_result();
 		return 1;
 	}
 
@@ -355,6 +395,12 @@ __attribute__((used, noreturn)) static void boot_main(void)
 	mount_fs("devtmpfs", "/dev");
 	mount_fs("proc", "/proc");
 	mount_fs("sysfs", "/sys");
+	syscall5(39, (long)"/run", 0755, 0, 0, 0);
+	mount_fs("tmpfs", "/run");
+	syscall5(39, (long)"/tmp", 01777, 0, 0, 0);
+	mount_fs("tmpfs", "/tmp");
+	syscall5(39, (long)"/dev/pts", 0755, 0, 0, 0);
+	mount_fs("devpts", "/dev/pts");
 	syscall5(39, (long)"/sys/fs/pstore", 0755, 0, 0, 0);
 	mount_fs("pstore", "/sys/fs/pstore");
 	log = open_file("/dev/kmsg", 1);
@@ -397,6 +443,7 @@ __attribute__((used, noreturn)) static void boot_main(void)
 			log_message(log, "<6>WT6580: DIAGNOSTIC_HEARTBEAT\n");
 			log_file(log, "/proc/uptime");
 		}
+		shell_reap();
 		/* Drain ready records immediately, but bound work between watchdog checks. */
 		while (budget-- && usb_poll_console())
 			;

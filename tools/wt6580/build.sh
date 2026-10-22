@@ -24,6 +24,17 @@ for tool in clang ld.lld llvm-ar llvm-nm llvm-objcopy; do
 	fi
 done
 
+userspace=${USERSPACE:-1}
+userspace_out=${USERSPACE_OUT:-"$source_root/../out/wt6580-userspace"}
+userspace_out=$(realpath -m -- "$userspace_out")
+if [[ "$userspace" == 1 ]]; then
+	USERSPACE_OUT="$userspace_out" LLVM_BIN="$toolchain" JOBS="$jobs" \
+		"$source_root/tools/wt6580/build-userspace.sh"
+elif [[ "$userspace" != 0 ]]; then
+	echo "USERSPACE must be 0 or 1" >&2
+	exit 1
+fi
+
 mkdir -p -- "$output_dir/diagnostic"
 "$toolchain/clang" --target=armv7a-linux-gnueabi -mcpu=cortex-a7 -marm \
 	-Os -Wall -Wextra -Werror -ffreestanding -fno-builtin \
@@ -38,6 +49,34 @@ dir /proc 0555 0 0
 dir /sys 0555 0 0
 file /init $output_dir/diagnostic/init 0755 0 0
 EOF
+if [[ "$userspace" == 1 ]]; then
+	python3 - "$source_root" "$output_dir" "$userspace_out" <<'PYROOTFS'
+from pathlib import Path
+import sys
+source, output, userspace = map(Path, sys.argv[1:])
+links = userspace.joinpath("busybox.links").read_text().splitlines()
+files = {
+    "/bin/busybox": (userspace / "busybox", "0755"),
+    "/etc/wt6580-storage.sh": (source / "tools/wt6580/storage.sh", "0755"),
+    "/usr/share/licenses/busybox/LICENSE": (userspace / "busybox-1.37.0/LICENSE", "0644"),
+    "/usr/share/licenses/musl/COPYRIGHT": (userspace / "musl-1.2.5/COPYRIGHT", "0644"),
+}
+dirs = {"/run", "/tmp", "/mnt", "/mnt/system", "/mnt/vendor", "/mnt/data", "/mnt/cache"}
+for path in list(files) + links:
+    parent = Path(path).parent
+    while str(parent) != "/":
+        dirs.add(str(parent))
+        parent = parent.parent
+with (output / "diagnostic/initramfs.list").open("a") as f:
+    for path in sorted(dirs):
+        f.write(f"dir {path} {'1777' if path == '/tmp' else '0755'} 0 0\n")
+    for path, (local, mode) in files.items():
+        f.write(f"file {path} {local} {mode} 0 0\n")
+    for path in links:
+        f.write(f"slink {path} /bin/busybox 0777 0 0\n")
+PYROOTFS
+fi
+
 
 kernel_make=(make -C "$source_root" O="$output_dir" ARCH=arm "LLVM=$toolchain/")
 "${kernel_make[@]}" wt6580_we_n_defconfig
@@ -140,6 +179,7 @@ manifest = {
     "debug_transport": "usb-cdc-acm",
     "usb_enumeration_verified": False,
     "early_boot_trace": os.environ.get("EARLY_BOOT_TRACE", "0") == "1",
+    "static_busybox": os.environ.get("USERSPACE", "1") == "1",
     "config_sha256": hashlib.sha256((output / ".config").read_bytes()).hexdigest(),
     "artifacts": {name: {"bytes": (output / name).stat().st_size,
                          "sha256": hashlib.sha256((output / name).read_bytes()).hexdigest()}

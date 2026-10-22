@@ -22,12 +22,14 @@ static int dumps;
 static long read_limit;
 static long write_limit;
 static int syncs;
+static int unmounts;
 static int reboots;
 static int prepare_failure;
 static int marker_verified;
 static int missing_bootmode;
 static int hangup_read;
 static int closes;
+static int pipe_eof;
 
 static long simulated_syscall(long nr, long a, long b, long c, long d, long e)
 {
@@ -67,7 +69,7 @@ static long simulated_syscall(long nr, long a, long b, long c, long d, long e)
 			return -32;
 		}
 		if (dump_pos == sizeof(dump))
-			return -11;
+			return pipe_eof ? 0 : -11;
 		if (c > (long)(sizeof(dump) - dump_pos))
 			c = sizeof(dump) - dump_pos;
 		if (c > read_limit)
@@ -105,11 +107,15 @@ static long simulated_syscall(long nr, long a, long b, long c, long d, long e)
 		return 0;
 	case 54:
 		return -25;
+	case 52:
+		assert(!strncmp((const char *)a, "/mnt/", 5) && !b);
+		unmounts++;
+		return -2; /* Also exercise reboot when filesystems are not mounted. */
 	case 36:
 		syncs++;
 		return 0;
 	case 88:
-		assert(syncs == 1);
+		assert(syncs == 1 && unmounts == 4);
 		assert((unsigned long)a == 0xfee1deadUL);
 		assert(b == 672274793);
 		if ((unsigned long)c == 0xa1b2c3d4UL) {
@@ -134,9 +140,11 @@ static void reset_fixture(const char *commands)
 	output[0] = 0;
 	blocked_writes = disconnect_write = overwritten_record = 0;
 	opens = dumps = 0;
-	syncs = reboots = 0;
+	syncs = reboots = unmounts = 0;
 	prepare_failure = marker_verified = missing_bootmode = 0;
-	hangup_read = closes = 0;
+	hangup_read = closes = pipe_eof = 0;
+	shell_started = shell_running = shell_capture = shell_status = 0;
+	shell_pid = -1;
 	read_limit = sizeof(dump);
 	write_limit = 7;
 	usb_fd = dump_fd = -1;
@@ -158,7 +166,7 @@ static void run_polls(void)
 
 int main(void)
 {
-	char overflow[100];
+	char overflow[sizeof(usb_command) + 20];
 	unsigned int steps;
 
 	reset_fixture("help\r\nhelp\n");
@@ -200,6 +208,26 @@ int main(void)
 	reset_fixture(overflow);
 	run_polls();
 	assert(strstr(output, "command too long") && !dumps);
+
+	/* An empty child pipe is not EOF; keep it open until the shell exits. */
+	reset_fixture("");
+	dump_fd = 12;
+	dump_pos = sizeof(dump);
+	shell_capture = shell_running = 1;
+	assert(!usb_poll_console() && dump_fd == 12 && !output_len);
+	shell_running = 0;
+	shell_status = 7 << 8;
+	pipe_eof = 1;
+	run_polls();
+	assert(strstr(output, "shell exit=7") && !strstr(output, "dump complete"));
+
+	/* Stream a child's output through short USB writes, then report exit. */
+	reset_fixture("");
+	dump_fd = 12;
+	shell_capture = pipe_eof = 1;
+	run_polls();
+	assert(!memcmp(output, dump, sizeof(dump)));
+	assert(strstr(output + sizeof(dump), "shell exit=0"));
 
 	reset_fixture("dmesX\bg\n");
 	run_polls();
