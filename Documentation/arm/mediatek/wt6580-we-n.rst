@@ -486,6 +486,50 @@ The host error field and DRM underflow/abnormal counters remain zero.
 Existing ext4 mount-count/check warnings remain; this work does not run
 filesystem repair or reset those filesystem health fields.
 
+LineageOS 24 / Android 17 userspace
+---------------------------------
+
+The selected userspace is LineageOS ``lineage-24.0`` (Android 17), not
+LineageOS 17.1 (Android 10). The checkout is ``~/AIC/lineage24``. Its
+initial manifest commit is ``b51a0c449a3279ca55fb6d4d91d2143e42e2fff5``;
+AOSP projects in that manifest use ``android-17.0.0_r1``. Repo is configured
+with depth 1, current-branch sync, no tags and Git LFS. Shallow history does
+not reduce the size of the checked-out source and prebuilt toolchains.
+
+The branch still contains the official ``lineage_gsi_arm`` product,
+which explicitly enables 32-bit apps and inherits ARM32 GSI configuration.
+It is the initial native build target for init, Bionic, toybox and adbd.
+The device's legacy header-v0 boot format, appended DTB, fixed GPT layout,
+1.5 GiB system partition and unfinished hardware HALs still need device
+integration before a generated GSI can be used as a bootable phone system.
+No Android 17 userspace image has yet been verified on this board.
+
+``arch/arm/configs/wt6580_android17.config`` adds VFP/NEON, SELinux,
+cgroup controllers, PSI, loop/device-mapper/verity and EROFS for APEX,
+DMA-BUF system heaps, zram and basic Android networking interfaces.
+The v1 cpuset and blkio controllers match Android 17's libprocessgroup
+configuration; memory control remains available through cgroup v2.
+``CONFIG_LSM`` explicitly activates SELinux instead of only compiling it.
+Enable this diagnostic kernel profile with::
+
+  ANDROID17_BRINGUP=1 DISPLAY_DRIVER=drm EARLY_BOOT_TRACE=1 \
+    OUT_DIR=../out/wt6580-lineage24 STOCK_BOOT=/path/to/stock-boot.img \
+    tools/wt6580/build.sh
+
+The profile enables SMP infrastructure for cpusets and limits boot to
+CPU0 with ``maxcpus=1``. It does not add a secondary-core release method.
+It explicitly uses SELinux permissive mode while device policy is being
+developed. This is a bring-up profile, not a production security policy
+or a claim of Android kernel/VTS compliance. The default diagnostic
+configuration remains available without ANDROID17_BRINGUP.
+
+The profile's hardware build #3 boots to the diagnostic PID 1 with VFP,
+NEON and CPU0 online. The v1 cpuset/blkio controllers, cgroup v2 and
+selinuxfs mount successfully; SELinux reports permissive mode. All four
+ext4 partitions pass the temporary-file read/write SHA256 test. Repeated
+1 MiB eMMC reads agree, and the DRM color-bar modeset completes. These
+checks validate the kernel prerequisites; they do not start Android init.
+
 References
 ----------
 

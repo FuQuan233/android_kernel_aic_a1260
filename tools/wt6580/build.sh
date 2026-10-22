@@ -80,6 +80,23 @@ fi
 
 kernel_make=(make -C "$source_root" O="$output_dir" ARCH=arm "LLVM=$toolchain/")
 "${kernel_make[@]}" wt6580_we_n_defconfig
+if [[ "${ANDROID17_BRINGUP:-0}" == 1 ]]; then
+	ARCH=arm "$source_root/scripts/kconfig/merge_config.sh" -m -O "$output_dir" \
+		"$output_dir/.config" "$source_root/arch/arm/configs/wt6580_android17.config"
+	python3 - "$source_root/scripts/config" "$output_dir/.config" <<'PYANDROID'
+import json
+from pathlib import Path
+import subprocess
+import sys
+script, path = sys.argv[1:]
+line = next(line for line in Path(path).read_text().splitlines()
+            if line.startswith("CONFIG_CMDLINE="))
+cmdline = json.loads(line.split("=", 1)[1])
+# Bring-up only: retain CPU0 and permit an unfinished device SELinux policy.
+cmdline += " maxcpus=1 androidboot.hardware=wt6580 androidboot.selinux=permissive enforcing=0"
+subprocess.run([script, "--file", path, "--set-str", "CMDLINE", cmdline], check=True)
+PYANDROID
+fi
 if [[ "${EARLY_BOOT_TRACE:-0}" == 1 ]]; then
 	python3 - "$source_root/scripts/config" "$output_dir/.config" <<'PY'
 import json
@@ -108,8 +125,9 @@ if [[ "$display" == drm ]]; then
 		--disable DRM_FBDEV_EMULATION
 fi
 "${kernel_make[@]}" olddefconfig
-python3 - "$output_dir/.config" "$display" <<'PY'
+python3 - "$output_dir/.config" "$display" "$source_root/arch/arm/configs/wt6580_android17.config" <<'PY'
 from pathlib import Path
+import os
 import sys
 
 config = Path(sys.argv[1]).read_text().splitlines()
@@ -124,6 +142,10 @@ required = ["CONFIG_ARCH_MEDIATEK=y", "CONFIG_ARM_APPENDED_DTB=y",
             "CONFIG_PHY_MTK_MT6580_USB=y", "CONFIG_COMMON_CLK_MT6580_USB=y",
             "CONFIG_USB_G_SERIAL=y", "CONFIG_U_SERIAL_CONSOLE=y",
             "# CONFIG_SMP is not set"]
+if os.environ.get("ANDROID17_BRINGUP", "0") == "1":
+    required.remove("# CONFIG_SMP is not set")
+    required += [line for line in Path(sys.argv[3]).read_text().splitlines()
+                 if line.startswith("CONFIG_")]
 if sys.argv[2] == "drm":
     required += ["CONFIG_DRM_MEDIATEK=y", "CONFIG_PHY_MTK_MIPI_DSI=y", "CONFIG_DMA_CMA=y"]
 else:
@@ -180,6 +202,7 @@ manifest = {
     "usb_enumeration_verified": False,
     "early_boot_trace": os.environ.get("EARLY_BOOT_TRACE", "0") == "1",
     "static_busybox": os.environ.get("USERSPACE", "1") == "1",
+    "android17_bringup": os.environ.get("ANDROID17_BRINGUP", "0") == "1",
     "config_sha256": hashlib.sha256((output / ".config").read_bytes()).hexdigest(),
     "artifacts": {name: {"bytes": (output / name).stat().st_size,
                          "sha256": hashlib.sha256((output / name).read_bytes()).hexdigest()}
