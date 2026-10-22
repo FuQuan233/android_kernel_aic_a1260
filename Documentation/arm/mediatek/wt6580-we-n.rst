@@ -82,6 +82,14 @@ Implemented
 * Binder/binderfs, BPF and seccomp build options included as groundwork.
   This configuration is a diagnostic baseline, not a completed Android 17
   kernel configuration or compatibility certification.
+* The Android profile includes netd's IPv4/IPv6 raw/filter/mangle/NAT
+  tables, connection marks/state, REJECT, TCPMSS, quota2, IPsec policy
+  matching, policy routing and XFRM userspace control. These are required
+  even on this Wi-Fi-only unit: netd initializes the chains at startup,
+  and failures cause its ``onrestart`` hook to restart zygote. FUSE is
+  enabled for Android emulated storage. These additions address source
+  prerequisites identified after the network BPF loader succeeded;
+  on-device netd startup still needs verification.
 * ARMv7 little-endian BPF JIT atomic word/doubleword operations use
   LDREX/STREX and LDREXD/STREXD retry loops with memory barriers. Android
   Tethering/netd programs use atomic 64-bit packet/byte counters; upstream
