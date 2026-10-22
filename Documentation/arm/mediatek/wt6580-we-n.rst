@@ -8,8 +8,9 @@ Base and scope
 
 This port uses Android Common Kernel ``android17-6.18``, initially pinned to
 ``64e87d26a115fd03e5fb17e3a56342605c3946ec`` (Linux 6.18.32). It is a custom
-32-bit ARMv7 board kernel, not an arm64 GKI image. Android 17 userspace and
-the vendor HALs have not been brought up.
+32-bit ARMv7 board kernel, not an arm64 GKI image. Android 17 first- and
+second-stage init run, and 40 APEX packages activate on hardware. Framework
+startup and the Android vendor HALs remain under bring-up.
 
 The reference BSP is ``~/android_kernel_mediatek_k80``, project
 ``wt6580_we_n``. That tree contains local user changes and is read-only for
@@ -81,6 +82,18 @@ Implemented
 * Binder/binderfs, BPF and seccomp build options included as groundwork.
   This configuration is a diagnostic baseline, not a completed Android 17
   kernel configuration or compatibility certification.
+* ARMv7 little-endian BPF JIT atomic word/doubleword operations use
+  LDREX/STREX and LDREXD/STREXD retry loops with memory barriers. Android
+  Tethering/netd programs use atomic 64-bit packet/byte counters; upstream
+  ARM32 JIT rejected opcode 0xc3 and fell back to the interpreter, which
+  Android 17's loader rejects. ADD/AND/OR/XOR, fetch variants, exchange and
+  compare-exchange are emitted with register preservation. ARMv6 and
+  big-endian builds retain interpreter fallback. The host test
+  ``tools/wt6580/test_arm_bpf_atomic.py`` needs Python Unicorn and a host C
+  compiler; it compiles the actual emitter functions and executes their
+  output in an ARM emulator. It covers 13,200 cases and 4,320 simulated
+  failed exclusive stores, both frame layouts, offsets, overflow, aliases
+  and compare failures. This does not replace on-device BPF validation.
 * LK framebuffer handover: hardware-verified stable eight-color output
   on build #19 via fbdev, using the top OVL layer at 0xbfb77000,
   480 x 800, 32 bpp and pitch 1920. Lower firmware layers, the DSI/PHY

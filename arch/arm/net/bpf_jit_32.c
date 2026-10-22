@@ -1578,6 +1578,124 @@ static void build_epilogue(struct jit_ctx *ctx)
 #endif
 }
 
+/* Native ARMv7 little-endian atomic read/modify/write operations. */
+static int emit_atomic(const struct bpf_insn *insn, struct jit_ctx *ctx)
+{
+#if __LINUX_ARM_ARCH__ >= 7 && !defined(CONFIG_CPU_BIG_ENDIAN)
+	const s8 *src = bpf2a32[insn->src_reg];
+	const s8 *dst = bpf2a32[insn->dst_reg];
+	const s8 *value = bpf2a32[TMP_REG_1];
+	const s8 *old = bpf2a32[TMP_REG_2];
+	const bool dw = BPF_SIZE(insn->code) == BPF_DW;
+	const bool cmpxchg = insn->imm == BPF_CMPXCHG;
+	const s8 *rs;
+	u32 store;
+	s8 addr;
+	int loop;
+
+	switch (insn->imm) {
+	case BPF_ADD:
+	case BPF_ADD | BPF_FETCH:
+	case BPF_AND:
+	case BPF_AND | BPF_FETCH:
+	case BPF_OR:
+	case BPF_OR | BPF_FETCH:
+	case BPF_XOR:
+	case BPF_XOR | BPF_FETCH:
+	case BPF_XCHG:
+	case BPF_CMPXCHG:
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	/* Snapshot both operands before using any BPF-mapped CPU registers. */
+	rs = arm_bpf_get_reg64(src, value, ctx);
+	if (rs != value) {
+		emit(ARM_MOV_R(value[1], rs[1]), ctx);
+		emit(ARM_MOV_R(value[0], rs[0]), ctx);
+	}
+	addr = arm_bpf_get_reg32(dst[1], ARM_IP, ctx);
+	if (addr != ARM_IP)
+		emit(ARM_MOV_R(ARM_IP, addr), ctx);
+	if (insn->off) {
+		emit_mov_i(ARM_LR, insn->off, ctx);
+		emit(ARM_ADD_R(ARM_IP, ARM_IP, ARM_LR), ctx);
+	}
+
+	/* R0:R1 hold the new value, R2:R3 the cmpxchg expected value.
+	 * Preserve BPF R0/R1; the scratch area is addressed through FP, so
+	 * changing SP does not move any stacked BPF registers.
+	 */
+	emit(ARM_PUSH(CALLER_MASK), ctx);
+	if (cmpxchg) {
+		emit(ARM_MOV_R(ARM_R2, ARM_R0), ctx);
+		emit(ARM_MOV_R(ARM_R3, ARM_R1), ctx);
+	}
+	emit(ARM_DMB_ISH, ctx);
+	loop = ctx->idx;
+	emit(dw ? ARM_LDREXD(old[1], ARM_IP) :
+		  ARM_LDREX(old[1], ARM_IP), ctx);
+
+	switch (insn->imm & ~BPF_FETCH) {
+	case BPF_ADD:
+		emit(ARM_ADDS_R(ARM_R0, old[1], value[1]), ctx);
+		if (dw)
+			emit(ARM_ADC_R(ARM_R1, old[0], value[0]), ctx);
+		break;
+	case BPF_AND:
+		emit(ARM_AND_R(ARM_R0, old[1], value[1]), ctx);
+		if (dw)
+			emit(ARM_AND_R(ARM_R1, old[0], value[0]), ctx);
+		break;
+	case BPF_OR:
+		emit(ARM_ORR_R(ARM_R0, old[1], value[1]), ctx);
+		if (dw)
+			emit(ARM_ORR_R(ARM_R1, old[0], value[0]), ctx);
+		break;
+	case BPF_XOR:
+		emit(ARM_EOR_R(ARM_R0, old[1], value[1]), ctx);
+		if (dw)
+			emit(ARM_EOR_R(ARM_R1, old[0], value[0]), ctx);
+		break;
+	default: /* XCHG / CMPXCHG */
+		emit(ARM_MOV_R(ARM_R0, value[1]), ctx);
+		if (dw)
+			emit(ARM_MOV_R(ARM_R1, value[0]), ctx);
+		break;
+	}
+
+	store = dw ? ARM_STREXD(ARM_LR, ARM_R0, ARM_IP) :
+		     ARM_STREX(ARM_LR, ARM_R0, ARM_IP);
+	if (cmpxchg) {
+		emit(ARM_CMP_R(old[1], ARM_R2), ctx);
+		if (dw)
+			_emit(ARM_COND_EQ, ARM_CMP_R(old[0], ARM_R3), ctx);
+		/* A failed comparison must neither store nor retry. */
+		_emit(ARM_COND_NE, ARM_MOV_I(ARM_LR, 0), ctx);
+		_emit(ARM_COND_EQ, store, ctx);
+	} else {
+		emit(store, ctx);
+	}
+	emit(ARM_CMP_I(ARM_LR, 0), ctx);
+	_emit(ARM_COND_NE, ARM_B(loop - (int)ctx->idx - 2), ctx);
+	if (cmpxchg)
+		emit(ARM_CLREX, ctx);
+	emit(ARM_DMB_ISH, ctx);
+	emit(ARM_POP(CALLER_MASK), ctx);
+
+	if (insn->imm & BPF_FETCH) {
+		if (!dw)
+			emit(ARM_MOV_I(old[0], 0), ctx);
+		arm_bpf_put_reg64(cmpxchg ? bpf2a32[BPF_REG_0] : src,
+				  old, ctx);
+	}
+	return 0;
+#else
+	return -EOPNOTSUPP;
+#endif
+}
+
 /*
  * Convert an eBPF instruction to native instruction, i.e
  * JITs an eBPF instruction.
@@ -1895,7 +2013,7 @@ exit:
 	/* Atomic ops */
 	case BPF_STX | BPF_ATOMIC | BPF_W:
 	case BPF_STX | BPF_ATOMIC | BPF_DW:
-		goto notyet;
+		return emit_atomic(insn, ctx);
 	/* STX: *(size *)(dst + off) = src */
 	case BPF_STX | BPF_MEM | BPF_W:
 	case BPF_STX | BPF_MEM | BPF_H:
@@ -2078,9 +2196,6 @@ go_jmp:
 		check_imm24(jmp_offset);
 		emit(ARM_B(jmp_offset), ctx);
 		break;
-notyet:
-		pr_info_once("*** NOT YET: opcode %02x ***\n", code);
-		return -EFAULT;
 	default:
 		pr_err_once("unknown opcode %02x\n", code);
 		return -EINVAL;

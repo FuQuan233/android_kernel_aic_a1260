@@ -87,6 +87,13 @@
 #define ARM_INST_LDR_I		0x05100000
 #define ARM_INST_LDR_R		0x07900000
 
+#define ARM_LDREX(rt, rn)	(0x01900f9f | (rn) << 16 | (rt) << 12)
+#define ARM_LDREXD(rt, rn)	(0x01b00f9f | (rn) << 16 | (rt) << 12)
+#define ARM_STREX(rd, rt, rn)	(0x01800f90 | (rn) << 16 | (rd) << 12 | (rt))
+#define ARM_STREXD(rd, rt, rn)	(0x01a00f90 | (rn) << 16 | (rd) << 12 | (rt))
+#define ARM_DMB_ISH		0xf57ff05b
+#define ARM_CLREX		0xf57ff01f
+
 #define ARM_INST_LDM		0x08900000
 #define ARM_INST_LDM_IA		0x08b00000
 
