@@ -20,12 +20,19 @@ static void __init mediatek_timer_init(void)
 {
 	void __iomem *gpt_base;
 
-	if (of_machine_is_compatible("mediatek,mt6589") ||
+	if (of_machine_is_compatible("mediatek,mt6580") ||
+	    of_machine_is_compatible("mediatek,mt6589") ||
 	    of_machine_is_compatible("mediatek,mt7623") ||
 	    of_machine_is_compatible("mediatek,mt8135") ||
 	    of_machine_is_compatible("mediatek,mt8127")) {
 		/* turn on GPT6 which ungates arch timer clocks */
-		gpt_base = ioremap(GPT6_CON_MT65xx, 0x04);
+		gpt_base = ioremap(GPT6_CON_MT65xx, 0x08);
+		if (!gpt_base)
+			panic("Cannot map GPT6 for architected timer\n");
+
+		/* MT6580 BSP selects the 13 MHz system clock without a divider. */
+		if (of_machine_is_compatible("mediatek,mt6580"))
+			writel(0, gpt_base + 0x04);
 
 		/* enable clock and set to free-run */
 		writel(GPT_ENABLE, gpt_base);

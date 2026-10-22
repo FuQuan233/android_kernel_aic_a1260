@@ -21,10 +21,9 @@ not used to determine RAM size or the screen model.
 Confirmed board information
 ---------------------------
 
-* Four Cortex-A7 cores; the first-stage configuration intentionally uses
-  CPU0 only. The upstream MT6580 DTS has no supported secondary-core
-  enable method. The vendor ``mediatek,mt6580-smp`` method is not implemented
-  by this kernel.
+* Four Cortex-A7 cores. The diagnostic UP defconfig retains CPU0 only;
+  the Android SMP profile uses ``mediatek,mt6580-smp`` to release CPU1--3
+  through the non-secure INFRACFG boot vector and SPM power controller.
 * Runtime DT memory: base ``0x80000000``, size ``0x3fa00000``. This is a 1 GiB
   device with the top 6 MiB omitted by firmware, not the 512 MiB shown by
   the unmodified vendor DTS.
@@ -56,9 +55,12 @@ Implemented
   2/2 and ``/memory`` keeps its vendor path for LK fixups. All inherited
   MMIO ``reg`` properties are widened consistently. DTC may warn about
   the intentionally unit-less legacy ``memory`` node.
-* GPT clocksource, UART0/earlycon, watchdog and persistent console
-  configuration. No architectural timer is described: its boot-firmware
-  setup and GPT6 gating need separate investigation.
+* GPT clocksource, UART0/earlycon, watchdog and persistent console.
+  The ARM architectural timer supplies per-CPU clockevents; GPT6 is
+  enabled in free-running mode at 13 MHz, matching the vendor BSP.
+  ``arm,cpu-registers-not-fw-configured`` selects physical timers and
+  counters because secondary CPUs bypass firmware initialization. The
+  ARM vDSO code also disables its CNTVCT fast path for this property.
 * Vendor fixed RAM-console/minirdump/framebuffer reservations and dynamic
   modem/connectivity reservation sizes retained. The modem and connectivity
   drivers are not enabled; their exact runtime physical allocation still
@@ -539,8 +541,33 @@ Enable this diagnostic kernel profile with::
     OUT_DIR=../out/wt6580-lineage24 STOCK_BOOT=/path/to/stock-boot.img \
     tools/wt6580/build.sh
 
-The profile enables SMP infrastructure for cpusets and limits boot to
-CPU0 with ``maxcpus=1``. It does not add a secondary-core release method.
+The profile enables four CPUs with the MT6580 non-secure SMP boot method.
+INFRACFG ``0x10001000 + 0x804`` bit 31 selects the programmable boot vector
+at ``+0x800``. The vector points directly to ``secondary_startup_arm``;
+the reference BSP's entry wrapper performs no additional work for cluster 0.
+SPM ``0x10006000`` powers CPU1--3, waits for both power status registers,
+restores L1 SRAM and removes isolation/clock gating before releasing reset.
+Polling has bounded timeouts so a failed power acknowledgement is logged
+instead of hanging the boot CPU indefinitely. CPU hot-unplug is deliberately
+unsupported until its power-down path is ported. CPU/GPU DVFS and system
+suspend remain separate tasks.
+
+``tools/wt6580/smp-check.c`` is a native userspace hardware check. It pins
+four workers to CPUs 0--3, compares their integer results, verifies a shared
+atomic counter and reports CPU time versus wall time for parallel execution.
+It also checks monotonic time across repeated migrations between all cores.
+
+The first SMP hardware boot (#17) released all four CPUs in 27 ms, but
+virtual-counter timekeeping then stalled: at GPT sched-clock time 0.211 s,
+RCU observed 1,625,463,745 elapsed jiffies. This confirms secondary boot,
+not a working Android SMP system. The physical-counter revision (#18)
+boots Android with all four CPUs online and local timer interrupts on
+each core. Four pinned workers complete identical integer calculations
+with 2.457 s total CPU time in 0.618 s elapsed (3.98-way parallelism).
+The shared atomic counter reaches exactly 400,000 and 400 cross-CPU
+migrations show no monotonic-clock reversal. ADB, desktop rendering and
+touch registration remain functional; RDMA underflow/abnormal counters
+are zero. This verifies SMP execution, not DVFS, hot-unplug or suspend.
 It explicitly uses SELinux permissive mode while device policy is being
 developed. This is a bring-up profile, not a production security policy
 or a claim of Android kernel/VTS compliance. The default diagnostic
