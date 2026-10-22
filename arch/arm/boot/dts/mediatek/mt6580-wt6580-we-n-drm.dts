@@ -16,7 +16,8 @@
 		display_cma: dma-pool {
 			compatible = "shared-dma-pool";
 			reusable;
-			size = <0 0x1000000>;
+			/* Android keeps multiple windows and composition buffers live. */
+			size = <0 0x4000000>;
 			alignment = <0 0x400000>;
 			alloc-ranges = <0 0x84000000 0 0x2c000000>;
 			linux,cma-default;
