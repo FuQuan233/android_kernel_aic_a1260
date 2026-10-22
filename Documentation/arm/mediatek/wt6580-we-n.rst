@@ -533,6 +533,13 @@ checks validate the kernel prerequisites; they do not start Android init.
 External Android ramdisk handover
 ---------------------------------
 
+Android APEX payloads still use dm-verity when boot/system AVB is disabled.
+The Android profile enables ``CRYPTO_SHA256`` and ``CRYPTO_SHA512`` to
+register hash implementations with the Crypto API. The ``CRYPTO_LIB_SHA*``
+helpers alone do not satisfy ``crypto_alloc_shash()``. Without SHA256,
+APEX activation fails with ``Cannot initialize hash function (-ENOENT)``;
+the missing Tethering APEX then triggers ``netbpfload-missing`` reboot.
+
 LK passes its own FDT in r2, including ``linux,initrd-start`` and
 ``linux,initrd-end``. Using an appended DTB previously discarded those
 values. Merely enabling ATAG compatibility does not copy them from an
