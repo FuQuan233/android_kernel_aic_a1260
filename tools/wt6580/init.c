@@ -244,7 +244,7 @@ static void usb_execute_command(void)
 		long fd, ret;
 
 		sync_storage(); /* Unmount before arming the RTC marker. */
-		fd = open_file("/sys/bus/platform/devices/1000f000.reboot-mode/bootloader", 1);
+		fd = open_file("/sys/bus/platform/devices/1000f000.pmic-wrap:reboot-mode/bootloader", 1);
 		if (fd < 0) {
 			usb_reply("\n[WT6580 bootloader mode driver unavailable; reboot cancelled]\n");
 			return;

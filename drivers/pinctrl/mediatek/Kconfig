@@ -47,6 +47,13 @@ config PINCTRL_MTK_PARIS
 	select PINCTRL_MTK_V2
 
 # For MIPS SoCs
+config PINCTRL_MT6580
+	tristate "MediaTek MT6580 pin control"
+	depends on OF
+	select PINCTRL_MTK_PARIS
+	help
+	  GPIO, pin multiplexing and the first EINT bank of MT6580.
+
 config PINCTRL_MT7620
 	tristate "MediaTek MT7620 pin control"
 	depends on SOC_MT7620 || COMPILE_TEST

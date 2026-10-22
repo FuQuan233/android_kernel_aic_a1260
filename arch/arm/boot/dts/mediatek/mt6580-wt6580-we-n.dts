@@ -2,6 +2,8 @@
 /dts-v1/;
 #include "mt6580.dtsi"
 #include <dt-bindings/clock/mt6580-clk.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pinctrl/mt65xx.h>
 
 / {
 	model = "Wingtech WT6580 WE N (JD9161)";
@@ -14,6 +16,7 @@
 		serial0 = &uart0;
 		serial1 = &uart1;
 		mmc0 = &mmc0;
+		i2c1 = &i2c1;
 	};
 
 	chosen {
@@ -101,9 +104,23 @@
 		timeout-sec = <30>;
 	};
 
-	reboot-mode@1000f000 {
-		compatible = "wingtech,wt6580-reboot-mode";
+	pmic-wrap@1000f000 {
+		compatible = "mediatek,mt6580-firmware-pwrap";
 		reg = <0 0x1000f000 0 0x1000>;
+
+		reboot-mode {
+			compatible = "wingtech,wt6580-reboot-mode";
+		};
+
+		regulators {
+			compatible = "mediatek,mt6350-regulator";
+
+			vtouch: ldo_vgp1 {
+				regulator-name = "vtouch";
+				regulator-min-microvolt = <2800000>;
+				regulator-max-microvolt = <2800000>;
+			};
+		};
 	};
 
 	topckgen: clock-controller@10000000 {
@@ -116,6 +133,68 @@
 		compatible = "mediatek,mt6580-apmixedsys";
 		reg = <0 0x10018000 0 0x1000>;
 		#clock-cells = <1>;
+	};
+
+	pio: pinctrl@10005000 {
+		compatible = "mediatek,mt6580-pinctrl";
+		reg = <0 0x10005000 0 0x1000>,
+		      <0 0x10014000 0 0x1000>,
+		      <0 0x10015000 0 0x1000>,
+		      <0 0x10016000 0 0x1000>,
+		      <0 0x10017000 0 0x1000>,
+		      <0 0x1000b000 0 0x1000>;
+		reg-names = "gpio", "iocfg-t", "iocfg-b", "iocfg-l", "iocfg-r", "eint";
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&pio 0 0 93>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupts = <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>;
+
+		i2c1_pins: i2c1-pins {
+			pins {
+				pinmux = <(MTK_PIN_NO(59) | 1)>,
+					 <(MTK_PIN_NO(62) | 1)>;
+				input-enable;
+			};
+		};
+
+		touch_pins: touch-pins {
+			pins {
+				pinmux = <(MTK_PIN_NO(5) | 6)>;
+				input-enable;
+				bias-disable;
+			};
+		};
+	};
+
+
+	i2c1: i2c@1100a000 {
+		compatible = "mediatek,mt6580-i2c";
+		reg = <0 0x1100a000 0 0x1000>, <0 0x11000200 0 0x80>;
+		interrupts = <GIC_SPI 41 IRQ_TYPE_LEVEL_LOW>;
+		clocks = <&topckgen CLK_MT6580_TOP_I2C1>,
+			 <&topckgen CLK_MT6580_TOP_APDMA>;
+		clock-names = "main", "dma";
+		clock-div = <10>;
+		clock-frequency = <100000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&i2c1_pins>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		touchscreen@38 {
+			compatible = "focaltech,ft6336u";
+			reg = <0x38>;
+			interrupt-parent = <&pio>;
+			interrupts = <5 IRQ_TYPE_EDGE_FALLING>;
+			reset-gpios = <&pio 2 GPIO_ACTIVE_LOW>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&touch_pins>;
+			vcc-supply = <&vtouch>;
+			touchscreen-size-x = <480>;
+			touchscreen-size-y = <800>;
+		};
 	};
 
 	/* Vendor msdc_emmc_power() uses VEMC=3.0 V; PMIC control is pending. */

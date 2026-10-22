@@ -261,6 +261,7 @@ struct mtk_i2c_compatible {
 	const u16 *regs;
 	unsigned char pmic_i2c: 1;
 	unsigned char dcm: 1;
+	unsigned char manual_wr_rd: 1;
 	unsigned char auto_restart: 1;
 	unsigned char aux_len_reg: 1;
 	unsigned char timing_adjust: 1;
@@ -402,6 +403,15 @@ static const struct mtk_i2c_compatible mt6589_compat = {
 	.max_dma_support = 32,
 };
 
+static const struct mtk_i2c_compatible mt6580_compat = {
+	.quirks = &mt6577_i2c_quirks,
+	.regs = mt_i2c_regs_v1,
+	.dcm = 1,
+	.manual_wr_rd = 1,
+	.aux_len_reg = 1,
+	.max_dma_support = 32,
+};
+
 static const struct mtk_i2c_compatible mt7622_compat = {
 	.quirks = &mt7622_i2c_quirks,
 	.regs = mt_i2c_regs_v1,
@@ -525,6 +535,7 @@ static const struct of_device_id mtk_i2c_of_match[] = {
 	{ .compatible = "mediatek,mt2712-i2c", .data = &mt2712_compat },
 	{ .compatible = "mediatek,mt6577-i2c", .data = &mt6577_compat },
 	{ .compatible = "mediatek,mt6589-i2c", .data = &mt6589_compat },
+	{ .compatible = "mediatek,mt6580-i2c", .data = &mt6580_compat },
 	{ .compatible = "mediatek,mt7622-i2c", .data = &mt7622_compat },
 	{ .compatible = "mediatek,mt7981-i2c", .data = &mt7981_compat },
 	{ .compatible = "mediatek,mt7986-i2c", .data = &mt7986_compat },
@@ -1250,7 +1261,11 @@ static int mtk_i2c_transfer(struct i2c_adapter *adap,
 	i2c->auto_restart = i2c->dev_comp->auto_restart;
 
 	/* checking if we can skip restart and optimize using WRRD mode */
-	if (i2c->auto_restart && num == 2) {
+	/* MT6580 supports a combined WRRD transaction without the later
+	 * multi-message auto-restart engine. Separate starts would leave the
+	 * first DMA waiting for a second transaction that has not been armed.
+	 */
+	if ((i2c->auto_restart || i2c->dev_comp->manual_wr_rd) && num == 2) {
 		if (!(msgs[0].flags & I2C_M_RD) && (msgs[1].flags & I2C_M_RD) &&
 		    msgs[0].addr == msgs[1].addr) {
 			i2c->auto_restart = 0;

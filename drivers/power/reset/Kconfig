@@ -12,9 +12,10 @@ if POWER_RESET
 config POWER_RESET_MT6580_BOOTMODE
 	bool "WT6580 LK bootloader reboot mode"
 	depends on ARCH_MEDIATEK && OF
+	select MTK_MT6580_PMIC_WRAP
 	help
-	  Preserve the MT6580 firmware PMIC wrapper setup and set the MT6350
-	  RTC fastboot marker before rebooting into LK. For initial bring-up;
+	  Set the MT6350 RTC fastboot marker before rebooting into LK through
+	  the shared firmware-initialized PMIC wrapper. For initial bring-up;
 	  do not enable alongside a full PMIC wrapper driver for the same MMIO.
 
 config POWER_RESET_AS3722

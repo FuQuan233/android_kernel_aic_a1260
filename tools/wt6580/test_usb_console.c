@@ -38,7 +38,7 @@ static long simulated_syscall(long nr, long a, long b, long c, long d, long e)
 	switch (nr) {
 	case 5:
 		if (!strcmp((const char *)a,
-			    "/sys/bus/platform/devices/1000f000.reboot-mode/bootloader")) {
+			    "/sys/bus/platform/devices/1000f000.pmic-wrap:reboot-mode/bootloader")) {
 			assert(b == 1);
 			return missing_bootmode ? -2 : 13;
 		}

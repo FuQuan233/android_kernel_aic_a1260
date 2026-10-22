@@ -55,6 +55,14 @@ config MTK_PMIC_WRAP
 	  on different MediaTek SoCs. The PMIC wrapper is a proprietary
 	  hardware to connect the PMIC.
 
+config MTK_MT6580_PMIC_WRAP
+	tristate "MT6580 firmware-initialized PMIC wrapper"
+	depends on OF
+	select REGMAP
+	help
+	  Share the firmware-initialized WACS2 channel between MT6350
+	  regulators and RTC reboot-mode control. Does not initialize PWRAP.
+
 config MTK_REGULATOR_COUPLER
 	bool "MediaTek SoC Regulator Coupler" if COMPILE_TEST
 	default ARCH_MEDIATEK

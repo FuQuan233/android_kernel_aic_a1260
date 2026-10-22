@@ -881,6 +881,12 @@ config REGULATOR_MT6315
 	  This driver supports the control of different power rails of device
 	  through regulator interface.
 
+config REGULATOR_MT6350
+	tristate "MediaTek MT6350 VGP1 regulator"
+	depends on MTK_MT6580_PMIC_WRAP
+	help
+	  Control the MT6350 VGP1 supply through the MT6580 PMIC wrapper.
+
 config REGULATOR_MT6323
 	tristate "MediaTek MT6323 PMIC"
 	depends on MFD_MT6397

@@ -1,20 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* MT6580/MT6350 LK fastboot marker, using the firmware-initialized wrapper. */
-#include <linux/bitfield.h>
-#include <linux/iopoll.h>
+/* MT6580/MT6350 LK fastboot marker through the shared PMIC wrapper regmap. */
+#include <linux/delay.h>
+#include <linux/regmap.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/reboot.h>
 
-#define WACS2_CMD	0x9c
-#define WACS2_RDATA	0xa0
-#define WACS2_VLDCLR	0xa4
-#define WACS_FSM	GENMASK(18, 16)
-#define WACS_IDLE	0
-#define WACS_VALID	6
-#define WACS_INIT_DONE	BIT(21)
 #define RTC_BBPU	0x8000
 #define RTC_PDN1	0x802c
 #define RTC_PROT	0x8036
@@ -23,7 +16,7 @@
 #define RTC_FAST_BOOT	BIT(13)
 
 struct mt6580_reboot {
-	void __iomem *base;
+	struct regmap *regmap;
 	struct device *dev;
 	struct mutex lock;
 	struct notifier_block notifier;
@@ -32,31 +25,15 @@ struct mt6580_reboot {
 
 static int mt6580_pmic_xfer(struct mt6580_reboot *rb, u16 reg, u16 *value, bool write)
 {
-	u32 status;
+	unsigned int data;
 	int ret;
 
-	status = readl(rb->base + WACS2_RDATA);
-	if (!(status & WACS_INIT_DONE))
-		return -ENODEV;
-	/* Finish an abandoned read before issuing another transaction. */
-	if (FIELD_GET(WACS_FSM, status) == WACS_VALID)
-		writel(1, rb->base + WACS2_VLDCLR);
-	ret = readl_poll_timeout(rb->base + WACS2_RDATA, status,
-				FIELD_GET(WACS_FSM, status) == WACS_IDLE, 10, 10000);
-	if (ret)
-		return ret;
-	writel((write ? BIT(31) : 0) | ((u32)(reg >> 1) << 16) |
-	       (write ? *value : 0), rb->base + WACS2_CMD);
 	if (write)
-		return readl_poll_timeout(rb->base + WACS2_RDATA, status,
-			FIELD_GET(WACS_FSM, status) == WACS_IDLE, 10, 10000);
-	ret = readl_poll_timeout(rb->base + WACS2_RDATA, status,
-				FIELD_GET(WACS_FSM, status) == WACS_VALID, 10, 10000);
-	if (ret)
-		return ret;
-	*value = status & 0xffff;
-	writel(1, rb->base + WACS2_VLDCLR);
-	return 0;
+		return regmap_write(rb->regmap, reg, *value);
+	ret = regmap_read(rb->regmap, reg, &data);
+	if (!ret)
+		*value = data;
+	return ret;
 }
 
 static int mt6580_rtc_commit(struct mt6580_reboot *rb, u16 reg, u16 value)
@@ -149,9 +126,9 @@ static int mt6580_reboot_probe(struct platform_device *pdev)
 	rb = devm_kzalloc(&pdev->dev, sizeof(*rb), GFP_KERNEL);
 	if (!rb)
 		return -ENOMEM;
-	rb->base = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(rb->base))
-		return PTR_ERR(rb->base);
+	rb->regmap = dev_get_regmap(pdev->dev.parent, NULL);
+	if (!rb->regmap)
+		return -ENODEV;
 	rb->dev = &pdev->dev;
 	mutex_init(&rb->lock);
 	platform_set_drvdata(pdev, rb);

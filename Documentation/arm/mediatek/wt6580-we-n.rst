@@ -37,8 +37,10 @@ Confirmed board information
   The reference source's ``jd9161_wvga_dsi_vdo_hlt_boe40`` has different
   timings and commands and must not be treated as the identified panel.
   See ``wt6580-stock-display.rst`` for addresses, values and limitations.
-* Touch controller reports ``FT6x36``. No touchscreen or I2C bus support
-  has been connected in this first-stage DTS.
+* Touch controller uses the reference BSP's FT6336U configuration: I2C1
+  address ``0x38``, reset GPIO2, GPIO5/EINT5 falling edge, 480x800.
+  The device owner confirms accurate taps, dragging and two-finger input
+  with the new 6.18 driver.
 * UART0: ``0x11005000``; GPT: ``0x10008000``; watchdog: ``0x10007000``.
 * eMMC boot partition: 16 MiB, ``/dev/block/mmcblk0p7``. The captured header
   is Android boot format v0, 2048-byte pages, kernel address
@@ -600,3 +602,53 @@ References
 * https://github.com/afanetd/pixus-hipower-mainline
 * https://github.com/eugenefil/mt6580-mainline/tree/mt6580
 * https://github.com/mt6572-mainline/linux
+
+
+FT6336U touch integration
+------------------------
+
+The reference BSP touch driver and its board parameters are confirmed correct
+by the device owner. The 6.18 port uses ``edt-ft5x06`` with the FT6236 two-slot
+protocol for ``focaltech,ft6336u``. It does not flash touch firmware. I2C1 at
+``0x1100a000`` uses APDMA channel ``0x11000200``, GPIO59/SCL and GPIO62/SDA
+(function 1), controller interrupt SPI41 and a 100 kHz bus. MT6580 has the
+auxiliary transfer-length register at 0x6c. Register reads use one WRRD
+transaction even though MT6580 has no multi-message auto-restart engine;
+separate starts would make the first DMA wait indefinitely for the second
+transaction. The hardware DCM register is explicitly disabled as in the BSP.
+
+The Paris pinctrl backend describes the vendor's 93 pins and IOCFG register
+fields, including 12-byte GPIO bank strides. Only GPIO0..15 EINT mappings are
+exposed; the other GPIO banks share interrupt channels and still need routing
+support. GPIO5 uses function 6/EINT5; GPIO2 is an active-low reset. The EINT
+summary interrupt is SPI94, level high. Special reversed MSDC pull fields are
+not advertised as generic pull-select controls.
+
+MT6350 VGP1 supplies 2.8 V. A hardware read before integration found CON0 at
+0x050a was 0x0000 (disabled), and CON1 at 0x0530 was 0x00a1 (selector 5).
+The regulator uses enable bit 15 and selector bits 7:5, with the BSP's voltage
+table. Firmware-initialized WACS2 access is shared through one regmap between
+VGP1 and the existing RTC reboot marker, rather than assigning the MMIO block
+to two independent drivers. PWRAP initialization, other MT6350 regulators,
+battery, PMIC interrupt support and suspend/resume remain unfinished.
+
+The Lineage device kernel fragment enables these drivers and evdev. No Android
+system/vendor change is required for standard direct multitouch input events.
+
+Hardware validation: the input device registers at about one second as
+``/dev/input/event0``, with the upstream EDT identification name ``EP0110M09``
+(the firmware vendor-ID heuristic, not an independently identified EDT panel).
+It advertises ``INPUT_PROP_DIRECT``, X=0..479, Y=0..799 and two MT slots.
+VGP1 remains enabled at 2.8 V. Actual interaction produces EINT5 interrupts,
+I2C completion interrupts, coordinate updates, tracking IDs and balanced
+BTN_TOUCH down/up events. Android InputReader classifies it as internal
+``TOUCH | TOUCH_MT``. The user confirms taps, swipes and two-finger operation
+with correct coordinates. Display RDMA reports zero underflows/abnormal events.
+A transient display misalignment was reported and recovered without changes;
+the captured screenshot was normal, so its cause is not established.
+
+The RTC marker algorithm is unchanged, while register transport now uses the
+shared regmap. The diagnostic sysfs path is
+``/sys/bus/platform/devices/1000f000.pmic-wrap:reboot-mode/bootloader``.
+Normal Android reboots are verified. Re-entering fastboot after the shared
+transport refactor has not been hardware-tested.
