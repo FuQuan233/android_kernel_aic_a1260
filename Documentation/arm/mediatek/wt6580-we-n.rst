@@ -380,6 +380,48 @@ that raw input had no echo. The interactive configuration described above
 addresses both paths; CR, LF and CRLF commands remain accepted. Host protocol tests and a PTY
 output-conversion check pass; device-side formatting needs retesting.
 
+eMMC bring-up
+-------------
+
+The captured running-device DT locates MSDC0 at ``0x11120000`` with GIC
+SPI 38, level low, an eight-bit non-removable bus and clock selector 7.
+The legacy MT6580 driver confirms a 12-bit divider (CFG[19:8]), clock mode
+at CFG[21:20], PAD_TUNE0 at 0xf0, synchronous command/CRC FIFOs and
+PATCH_BIT1=0xfffe00c9. The existing ``mtk-sd`` driver now has an MT6580
+variant for that layout; the asynchronous FIFO settings of MT2701 are
+not used. The board's captured DAT read and CMD/write delay values are
+all zero. The vendor initialization forces rising sampling edges for
+non-SDIO cards regardless of the captured default edge properties.
+
+TOPCKGEN exposes MSDC0's gate (CLK_GATING_CTRL0[17]) and retains the
+firmware source selector (CLK_MUX_SEL0[13:11]). Source rates come from
+the MT6580 vendor clock table. PLL retuning, a full pinctrl driver and
+PMIC regulator control are pending. ``mediatek,firmware-pins`` explicitly
+opts into retaining LK's pad setup, restricted to non-removable legacy
+eMMC at no more than 26 MHz. A fixed always-on VEMC supply models the
+vendor driver's 3.0 V setting; it does not program the PMIC. No DDR,
+HS200, HS400, signal voltage switching or hardware command queue is
+advertised. This is a bootloader-dependent bring-up configuration.
+
+Diagnostic commands are ``mmcstatus`` (clock/register snapshot),
+``mmcid`` (raw CID), ``partitions`` (kernel partition list) and ``mmcread``.
+The last command opens only ``/dev/mmcblk0`` with ARM EABI
+``O_RDONLY | O_DIRECT | O_LARGEFILE`` and reads its first MiB twice,
+reporting both CRC32 values. Every 64 KiB read bypasses the page cache;
+no block-write, erase or discard operation is requested. The diagnostic
+PID 1 never mounts an eMMC filesystem. Host tests check ARM open flags,
+CRC calculation, repeated reads, short I/O, EINTR and descriptor cleanup.
+The MMC core still performs normal card initialization/mode selection.
+
+Hardware builds #29 and #30 identify ``FN62MB``, 7.28 GiB, 22 GPT partitions,
+two 4 MiB boot areas and a 512 KiB RPMB character device. Legacy timing
+uses an eight-bit bus, a 208 MHz source and an actual 17.333333 MHz card
+clock (25 MHz requested, rounded down by the divider). Two uncached
+first-MiB reads both yield CRC32 ``77bb957a`` with host error zero. DRM
+color-bar output remains active with zero RDMA underflow/abnormal counts.
+These checks do not establish write reliability, full-media integrity,
+Android filesystem mounting, suspend-to-RAM or high-speed tuning.
+
 References
 ----------
 

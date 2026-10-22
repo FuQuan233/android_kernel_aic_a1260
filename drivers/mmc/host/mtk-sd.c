@@ -448,6 +448,7 @@ struct mtk_mmc_compatible {
 	bool use_internal_cd;
 	bool support_new_tx;
 	bool support_new_rx;
+	bool legacy_sync_fifo;
 };
 
 struct msdc_tune_para {
@@ -504,6 +505,7 @@ struct msdc_host {
 	u32 src_clk_freq;	/* source clock frequency */
 	unsigned char timing;
 	bool vqmmc_enabled;
+	bool firmware_pins;
 	u32 latch_ck;
 	u32 hs400_ds_delay;
 	u32 hs400_ds_dly3;
@@ -522,6 +524,12 @@ struct msdc_host {
 	struct msdc_tune_para saved_tune_para; /* tune result of CMD21/CMD19 */
 	struct cqhci_host *cq_host;
 	u32 cq_ssc1_time;
+};
+
+static const struct mtk_mmc_compatible mt6580_compat = {
+	.clk_div_bits = 12,
+	.pad_tune_reg = MSDC_PAD_TUNE0,
+	.legacy_sync_fifo = true,
 };
 
 static const struct mtk_mmc_compatible mt2701_compat = {
@@ -692,6 +700,7 @@ static const struct mtk_mmc_compatible mt8196_compat = {
 };
 
 static const struct of_device_id msdc_of_ids[] = {
+	{ .compatible = "mediatek,mt6580-mmc", .data = &mt6580_compat },
 	{ .compatible = "mediatek,mt2701-mmc", .data = &mt2701_compat},
 	{ .compatible = "mediatek,mt2712-mmc", .data = &mt2712_compat},
 	{ .compatible = "mediatek,mt6779-mmc", .data = &mt6779_compat},
@@ -745,13 +754,17 @@ static void sdr_get_field(void __iomem *reg, u32 field, u32 *val)
 static void msdc_reset_hw(struct msdc_host *host)
 {
 	u32 val;
+	u32 timeout = host->dev_comp->legacy_sync_fifo ? 20000 : 0;
 
 	sdr_set_bits(host->base + MSDC_CFG, MSDC_CFG_RST);
-	readl_poll_timeout_atomic(host->base + MSDC_CFG, val, !(val & MSDC_CFG_RST), 0, 0);
+	if (readl_poll_timeout_atomic(host->base + MSDC_CFG, val,
+				      !(val & MSDC_CFG_RST), timeout ? 1 : 0, timeout))
+		dev_err_ratelimited(host->dev, "Reset timed out: cfg=%08x\n", val);
 
 	sdr_set_bits(host->base + MSDC_FIFOCS, MSDC_FIFOCS_CLR);
-	readl_poll_timeout_atomic(host->base + MSDC_FIFOCS, val,
-				  !(val & MSDC_FIFOCS_CLR), 0, 0);
+	if (readl_poll_timeout_atomic(host->base + MSDC_FIFOCS, val,
+				      !(val & MSDC_FIFOCS_CLR), timeout ? 1 : 0, timeout))
+		dev_err_ratelimited(host->dev, "FIFO clear timed out: fifocs=%08x\n", val);
 
 	val = readl(host->base + MSDC_INT);
 	writel(val, host->base + MSDC_INT);
@@ -1070,7 +1083,13 @@ static void msdc_set_mclk(struct msdc_host *host, unsigned char timing, u32 hz)
 			      (mode << 12) | div);
 
 	clk_prepare_enable(host->src_clk_cg);
-	readl_poll_timeout(host->base + MSDC_CFG, val, (val & MSDC_CFG_CKSTB), 0, 0);
+	if (readl_poll_timeout(host->base + MSDC_CFG, val,
+			       (val & MSDC_CFG_CKSTB), 1,
+			       host->dev_comp->legacy_sync_fifo ? 20000 : 0)) {
+		dev_err(host->dev, "Clock failed to stabilize: cfg=%08x\n", val);
+		sdr_set_bits(host->base + MSDC_INTEN, flags);
+		return;
+	}
 	sdr_set_bits(host->base + MSDC_CFG, MSDC_CFG_CKPDN);
 	mmc->actual_clock = sclk;
 	host->mclk = hz;
@@ -1643,6 +1662,10 @@ static int msdc_ops_switch_volt(struct mmc_host *mmc, struct mmc_ios *ios)
 	struct msdc_host *host = mmc_priv(mmc);
 	int ret;
 
+	/* LK owns the pad voltage until the MT6580 pinctrl/PMIC port is ready. */
+	if (host->firmware_pins)
+		return ios->signal_voltage == MMC_SIGNAL_VOLTAGE_330 ? 0 : -EINVAL;
+
 	if (!IS_ERR(mmc->supply.vqmmc)) {
 		if (ios->signal_voltage != MMC_SIGNAL_VOLTAGE_330 &&
 		    ios->signal_voltage != MMC_SIGNAL_VOLTAGE_180) {
@@ -1896,6 +1919,22 @@ static void msdc_init_hw(struct msdc_host *host)
 		sdr_clr_bits(host->base + MSDC_INTEN, MSDC_INTEN_CDSC);
 	}
 
+	if (host->dev_comp->legacy_sync_fifo) {
+		/* MT6580 vendor init: separate DAT delays and synchronous FIFO. */
+		writel(0x10008000, host->base + tune_reg);
+		writel(MSDC_IOCON_DDLSEL, host->base + MSDC_IOCON);
+		writel(0, host->base + 0xf8); /* DAT_RDDLY0: captured board delays */
+		writel(0, host->base + 0xfc); /* DAT_RDDLY1 */
+		writel(0xfffe00c9, host->base + MSDC_PATCH_BIT1);
+		sdr_set_bits(host->base + MSDC_PATCH_BIT, MSDC_PATCH_BIT_DECRCTMO);
+		sdr_clr_bits(host->base + MSDC_PATCH_BIT2, MSDC_PATCH_BIT2_CFGCRCSTS);
+		sdr_set_bits(host->base + MSDC_PATCH_BIT2, MSDC_PATCH_BIT2_CFGRESP);
+		sdr_set_field(host->base + MSDC_PATCH_BIT2, MSDC_PB2_RESPWAIT, 3);
+		sdr_set_bits(host->base + SDC_CFG, SDC_CFG_SDIO);
+		sdr_clr_bits(host->base + SDC_CFG, SDC_CFG_SDIOIDE | SDC_CFG_BUSWIDTH);
+		goto save_timing;
+	}
+
 	if (host->top_base) {
 		writel(0, host->top_base + EMMC_TOP_CONTROL);
 		writel(0, host->top_base + EMMC_TOP_CMD);
@@ -2045,6 +2084,7 @@ static void msdc_init_hw(struct msdc_host *host)
 		sdr_set_bits(host->base + SDC_ADV_CFG0, SDC_DAT1_IRQ_TRIGGER);
 	}
 
+save_timing:
 	/* Configure to default data timeout */
 	sdr_set_field(host->base + SDC_CFG, SDC_CFG_DTOC, 3);
 
@@ -2957,6 +2997,47 @@ static int msdc_of_clock_parse(struct platform_device *pdev,
 	return 0;
 }
 
+/* Read-only bring-up diagnostics; resume clocks before touching registers. */
+static ssize_t state_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct mmc_host *mmc = dev_get_drvdata(dev);
+	struct msdc_host *host = mmc_priv(mmc);
+	int ret;
+	ssize_t len;
+
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		return ret;
+	len = sysfs_emit(buf,
+		"source_hz=%u requested_hz=%u actual_hz=%u timing=%u width=%u error=%x\n"
+		"cfg=%08x iocon=%08x ps=%08x int=%08x inten=%08x\n"
+		"sdc_cfg=%08x cmd=%08x arg=%08x sts=%08x resp0=%08x\n"
+		"pb0=%08x pb1=%08x pb2=%08x pad=%08x dma_cfg=%08x\n",
+		host->src_clk_freq, host->mclk, mmc->actual_clock, host->timing,
+		1U << mmc->ios.bus_width, host->error,
+		readl(host->base + MSDC_CFG), readl(host->base + MSDC_IOCON),
+		readl(host->base + MSDC_PS), readl(host->base + MSDC_INT),
+		readl(host->base + MSDC_INTEN), readl(host->base + SDC_CFG),
+		readl(host->base + SDC_CMD), readl(host->base + SDC_ARG),
+		readl(host->base + SDC_STS), readl(host->base + SDC_RESP0),
+		readl(host->base + MSDC_PATCH_BIT), readl(host->base + MSDC_PATCH_BIT1),
+		readl(host->base + MSDC_PATCH_BIT2),
+		readl(host->base + host->dev_comp->pad_tune_reg),
+		readl(host->base + MSDC_DMA_CFG));
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_put_autosuspend(dev);
+	return len;
+}
+static DEVICE_ATTR_RO(state);
+
+static struct attribute *mt6580_mmc_attrs[] = {
+	&dev_attr_state.attr,
+	NULL,
+};
+static const struct attribute_group mt6580_mmc_group = {
+	.attrs = mt6580_mmc_attrs,
+};
+
 static int msdc_drv_probe(struct platform_device *pdev)
 {
 	struct mmc_host *mmc;
@@ -3016,6 +3097,21 @@ static int msdc_drv_probe(struct platform_device *pdev)
 	if (host->irq < 0)
 		return host->irq;
 
+	host->firmware_pins = host->dev_comp->legacy_sync_fifo &&
+		of_property_read_bool(pdev->dev.of_node, "mediatek,firmware-pins");
+	if (host->firmware_pins) {
+		if (!(mmc->caps & MMC_CAP_NONREMOVABLE) ||
+		    (mmc->caps2 & (MMC_CAP2_NO_SD | MMC_CAP2_NO_SDIO)) !=
+			(MMC_CAP2_NO_SD | MMC_CAP2_NO_SDIO) ||
+		    mmc->f_max > 26000000 ||
+		    (mmc->caps & (MMC_CAP_UHS | MMC_CAP_MMC_HIGHSPEED)) ||
+		    (mmc->caps2 & (MMC_CAP2_HS200 | MMC_CAP2_HS400)))
+			return dev_err_probe(&pdev->dev, -EINVAL,
+				"Firmware pads require non-removable legacy eMMC <=26 MHz\n");
+		dev_info(&pdev->dev, "Retaining firmware eMMC pads and supply voltage\n");
+		goto pins_ready;
+	}
+
 	host->pinctrl = devm_pinctrl_get(&pdev->dev);
 	if (IS_ERR(host->pinctrl))
 		return dev_err_probe(&pdev->dev, PTR_ERR(host->pinctrl),
@@ -3047,6 +3143,7 @@ static int msdc_drv_probe(struct platform_device *pdev)
 		}
 	}
 
+pins_ready:
 	msdc_of_property_parse(pdev, host);
 
 	host->dev = &pdev->dev;
@@ -3156,6 +3253,11 @@ static int msdc_drv_probe(struct platform_device *pdev)
 	pm_runtime_set_autosuspend_delay(host->dev, MTK_MMC_AUTOSUSPEND_DELAY);
 	pm_runtime_use_autosuspend(host->dev);
 	pm_runtime_enable(host->dev);
+	if (host->dev_comp->legacy_sync_fifo) {
+		ret = devm_device_add_group(&pdev->dev, &mt6580_mmc_group);
+		if (ret)
+			goto end;
+	}
 	ret = mmc_add_host(mmc);
 
 	if (ret)

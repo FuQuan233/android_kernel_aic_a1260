@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* USB gates from the MT6580 vendor clock manager. */
+/* USB and MSDC0 clocks from the MT6580 vendor clock manager. */
 #include <linux/clk-provider.h>
 #include <linux/io.h>
 #include <linux/module.h>
@@ -17,7 +17,7 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	struct clk_hw *source;
 	void __iomem *base;
 	bool top = of_device_is_compatible(dev->of_node, "mediatek,mt6580-topckgen");
-	unsigned int count = top ? 1 : 2;
+	unsigned int count = 2;
 	unsigned int i;
 
 	base = devm_platform_ioremap_resource(pdev, 0);
@@ -29,6 +29,23 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	data->num = count;
 
 	if (top) {
+		/* Keep LK's mux selection; rates from the MT6580 clock manager. */
+		static const unsigned long msdc_rates[] = {
+			125130000, 150150000, 187690000, 178280000,
+			214500000, 187690000, 26000000, 208000000,
+		};
+		u32 mux = (readl(base) >> 11) & 7;
+
+		source = devm_clk_hw_register_fixed_rate(dev, "mt6580_msdc0_src",
+						       NULL, 0, msdc_rates[mux]);
+		if (IS_ERR(source))
+			return PTR_ERR(source);
+		data->hws[CLK_MT6580_TOP_MSDC0] = devm_clk_hw_register_gate(dev,
+			"mt6580_msdc0", "mt6580_msdc0_src", 0, base + 0x20, 17,
+			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
+		dev_info(dev, "MSDC0 firmware mux %u, source %lu Hz\n",
+			 mux, msdc_rates[mux]);
+
 		/* CLK_GATING_CTRL1[13]: 1 gates the USB bus clock. */
 		data->hws[CLK_MT6580_TOP_USB] = devm_clk_hw_register_gate(dev,
 			"mt6580_usb_bus", NULL, 0, base + 0x24, 13,
@@ -73,5 +90,5 @@ static struct platform_driver mt6580_usb_clk_driver = {
 };
 module_platform_driver(mt6580_usb_clk_driver);
 
-MODULE_DESCRIPTION("MT6580 USB clock gates");
+MODULE_DESCRIPTION("MT6580 USB and MSDC0 clocks");
 MODULE_LICENSE("GPL");

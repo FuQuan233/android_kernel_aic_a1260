@@ -16,6 +16,7 @@ properties:
       - enum:
           - mediatek,mt2701-mmc
           - mediatek,mt2712-mmc
+          - mediatek,mt6580-mmc
           - mediatek,mt6779-mmc
           - mediatek,mt6795-mmc
           - mediatek,mt7620-mmc
@@ -157,6 +158,13 @@ properties:
     enum: [32, 64]
     default: 32
 
+  mediatek,firmware-pins:
+    $ref: /schemas/types.yaml#/definitions/flag
+    description:
+      Retain bootloader pad mux and supply voltage on MT6580 while pinctrl
+      support is pending. Only non-removable legacy eMMC up to 26 MHz is
+      supported. No signal voltage switching or high speed modes are allowed.
+
   resets:
     maxItems: 1
 
@@ -169,19 +177,34 @@ required:
   - interrupts
   - clocks
   - clock-names
-  - pinctrl-names
-  - pinctrl-0
-  - pinctrl-1
   - vmmc-supply
-  - vqmmc-supply
 
 allOf:
   - $ref: mmc-controller.yaml#
+  - if:
+      required: [mediatek,firmware-pins]
+    then:
+      properties:
+        compatible:
+          const: mediatek,mt6580-mmc
+        non-removable: true
+        max-frequency:
+          maximum: 26000000
+        cap-mmc-highspeed: false
+        mmc-hs200-1_8v: false
+        mmc-hs200-1_2v: false
+        mmc-hs400-1_8v: false
+        mmc-hs400-1_2v: false
+      required: [non-removable, max-frequency, no-sd, no-sdio]
+    else:
+      required: [pinctrl-names, pinctrl-0, pinctrl-1, vqmmc-supply]
+
   - if:
       properties:
         compatible:
           enum:
             - mediatek,mt2701-mmc
+            - mediatek,mt6580-mmc
             - mediatek,mt6779-mmc
             - mediatek,mt6795-mmc
             - mediatek,mt7620-mmc

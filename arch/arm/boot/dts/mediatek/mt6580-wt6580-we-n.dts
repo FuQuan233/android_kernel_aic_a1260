@@ -13,6 +13,7 @@
 	aliases {
 		serial0 = &uart0;
 		serial1 = &uart1;
+		mmc0 = &mmc0;
 	};
 
 	chosen {
@@ -115,6 +116,33 @@
 		compatible = "mediatek,mt6580-apmixedsys";
 		reg = <0 0x10018000 0 0x1000>;
 		#clock-cells = <1>;
+	};
+
+	/* Vendor msdc_emmc_power() uses VEMC=3.0 V; PMIC control is pending. */
+	vemc: regulator-vemc {
+		compatible = "regulator-fixed";
+		regulator-name = "vemc-firmware";
+		regulator-min-microvolt = <3000000>;
+		regulator-max-microvolt = <3000000>;
+		regulator-boot-on;
+		regulator-always-on;
+	};
+
+	mmc0: mmc@11120000 {
+		compatible = "mediatek,mt6580-mmc";
+		reg = <0 0x11120000 0 0x10000>;
+		interrupts = <GIC_SPI 38 IRQ_TYPE_LEVEL_LOW>;
+		clocks = <&topckgen CLK_MT6580_TOP_MSDC0>,
+			 <&topckgen CLK_MT6580_TOP_MSDC0>;
+		clock-names = "source", "hclk";
+		bus-width = <8>;
+		max-frequency = <26000000>;
+		non-removable;
+		no-sd;
+		no-sdio;
+		vmmc-supply = <&vemc>;
+		/* No voltage switching until pinctrl and PMIC are ported. */
+		mediatek,firmware-pins;
 	};
 
 	usbphy: phy@11110800 {

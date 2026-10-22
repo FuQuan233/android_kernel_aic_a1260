@@ -2,8 +2,9 @@
 #ifndef _DT_BINDINGS_CLK_MT6580_H
 #define _DT_BINDINGS_CLK_MT6580_H
 
-/* USB subset of the MT6580 clock tree. */
+/* Bring-up subset of the MT6580 clock tree. */
 #define CLK_MT6580_TOP_USB	0
+#define CLK_MT6580_TOP_MSDC0	1
 #define CLK_MT6580_APMIXED_UNIV48M	0
 #define CLK_MT6580_APMIXED_USB48M	1
 

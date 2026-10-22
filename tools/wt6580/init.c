@@ -98,6 +98,7 @@ static void log_file(long log, const char *path)
 
 /* Keep USB backpressure/disconnects out of the watchdog feeding path. */
 static long usb_fd = -1;
+static long watchdog = -1;
 static long dump_fd = -1;
 static char usb_output[8192];
 static long usb_output_len;
@@ -132,6 +133,7 @@ static void usb_start_dump(const char *path)
 
 #include "fbtest.h"
 #include "drmtest.h"
+#include "mmctest.h"
 
 static void usb_execute_command(void)
 {
@@ -140,8 +142,16 @@ static void usb_execute_command(void)
 	} else if (text_equal(usb_command, "help")) {
 		usb_reply("\nWT6580 USB CDC debug: help, dmesg, status, cmdline, "
 			  "interrupts, meminfo, fbstatus, fbtest, fbrestore, dsistate, panelid, "
-			  "paneloff, panelon, panelreinit, drmstatus, drmtest, drmoff, reboot, reboot bootloader\n"
+			  "paneloff, panelon, panelreinit, drmstatus, drmtest, drmoff, mmcstatus, mmcid, partitions, mmcread, reboot, reboot bootloader\n"
 			  "dmesg replays the kernel ring buffer, including pre-USB logs.\n");
+	} else if (text_equal(usb_command, "mmcstatus")) {
+		usb_start_dump("/sys/bus/platform/devices/11120000.mmc/state");
+	} else if (text_equal(usb_command, "mmcid")) {
+		usb_start_dump("/sys/block/mmcblk0/device/cid");
+	} else if (text_equal(usb_command, "partitions")) {
+		usb_start_dump("/proc/partitions");
+	} else if (text_equal(usb_command, "mmcread")) {
+		mmc_read_test();
 	} else if (text_equal(usb_command, "drmstatus")) {
 		drm_test(0);
 	} else if (text_equal(usb_command, "drmtest")) {
@@ -338,7 +348,7 @@ static int usb_poll_console(void)
 
 __attribute__((used, noreturn)) static void boot_main(void)
 {
-	long log, watchdog;
+	long log;
 	int timeout = 30;
 	long next_feed = 0, next_heartbeat = 0;
 
