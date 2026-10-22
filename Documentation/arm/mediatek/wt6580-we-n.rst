@@ -543,8 +543,10 @@ compressed-boot option, depending on ATAG/appended-DTB compatibility. It
 copies only the two initrd properties into the appended tree. Both 32-bit
 and 64-bit encodings are supported; missing, incomplete and inverted
 ranges are handled explicitly. The board's command line, memory map and
-reserved regions stay in the appended tree. This avoids importing the
-legacy kernel's ``androidboot.hardware=mt6580`` and ``vmalloc=496M``.
+reserved regions stay in the appended tree. This avoids importing
+legacy command-line settings such as ``vmalloc=496M``. Android uses the
+SoC identifier ``androidboot.hardware=mt6580``; ``wt6580_we_n`` names the
+specific board and remains in the board DTS and defconfig names.
 
 The A1260 device product enables the option and builds an external Android
 first-stage ramdisk without the diagnostic built-in initramfs. Hardware

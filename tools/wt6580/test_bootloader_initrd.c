@@ -24,7 +24,7 @@ static void create_tree(union tree *tree, int loader)
 	assert(node >= 0);
 	assert(!fdt_setprop_string(tree->data, node, "bootargs", loader ?
 		"androidboot.hardware=mt6580 vmalloc=496M" :
-		"androidboot.hardware=wt6580 maxcpus=1"));
+		"androidboot.hardware=mt6580 maxcpus=1"));
 	node = fdt_add_subnode(tree->data, 0, "reserved-memory");
 	assert(node >= 0);
 	assert(!fdt_setprop(tree->data, node, "reg", reg, sizeof(reg)));
@@ -78,7 +78,7 @@ static void successful_copy(int cells)
 	assert(address(target.data, "linux,initrd-end", cells) == end);
 	node = fdt_path_offset(target.data, "/chosen");
 	prop = fdt_getprop(target.data, node, "bootargs", &len);
-	assert(prop && !strcmp(prop, "androidboot.hardware=wt6580 maxcpus=1"));
+	assert(prop && !strcmp(prop, "androidboot.hardware=mt6580 maxcpus=1"));
 	node = fdt_path_offset(target.data, "/reserved-memory");
 	prop = fdt_getprop(target.data, node, "reg", &len);
 	assert(prop && len == sizeof(reserved) && !memcmp(prop, reserved, len));

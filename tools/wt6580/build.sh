@@ -93,7 +93,7 @@ line = next(line for line in Path(path).read_text().splitlines()
             if line.startswith("CONFIG_CMDLINE="))
 cmdline = json.loads(line.split("=", 1)[1])
 # Bring-up only: retain CPU0 and permit an unfinished device SELinux policy.
-cmdline += " maxcpus=1 androidboot.hardware=wt6580 androidboot.selinux=permissive enforcing=0"
+cmdline += " maxcpus=1 androidboot.hardware=mt6580 androidboot.selinux=permissive enforcing=0"
 subprocess.run([script, "--file", path, "--set-str", "CMDLINE", cmdline], check=True)
 PYANDROID
 fi
