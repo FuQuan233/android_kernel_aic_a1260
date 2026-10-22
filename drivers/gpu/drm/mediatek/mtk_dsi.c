@@ -193,6 +193,7 @@ struct mtk_dsi_driver_data {
 	bool has_size_ctl;
 	bool cmdq_long_packet_ctl;
 	bool support_per_frame_lp;
+	bool mt6580;
 };
 
 struct mtk_dsi {
@@ -211,6 +212,7 @@ struct mtk_dsi {
 	struct clk *hs_clk;
 
 	u32 data_rate;
+	int irq;
 
 	unsigned long mode_flags;
 	enum mipi_dsi_pixel_format format;
@@ -265,6 +267,28 @@ static void mtk_dsi_phy_timconfig(struct mtk_dsi *dsi)
 	timing->clk_hs_zero = timing->clk_hs_trail * 4;
 	timing->clk_hs_exit = 2 * timing->clk_hs_trail;
 
+	if (dsi->driver_data->mt6580) {
+		u32 ui = 1000 / data_rate_mhz + 1;
+		u32 cycle = 8000 / data_rate_mhz + 1;
+
+		/* MT6580 DSI_PHY_TIMCONFIG, matching the running 150 MHz link. */
+		timing->lpx = max(1U, 80 / cycle);
+		timing->da_hs_prepare = max(1U, (64 + 5 * ui) / cycle);
+		timing->da_hs_zero = (200 + 10 * ui) / cycle;
+		if (timing->da_hs_zero > timing->da_hs_prepare)
+			timing->da_hs_zero -= timing->da_hs_prepare;
+		timing->da_hs_trail = max(1U, (4 * ui + 80) / cycle);
+		timing->ta_go = 4 * timing->lpx;
+		timing->ta_sure = 3 * timing->lpx / 2;
+		timing->ta_get = 5 * timing->lpx;
+		timing->da_hs_exit = 2 * timing->lpx;
+		timing->clk_hs_prepare = max(1U, 64 / cycle);
+		timing->clk_hs_post = (96 + 52 * ui) / cycle;
+		timing->clk_hs_zero = 400 / cycle;
+		timing->clk_hs_trail = max(2U, 96 / cycle + 1);
+		timing->clk_hs_exit = 2 * timing->lpx;
+	}
+
 	timcon0 = FIELD_PREP(LPX, timing->lpx) |
 		  FIELD_PREP(HS_PREP, timing->da_hs_prepare) |
 		  FIELD_PREP(HS_ZERO, timing->da_hs_zero) |
@@ -291,12 +315,15 @@ static void mtk_dsi_phy_timconfig(struct mtk_dsi *dsi)
 
 static void mtk_dsi_enable(struct mtk_dsi *dsi)
 {
-	mtk_dsi_mask(dsi, DSI_CON_CTRL, DSI_EN, DSI_EN);
+	/* MT6580 COM_CTRL bit 1 is dual-DSI selection, not engine enable. */
+	if (!dsi->driver_data->mt6580)
+		mtk_dsi_mask(dsi, DSI_CON_CTRL, DSI_EN, DSI_EN);
 }
 
 static void mtk_dsi_disable(struct mtk_dsi *dsi)
 {
-	mtk_dsi_mask(dsi, DSI_CON_CTRL, DSI_EN, 0);
+	if (!dsi->driver_data->mt6580)
+		mtk_dsi_mask(dsi, DSI_CON_CTRL, DSI_EN, 0);
 }
 
 static void mtk_dsi_reset_engine(struct mtk_dsi *dsi)
@@ -426,7 +453,8 @@ static void mtk_dsi_ps_control(struct mtk_dsi *dsi, bool config_vact)
 	if (config_vact) {
 		vact_nl = FIELD_PREP(VACT_NL, dsi->vm.vactive);
 		writel(vact_nl, dsi->regs + DSI_VACT_NL);
-		writel(ps_wc, dsi->regs + DSI_HSTX_CKL_WC);
+		writel(dsi->driver_data->mt6580 ? BIT(16) : ps_wc,
+		       dsi->regs + DSI_HSTX_CKL_WC);
 	}
 	writel(ps_val, dsi->regs + DSI_PSCTRL);
 }
@@ -577,7 +605,12 @@ static void mtk_dsi_config_vdo_timing(struct mtk_dsi *dsi)
 			FIELD_PREP(DSI_WIDTH, vm->hactive),
 			dsi->regs + DSI_SIZE_CON);
 
-	if (dsi->driver_data->support_per_frame_lp)
+	if (dsi->driver_data->mt6580) {
+		/* Continuous-clock BSP packet overhead and four-byte alignment. */
+		writel(ALIGN(vm->hsync_len * 3 - 10, 4), dsi->regs + DSI_HSA_WC);
+		writel(ALIGN(vm->hback_porch * 3 - 10, 4), dsi->regs + DSI_HBP_WC);
+		writel(ALIGN(vm->hfront_porch * 3 - 12, 4), dsi->regs + DSI_HFP_WC);
+	} else if (dsi->driver_data->support_per_frame_lp)
 		mtk_dsi_config_vdo_timing_per_frame_lp(dsi);
 	else
 		mtk_dsi_config_vdo_timing_per_line_lp(dsi);
@@ -645,6 +678,16 @@ static irqreturn_t mtk_dsi_irq(int irq, void *dev_id)
 
 	status = readl(dsi->regs + DSI_INTSTA) & flag;
 
+	if (dsi->driver_data->mt6580) {
+		if (!status)
+			return IRQ_NONE;
+		/* BTA is acknowledged by the polled transfer after copying RX. */
+		mtk_dsi_mask(dsi, DSI_INTSTA, status, 0);
+		mtk_dsi_irq_data_set(dsi, status);
+		wake_up_interruptible(&dsi->irq_wait_queue);
+		return IRQ_HANDLED;
+	}
+
 	if (status) {
 		do {
 			mtk_dsi_mask(dsi, DSI_RACK, RACK, RACK);
@@ -690,6 +733,18 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
 
 	dsi->data_rate = DIV_ROUND_UP_ULL(dsi->vm.pixelclock * bit_per_pixel,
 					  dsi->lanes);
+	if (dsi->driver_data->mt6580) {
+		u32 status;
+
+		/* Stop inherited video before changing its PLL or timings. */
+		writel(0, dsi->regs + DSI_START);
+		writel(CMD_MODE, dsi->regs + DSI_MODE_CTRL);
+		ret = readl_poll_timeout(dsi->regs + DSI_INTSTA, status,
+					!(status & DSI_BUSY), 10, 100000);
+		if (ret)
+			goto err_refcount;
+		dsi->data_rate = 300000000;
+	}
 
 	ret = clk_set_rate(dsi->hs_clk, dsi->data_rate);
 	if (ret < 0) {
@@ -697,7 +752,9 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
 		goto err_refcount;
 	}
 
-	phy_power_on(dsi->phy);
+	ret = phy_power_on(dsi->phy);
+	if (ret)
+		goto err_refcount;
 
 	ret = clk_prepare_enable(dsi->engine_clk);
 	if (ret < 0) {
@@ -871,6 +928,13 @@ mtk_dsi_bridge_mode_valid(struct drm_bridge *bridge,
 {
 	struct mtk_dsi *dsi = bridge_to_dsi(bridge);
 	int bpp;
+
+	if (dsi->driver_data->mt6580 &&
+	    (mode->hdisplay != 480 || mode->vdisplay != 800 ||
+	     mode->hsync_start - mode->hdisplay != 10 ||
+	     mode->hsync_end - mode->hsync_start != 10 ||
+	     mode->htotal - mode->hsync_end != 10))
+		return MODE_BAD;
 
 	bpp = mipi_dsi_pixel_format_to_bpp(dsi->format);
 	if (bpp < 0)
@@ -1113,6 +1177,8 @@ static ssize_t mtk_dsi_host_send_cmd(struct mtk_dsi *dsi,
 		return 0;
 }
 
+#include "mtk_dsi_mt6580.h"
+
 static ssize_t mtk_dsi_host_transfer(struct mipi_dsi_host *host,
 				     const struct mipi_dsi_msg *msg)
 {
@@ -1123,6 +1189,9 @@ static ssize_t mtk_dsi_host_transfer(struct mipi_dsi_host *host,
 	u8 irq_flag = CMD_DONE_INT_FLAG;
 	u32 dsi_mode;
 	int ret, i;
+
+	if (dsi->driver_data->mt6580)
+		return mt6580_dsi_transfer(dsi, msg);
 
 	dsi_mode = readl(dsi->regs + DSI_MODE_CTRL);
 	if (dsi_mode & MODE) {
@@ -1189,6 +1258,29 @@ static const struct mipi_dsi_host_ops mtk_dsi_ops = {
 	.transfer = mtk_dsi_host_transfer,
 };
 
+static ssize_t state_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	static const u16 offsets[] = {
+		0x000, 0x008, 0x00c, 0x010, 0x014, 0x018, 0x01c,
+		0x020, 0x024, 0x028, 0x02c, 0x050, 0x054, 0x058, 0x064,
+		0x104, 0x108, 0x110, 0x114, 0x118, 0x11c, 0x130,
+	};
+	struct mtk_dsi *dsi = dev_get_drvdata(dev);
+	unsigned int i;
+	int len;
+
+	len = sysfs_emit(buf, "DRM DSI rate=%u lanes=%u refs=%d enabled=%u ready=%u\n",
+			 dsi->data_rate, dsi->lanes, dsi->refcount,
+			 dsi->enabled, dsi->lanes_ready);
+	for (i = 0; i < ARRAY_SIZE(offsets); i++)
+		len += sysfs_emit_at(buf, len, "DSI %03x=%08x\n", offsets[i],
+				     readl(dsi->regs + offsets[i]));
+	return len;
+}
+static DEVICE_ATTR_RO(state);
+static struct attribute *mt6580_attrs[] = { &dev_attr_state.attr, NULL };
+static const struct attribute_group mt6580_group = { .attrs = mt6580_attrs };
+
 static int mtk_dsi_probe(struct platform_device *pdev)
 {
 	struct mtk_dsi *dsi;
@@ -1230,12 +1322,18 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 	if (irq_num < 0)
 		return irq_num;
 
+	dsi->irq = irq_num;
 	dsi->host.ops = &mtk_dsi_ops;
 	dsi->host.dev = dev;
 
 	init_waitqueue_head(&dsi->irq_wait_queue);
 
 	platform_set_drvdata(pdev, dsi);
+	if (dsi->driver_data->mt6580) {
+		ret = devm_device_add_group(dev, &mt6580_group);
+		if (ret)
+			return ret;
+	}
 
 	ret = mipi_dsi_host_register(&dsi->host);
 	if (ret < 0)
@@ -1261,6 +1359,12 @@ static void mtk_dsi_remove(struct platform_device *pdev)
 	mtk_output_dsi_disable(dsi);
 	mipi_dsi_host_unregister(&dsi->host);
 }
+
+static const struct mtk_dsi_driver_data mt6580_dsi_driver_data = {
+	.reg_cmdq_off = 0x200,
+	.reg_vm_cmd_off = 0x130,
+	.mt6580 = true,
+};
 
 static const struct mtk_dsi_driver_data mt8173_dsi_driver_data = {
 	.reg_cmdq_off = 0x200,
@@ -1301,6 +1405,7 @@ static const struct mtk_dsi_driver_data mt8188_dsi_driver_data = {
 };
 
 static const struct of_device_id mtk_dsi_of_match[] = {
+	{ .compatible = "mediatek,mt6580-dsi", .data = &mt6580_dsi_driver_data },
 	{ .compatible = "mediatek,mt2701-dsi", .data = &mt2701_dsi_driver_data },
 	{ .compatible = "mediatek,mt8173-dsi", .data = &mt8173_dsi_driver_data },
 	{ .compatible = "mediatek,mt8183-dsi", .data = &mt8183_dsi_driver_data },

@@ -7,6 +7,7 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/io.h>
+#include <linux/gpio/driver.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -24,6 +25,18 @@
 #include "mt8365-mmsys.h"
 
 #define MMSYS_SW_RESET_PER_REG 32
+
+/* MT6580 BSP PRIMARY_RDMA0_DISP path: RDMA0 SOUT=2, DSI0 input=1. */
+static const struct mtk_mmsys_routes mt6580_mmsys_routes[] = {
+	MMSYS_ROUTE(RDMA0, DSI0, 0x06c, GENMASK(1, 0), 2),
+	MMSYS_ROUTE(RDMA0, DSI0, 0x064, GENMASK(1, 0), 1),
+};
+
+static const struct mtk_mmsys_driver_data mt6580_mmsys_driver_data = {
+	.clk_driver = "clk-mt6580-mm",
+	.routes = mt6580_mmsys_routes,
+	.num_routes = ARRAY_SIZE(mt6580_mmsys_routes),
+};
 
 static const struct mtk_mmsys_driver_data mt2701_mmsys_driver_data = {
 	.clk_driver = "clk-mt2701-mm",
@@ -384,6 +397,28 @@ static const struct reset_control_ops mtk_mmsys_reset_ops = {
 	.reset = mtk_mmsys_reset,
 };
 
+/* The MT6580 LCM reset is a dedicated MMSYS output, not a pinctrl pin. */
+static int mt6580_lcm_reset_get(struct gpio_chip *gc, unsigned int offset)
+{
+	void __iomem *regs = gpiochip_get_data(gc);
+
+	return !!(readl(regs + 0x150) & BIT(0));
+}
+
+static int mt6580_lcm_reset_set(struct gpio_chip *gc, unsigned int offset, int value)
+{
+	void __iomem *regs = gpiochip_get_data(gc);
+	u32 val = readl(regs + 0x150);
+
+	writel((val & ~BIT(0)) | !!value, regs + 0x150);
+	return 0;
+}
+
+static int mt6580_lcm_reset_direction(struct gpio_chip *gc, unsigned int offset)
+{
+	return GPIO_LINE_DIRECTION_OUT;
+}
+
 static int mtk_mmsys_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -404,6 +439,25 @@ static int mtk_mmsys_probe(struct platform_device *pdev)
 	}
 
 	mmsys->data = of_device_get_match_data(&pdev->dev);
+
+	if (mmsys->data == &mt6580_mmsys_driver_data) {
+		struct gpio_chip *gc = devm_kzalloc(dev, sizeof(*gc), GFP_KERNEL);
+
+		if (!gc)
+			return -ENOMEM;
+		gc->label = "mt6580-lcm-reset";
+		gc->parent = dev;
+		gc->owner = THIS_MODULE;
+		gc->base = -1;
+		gc->ngpio = 1;
+		gc->get = mt6580_lcm_reset_get;
+		gc->set = mt6580_lcm_reset_set;
+		gc->get_direction = mt6580_lcm_reset_direction;
+		gc->direction_output = mt6580_lcm_reset_set;
+		ret = devm_gpiochip_add_data(dev, gc, mmsys->regs);
+		if (ret)
+			return ret;
+	}
 
 	if (mmsys->data->num_resets > 0) {
 		spin_lock_init(&mmsys->lock);
@@ -456,6 +510,7 @@ static void mtk_mmsys_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id of_match_mtk_mmsys[] = {
+	{ .compatible = "mediatek,mt6580-mmsys", .data = &mt6580_mmsys_driver_data },
 	{ .compatible = "mediatek,mt2701-mmsys", .data = &mt2701_mmsys_driver_data },
 	{ .compatible = "mediatek,mt2712-mmsys", .data = &mt2712_mmsys_driver_data },
 	{ .compatible = "mediatek,mt6779-mmsys", .data = &mt6779_mmsys_driver_data },

@@ -4,6 +4,8 @@ dtb-$(CONFIG_ARCH_MEDIATEK) += \
 	mt6572-jty-d101.dtb \
 	mt6572-lenovo-a369i.dtb \
 	mt6580-evbp1.dtb \
+	mt6580-wt6580-we-n.dtb \
+	mt6580-wt6580-we-n-drm.dtb \
 	mt6582-prestigio-pmt5008-3g.dtb \
 	mt6589-aquaris5.dtb \
 	mt6589-fairphone-fp1.dtb \

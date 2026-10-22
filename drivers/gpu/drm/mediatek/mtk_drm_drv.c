@@ -58,6 +58,11 @@ static const struct drm_mode_config_funcs mtk_drm_mode_config_funcs = {
 	.atomic_commit = drm_atomic_helper_commit,
 };
 
+static const unsigned int mt6580_mtk_ddp_main[] = {
+	DDP_COMPONENT_RDMA0,
+	DDP_COMPONENT_DSI0,
+};
+
 static const unsigned int mt2701_mtk_ddp_main[] = {
 	DDP_COMPONENT_OVL0,
 	DDP_COMPONENT_RDMA0,
@@ -330,7 +335,15 @@ static const struct mtk_mmsys_driver_data mt8365_mmsys_driver_data = {
 	.mmsys_dev_num = 1,
 };
 
+static const struct mtk_mmsys_driver_data mt6580_mmsys_driver_data = {
+	.main_path = mt6580_mtk_ddp_main,
+	.main_len = ARRAY_SIZE(mt6580_mtk_ddp_main),
+	.mmsys_dev_num = 1,
+};
+
 static const struct of_device_id mtk_drm_of_ids[] = {
+	{ .compatible = "mediatek,mt6580-mmsys",
+	  .data = &mt6580_mmsys_driver_data },
 	{ .compatible = "mediatek,mt2701-mmsys",
 	  .data = &mt2701_mmsys_driver_data},
 	{ .compatible = "mediatek,mt7623-mmsys",
@@ -712,6 +725,9 @@ static const struct component_master_ops mtk_drm_ops = {
 };
 
 static const struct of_device_id mtk_ddp_comp_dt_ids[] = {
+	{ .compatible = "mediatek,mt6580-disp-rdma", .data = (void *)MTK_DISP_RDMA },
+	{ .compatible = "mediatek,mt6580-disp-mutex", .data = (void *)MTK_DISP_MUTEX },
+	{ .compatible = "mediatek,mt6580-dsi", .data = (void *)MTK_DSI },
 	{ .compatible = "mediatek,mt8167-disp-aal",
 	  .data = (void *)MTK_DISP_AAL},
 	{ .compatible = "mediatek,mt8173-disp-aal",

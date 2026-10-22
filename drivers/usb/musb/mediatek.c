@@ -21,6 +21,9 @@
 #define USB_L1INTS		0x00a0
 #define USB_L1INTM		0x00a4
 #define MTK_MUSB_TXFUNCADDR	0x0480
+#define MT6580_MUSB_SWRST		0x0074
+#define MT6580_DISUSBRESET	BIT(0)
+#define MT6580_SWRST		BIT(1)
 
 /* MediaTek controller toggle enable and status reg */
 #define MUSB_RXTOG		0x80
@@ -284,12 +287,18 @@ static int mtk_musb_init(struct musb *musb)
 
 	phy_set_mode(glue->phy, glue->phy_mode);
 
+	if (of_device_is_compatible(dev->parent->of_node, "mediatek,mt6580-musb"))
+		musb_writew(musb->mregs, MT6580_MUSB_SWRST,
+			    musb_readw(musb->mregs, MT6580_MUSB_SWRST) |
+			    MT6580_DISUSBRESET | MT6580_SWRST);
+
 #if defined(CONFIG_USB_INVENTRA_DMA)
 	musb_writel(musb->mregs, MUSB_HSDMA_INTR,
 		    DMA_INTR_STATUS_MSK | DMA_INTR_UNMASK_SET_MSK);
 #endif
 	musb_writel(musb->mregs, USB_L1INTM, TX_INT_STATUS | RX_INT_STATUS |
-		    USBCOM_INT_STATUS | DMA_INT_STATUS);
+		    USBCOM_INT_STATUS |
+		    (IS_ENABLED(CONFIG_USB_INVENTRA_DMA) ? DMA_INT_STATUS : 0));
 	return 0;
 
 err_phy_power_on:

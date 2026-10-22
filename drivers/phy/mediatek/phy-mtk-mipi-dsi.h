@@ -18,6 +18,7 @@
 
 struct mtk_mipitx_data {
 	const u32 mppll_preserve;
+	bool mt6580;
 	const struct clk_ops *mipi_tx_clk_ops;
 	void (*mipi_tx_enable_signal)(struct phy *phy);
 	void (*mipi_tx_disable_signal)(struct phy *phy);
@@ -39,6 +40,7 @@ int mtk_mipi_tx_pll_set_rate(struct clk_hw *hw, unsigned long rate,
 unsigned long mtk_mipi_tx_pll_recalc_rate(struct clk_hw *hw,
 					  unsigned long parent_rate);
 
+extern const struct mtk_mipitx_data mt6580_mipitx_data;
 extern const struct mtk_mipitx_data mt2701_mipitx_data;
 extern const struct mtk_mipitx_data mt8173_mipitx_data;
 extern const struct mtk_mipitx_data mt8183_mipitx_data;

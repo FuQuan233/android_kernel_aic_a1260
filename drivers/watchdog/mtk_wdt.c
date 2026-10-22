@@ -237,6 +237,13 @@ static int mtk_wdt_restart(struct watchdog_device *wdt_dev,
 	/* Enable reset in order to issue a system reset instead of an IRQ */
 	reg = readl(wdt_base + WDT_MODE);
 	reg &= ~WDT_MODE_IRQ_EN;
+	if (of_device_is_compatible(wdt_dev->parent->of_node, "mediatek,mt6580-wdt")) {
+		/* LK checks RTC fastboot when the power-key bypass flag is clear. */
+		reg &= ~(WDT_MODE_EN | WDT_MODE_DUAL_EN | WDT_MODE_AUTO_START);
+		reg |= WDT_MODE_EXRST_EN;
+		if (!data || strcmp(data, "bootloader"))
+			reg |= WDT_MODE_AUTO_START;
+	}
 	writel(reg | WDT_MODE_KEY, wdt_base + WDT_MODE);
 
 	while (1) {

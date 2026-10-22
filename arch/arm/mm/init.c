@@ -194,17 +194,22 @@ void __init arm_memblock_init(const struct machine_desc *mdesc)
 	if (mdesc->reserve)
 		mdesc->reserve();
 
+	arm_early_trace("memblock: reserved-memory scan begin");
 	early_init_fdt_scan_reserved_mem();
+	arm_early_trace("memblock: reserved-memory scan done; DMA reserve begin");
 
 	/* reserve memory for DMA contiguous allocations */
 	dma_contiguous_reserve(arm_dma_limit);
+	arm_early_trace("memblock: DMA reserve done");
 
 	arm_memblock_steal_permitted = false;
 	memblock_dump_all();
+	arm_early_trace("memblock: complete");
 }
 
 void __init bootmem_init(void)
 {
+	arm_early_trace("bootmem: begin");
 	memblock_allow_resize();
 
 	find_limits(&min_low_pfn, &max_low_pfn, &max_pfn);
@@ -216,7 +221,9 @@ void __init bootmem_init(void)
 	 * sparse_init() tries to allocate memory from memblock, so must be
 	 * done after the fixed reservations
 	 */
+	arm_early_trace("bootmem: sparse_init begin");
 	sparse_init();
+	arm_early_trace("bootmem: sparse_init done; zone initialization begin");
 
 	/*
 	 * Now free the memory - free_area_init needs
@@ -224,6 +231,7 @@ void __init bootmem_init(void)
 	 * for memmap_init_zone(), otherwise all PFNs are invalid.
 	 */
 	zone_sizes_init(min_low_pfn, max_low_pfn, max_pfn);
+	arm_early_trace("bootmem: complete");
 }
 
 /*

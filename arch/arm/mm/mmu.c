@@ -1764,30 +1764,43 @@ void __init paging_init(const struct machine_desc *mdesc)
 	pr_debug("physical kernel sections: 0x%08llx-0x%08llx\n",
 		 kernel_sec_start, kernel_sec_end);
 
+	arm_early_trace("paging: prepare page table begin");
 	prepare_page_table();
+	arm_early_trace("paging: prepare page table done; map lowmem begin");
 	map_lowmem();
+	arm_early_trace("paging: map lowmem done");
 	memblock_set_current_limit(arm_lowmem_limit);
 	pr_debug("lowmem limit is %08llx\n", (long long)arm_lowmem_limit);
 	/*
 	 * After this point early_alloc(), i.e. the memblock allocator, can
 	 * be used
 	 */
+	arm_early_trace("paging: map kernel begin");
 	map_kernel();
+	arm_early_trace("paging: map kernel done; DMA remap begin");
 	dma_contiguous_remap();
+	arm_early_trace("paging: DMA remap done; early fixmap shutdown begin");
 	early_fixmap_shutdown();
+	arm_early_trace("paging: early fixmap shutdown done; device maps begin");
 	devicemaps_init(mdesc);
+	arm_early_trace("paging: device maps done; kmap begin");
 	kmap_init();
+	arm_early_trace("paging: kmap done; TCM begin");
 	tcm_init();
+	arm_early_trace("paging: TCM done; zero page allocation begin");
 
 	top_pmd = pmd_off_k(0xffff0000);
 
 	/* allocate the zero page. */
 	zero_page = early_alloc(PAGE_SIZE);
+	arm_early_trace("paging: zero page allocated; bootmem begin");
 
 	bootmem_init();
+	arm_early_trace("paging: bootmem done; zero page flush begin");
 
 	empty_zero_page = virt_to_page(zero_page);
 	__flush_dcache_folio(NULL, page_folio(empty_zero_page));
+	arm_early_trace("paging: complete");
 }
 
 void __init early_mm_init(const struct machine_desc *mdesc)

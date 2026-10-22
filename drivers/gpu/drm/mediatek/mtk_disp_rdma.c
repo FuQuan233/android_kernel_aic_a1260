@@ -72,6 +72,7 @@ struct mtk_disp_rdma_data {
 	unsigned int fifo_size;
 	const u32 *formats;
 	size_t num_formats;
+	bool mt6580;
 };
 
 /*
@@ -86,11 +87,23 @@ struct mtk_disp_rdma {
 	void				(*vblank_cb)(void *data);
 	void				*vblank_cb_data;
 	u32				fifo_size;
+	u32 frame_ends, underflows, abnormal;
 };
 
 static irqreturn_t mtk_disp_rdma_irq_handler(int irq, void *dev_id)
 {
 	struct mtk_disp_rdma *priv = dev_id;
+
+	u32 status = readl(priv->regs + DISP_REG_RDMA_INT_STATUS);
+
+	if (priv->data && priv->data->mt6580) {
+		if (status & RDMA_FRAME_END_INT)
+			priv->frame_ends++;
+		if (status & RDMA_FIFO_UNDERFLOW_INT)
+			priv->underflows++;
+		if (status & RDMA_EOF_ABNORMAL_INT)
+			priv->abnormal++;
+	}
 
 	/* Clear frame completion interrupt */
 	writel(0x0, priv->regs + DISP_REG_RDMA_INT_STATUS);
@@ -206,11 +219,17 @@ void mtk_rdma_config(struct device *dev, unsigned int width,
 	 * output threshold to 70% of max fifo size to make sure the
 	 * threhold will not overflow
 	 */
-	threshold = rdma_fifo_size * 7 / 10;
+	threshold = rdma->data->mt6580 ? 512 : rdma_fifo_size * 7 / 10;
 	reg = RDMA_FIFO_UNDERFLOW_EN |
 	      RDMA_FIFO_PSEUDO_SIZE(rdma_fifo_size) |
 	      RDMA_OUTPUT_VALID_FIFO_THRESHOLD(threshold);
 	mtk_ddp_write(cmdq_pkt, reg, &rdma->cmdq_reg, rdma->regs, DISP_REG_RDMA_FIFO_CON);
+	if (rdma->data->mt6580) {
+		/* MT6580 rdma_set_ultra: WVGA memory mode, normal activity. */
+		mtk_ddp_write(cmdq_pkt, 221, &rdma->cmdq_reg, rdma->regs, 0x38);
+		mtk_ddp_write(cmdq_pkt, 34 | (39 << 10),
+			      &rdma->cmdq_reg, rdma->regs, 0xa8);
+	}
 }
 
 static unsigned int rdma_fmt_convert(struct mtk_disp_rdma *rdma,
@@ -285,7 +304,8 @@ void mtk_rdma_layer_config(struct device *dev, unsigned int idx,
 			      DISP_RDMA_MEM_START_ADDR);
 	mtk_ddp_write_relaxed(cmdq_pkt, pitch, &rdma->cmdq_reg, rdma->regs,
 			      DISP_RDMA_MEM_SRC_PITCH);
-	mtk_ddp_write(cmdq_pkt, RDMA_MEM_GMC, &rdma->cmdq_reg, rdma->regs,
+	mtk_ddp_write(cmdq_pkt, rdma->data->mt6580 ? 0x06010816 : RDMA_MEM_GMC,
+		      &rdma->cmdq_reg, rdma->regs,
 		      DISP_RDMA_MEM_GMC_SETTING_0);
 	mtk_ddp_write_mask(cmdq_pkt, RDMA_MODE_MEMORY, &rdma->cmdq_reg, rdma->regs,
 			   DISP_REG_RDMA_GLOBAL_CON, RDMA_MODE_MEMORY);
@@ -308,6 +328,27 @@ static const struct component_ops mtk_disp_rdma_component_ops = {
 	.bind	= mtk_disp_rdma_bind,
 	.unbind = mtk_disp_rdma_unbind,
 };
+
+static ssize_t state_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct mtk_disp_rdma *rdma = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf,
+		"DRM RDMA inten=%08x status=%08x global=%08x size=%08x/%08x con=%08x addr=%08x pitch=%08x fifo=%08x gmc=%08x/%08x\n"
+		"frames=%u underflows=%u abnormal=%u fifo_min=%08x in=%u/%u out=%u/%u\n",
+		readl(rdma->regs), readl(rdma->regs + 4),
+		readl(rdma->regs + 0x10), readl(rdma->regs + 0x14),
+		readl(rdma->regs + 0x18), readl(rdma->regs + 0x24),
+		readl(rdma->regs + 0xf00), readl(rdma->regs + 0x2c),
+		readl(rdma->regs + 0x40), readl(rdma->regs + 0x30),
+		readl(rdma->regs + 0x38), rdma->frame_ends, rdma->underflows, rdma->abnormal,
+		readl(rdma->regs + 0x44), readl(rdma->regs + 0xf0),
+		readl(rdma->regs + 0xf4), readl(rdma->regs + 0xf8),
+		readl(rdma->regs + 0xfc));
+}
+static DEVICE_ATTR_RO(state);
+static struct attribute *mt6580_attrs[] = { &dev_attr_state.attr, NULL };
+static const struct attribute_group mt6580_group = { .attrs = mt6580_attrs };
 
 static int mtk_disp_rdma_probe(struct platform_device *pdev)
 {
@@ -357,6 +398,11 @@ static int mtk_disp_rdma_probe(struct platform_device *pdev)
 	priv->data = of_device_get_match_data(dev);
 
 	platform_set_drvdata(pdev, priv);
+	if (of_device_is_compatible(dev->of_node, "mediatek,mt6580-disp-rdma")) {
+		ret = devm_device_add_group(dev, &mt6580_group);
+		if (ret)
+			return ret;
+	}
 
 	pm_runtime_enable(dev);
 
@@ -400,7 +446,16 @@ static const struct mtk_disp_rdma_data mt8195_rdma_driver_data = {
 	.num_formats = ARRAY_SIZE(mt8173_formats),
 };
 
+static const struct mtk_disp_rdma_data mt6580_rdma_driver_data = {
+	.fifo_size = SZ_4K,
+	.formats = mt8173_formats,
+	.num_formats = ARRAY_SIZE(mt8173_formats),
+	.mt6580 = true,
+};
+
 static const struct of_device_id mtk_disp_rdma_driver_dt_match[] = {
+	{ .compatible = "mediatek,mt6580-disp-rdma",
+	  .data = &mt6580_rdma_driver_data },
 	{ .compatible = "mediatek,mt2701-disp-rdma",
 	  .data = &mt2701_rdma_driver_data},
 	{ .compatible = "mediatek,mt8173-disp-rdma",

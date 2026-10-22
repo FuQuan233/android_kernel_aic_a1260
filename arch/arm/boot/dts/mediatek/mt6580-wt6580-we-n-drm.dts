@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#include "mt6580-wt6580-we-n.dts"
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	/delete-node/ display@14007000;
+
+	/* The MT6350 supply remains enabled by LK until its driver is ported. */
+	panel_supply: regulator-panel {
+		compatible = "regulator-fixed";
+		regulator-name = "lk-panel-supply";
+		regulator-always-on;
+	};
+
+	reserved-memory {
+		display_cma: dma-pool {
+			compatible = "shared-dma-pool";
+			reusable;
+			size = <0 0x1000000>;
+			alignment = <0 0x400000>;
+			alloc-ranges = <0 0x84000000 0 0x2c000000>;
+			linux,cma-default;
+		};
+	};
+
+	mmsys: syscon@14000000 {
+		compatible = "mediatek,mt6580-mmsys", "syscon";
+		reg = <0 0x14000000 0 0x1000>;
+		#clock-cells = <1>;
+		gpio-controller;
+		#gpio-cells = <2>;
+	};
+
+	rdma0: rdma@14009000 {
+		compatible = "mediatek,mt6580-disp-rdma";
+		reg = <0 0x14009000 0 0x1000>;
+		interrupts = <GIC_SPI 121 IRQ_TYPE_LEVEL_LOW>;
+		clocks = <&mmsys CLK_MT6580_MM_RDMA0>;
+	};
+
+	dsi0: dsi@14012000 {
+		compatible = "mediatek,mt6580-dsi";
+		reg = <0 0x14012000 0 0x1000>;
+		interrupts = <GIC_SPI 130 IRQ_TYPE_LEVEL_LOW>;
+		clocks = <&mmsys CLK_MT6580_MM_DSI_ENGINE>,
+			 <&mmsys CLK_MT6580_MM_DSI_DIGITAL>, <&mipi_tx>;
+		clock-names = "engine", "digital", "hs";
+		phys = <&mipi_tx>;
+		phy-names = "dphy";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port {
+			dsi_out: endpoint {
+				remote-endpoint = <&panel_in>;
+			};
+		};
+
+		panel@0 {
+			compatible = "wingtech,wt6580-we-n-panel";
+			reg = <0>;
+			power-supply = <&panel_supply>;
+			reset-gpios = <&mmsys 0 GPIO_ACTIVE_LOW>;
+			port {
+				panel_in: endpoint {
+					remote-endpoint = <&dsi_out>;
+				};
+			};
+		};
+	};
+
+	mutex: mutex@14015000 {
+		compatible = "mediatek,mt6580-disp-mutex";
+		reg = <0 0x14015000 0 0x1000>;
+	};
+
+	mipi_tx: phy@14018000 {
+		compatible = "mediatek,mt6580-mipi-tx";
+		reg = <0 0x14018000 0 0x1000>;
+		clocks = <&uart_clk>;
+		clock-output-names = "mt6580_mipi_tx";
+		#clock-cells = <0>;
+		#phy-cells = <0>;
+	};
+};

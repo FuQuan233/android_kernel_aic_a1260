@@ -1,0 +1,15 @@
+/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
+#ifndef _DT_BINDINGS_CLK_MT6580_H
+#define _DT_BINDINGS_CLK_MT6580_H
+
+/* USB subset of the MT6580 clock tree. */
+#define CLK_MT6580_TOP_USB	0
+#define CLK_MT6580_APMIXED_UNIV48M	0
+#define CLK_MT6580_APMIXED_USB48M	1
+
+#define CLK_MT6580_MM_RDMA0	0
+#define CLK_MT6580_MM_DSI_ENGINE	1
+#define CLK_MT6580_MM_DSI_DIGITAL	2
+#define CLK_MT6580_MM_NR_CLK	3
+
+#endif

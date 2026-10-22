@@ -152,23 +152,32 @@ static int mtk_mipi_tx_pll_prepare(struct clk_hw *hw)
 		return -EINVAL;
 	}
 
-	mtk_phy_update_bits(base + MIPITX_DSI_BG_CON,
-			    RG_DSI_VOUT_MSK | RG_DSI_BG_CKEN |
-			    RG_DSI_BG_CORE_EN,
-			    FIELD_PREP(RG_DSI_V02_SEL, 4) |
-			    FIELD_PREP(RG_DSI_V032_SEL, 4) |
-			    FIELD_PREP(RG_DSI_V04_SEL, 4) |
-			    FIELD_PREP(RG_DSI_V072_SEL, 4) |
-			    FIELD_PREP(RG_DSI_V10_SEL, 4) |
-			    FIELD_PREP(RG_DSI_V12_SEL, 4) |
-			    RG_DSI_BG_CKEN | RG_DSI_BG_CORE_EN);
+	if (mipi_tx->driver_data->mt6580) {
+		/* Retain the board-specific bandgap trims from firmware. */
+		mtk_phy_set_bits(base + MIPITX_DSI_BG_CON,
+				 RG_DSI_BG_CKEN | RG_DSI_BG_CORE_EN);
+		usleep_range(1000, 1500);
+		mtk_phy_set_bits(base + MIPITX_DSI_TOP_CON, RG_DSI_LNT_HS_BIAS_EN);
+	} else {
+		mtk_phy_update_bits(base + MIPITX_DSI_BG_CON,
+				    RG_DSI_VOUT_MSK | RG_DSI_BG_CKEN |
+				    RG_DSI_BG_CORE_EN,
+				    FIELD_PREP(RG_DSI_V02_SEL, 4) |
+				    FIELD_PREP(RG_DSI_V032_SEL, 4) |
+				    FIELD_PREP(RG_DSI_V04_SEL, 4) |
+				    FIELD_PREP(RG_DSI_V072_SEL, 4) |
+				    FIELD_PREP(RG_DSI_V10_SEL, 4) |
+				    FIELD_PREP(RG_DSI_V12_SEL, 4) |
+				    RG_DSI_BG_CKEN | RG_DSI_BG_CORE_EN);
 
-	usleep_range(30, 100);
+		usleep_range(30, 100);
 
-	mtk_phy_update_bits(base + MIPITX_DSI_TOP_CON,
-			    RG_DSI_LNT_IMP_CAL_CODE | RG_DSI_LNT_HS_BIAS_EN,
-			    FIELD_PREP(RG_DSI_LNT_IMP_CAL_CODE, 8) |
-			    RG_DSI_LNT_HS_BIAS_EN);
+		mtk_phy_update_bits(base + MIPITX_DSI_TOP_CON,
+				    RG_DSI_LNT_IMP_CAL_CODE | RG_DSI_LNT_HS_BIAS_EN,
+				    FIELD_PREP(RG_DSI_LNT_IMP_CAL_CODE, 8) |
+				    RG_DSI_LNT_HS_BIAS_EN);
+
+	}
 
 	mtk_phy_set_bits(base + MIPITX_DSI_CON,
 			 RG_DSI_CKG_LDOOUT_EN | RG_DSI_LDOCORE_EN);
@@ -176,6 +185,9 @@ static int mtk_mipi_tx_pll_prepare(struct clk_hw *hw)
 	mtk_phy_update_bits(base + MIPITX_DSI_PLL_PWR,
 			    RG_DSI_MPPLL_SDM_PWR_ON | RG_DSI_MPPLL_SDM_ISO_EN,
 			    RG_DSI_MPPLL_SDM_PWR_ON);
+
+	if (mipi_tx->driver_data->mt6580)
+		usleep_range(1000, 1500);
 
 	mtk_phy_clear_bits(base + MIPITX_DSI_PLL_CON0, RG_DSI_MPPLL_PLL_EN);
 
@@ -202,11 +214,25 @@ static int mtk_mipi_tx_pll_prepare(struct clk_hw *hw)
 
 	usleep_range(20, 100);
 
-	mtk_phy_clear_bits(base + MIPITX_DSI_PLL_CON1, RG_DSI_MPPLL_SDM_SSC_EN);
+	if (mipi_tx->driver_data->mt6580) {
+		u32 delta = div_u64((u64)5 * (mipi_tx->data_rate / 1000000) *
+				    txdiv * 262144 + 281664, 563329);
 
-	mtk_phy_update_field(base + MIPITX_DSI_PLL_TOP,
-			     RG_DSI_MPPLL_PRESERVE,
-			     mipi_tx->driver_data->mppll_preserve);
+		/* Vendor default: 5 percent SSC, PCW latch and 1 ms settling. */
+		mtk_phy_update_bits(base + MIPITX_DSI_PLL_CON1,
+				    RG_DSI_MPPLL_SDM_SSC_PRD | RG_DSI_MPPLL_SDM_SSC_PH_INIT,
+				    (0x1b1 << 16) | RG_DSI_MPPLL_SDM_SSC_PH_INIT);
+		writel(delta | (delta << 16), base + 0x5c);
+		usleep_range(1000, 1500);
+		mtk_phy_clear_bits(base + 0x60, BIT(0));
+		mtk_phy_set_bits(base + 0x60, BIT(0));
+		mtk_phy_set_bits(base + MIPITX_DSI_PLL_CON1, RG_DSI_MPPLL_SDM_SSC_EN);
+	} else {
+		mtk_phy_clear_bits(base + MIPITX_DSI_PLL_CON1, RG_DSI_MPPLL_SDM_SSC_EN);
+		mtk_phy_update_field(base + MIPITX_DSI_PLL_TOP,
+				     RG_DSI_MPPLL_PRESERVE,
+				     mipi_tx->driver_data->mppll_preserve);
+	}
 
 	return 0;
 }
@@ -257,7 +283,8 @@ static void mtk_mipi_tx_power_on_signal(struct phy *phy)
 	u32 reg;
 
 	for (reg = MIPITX_DSI_CLOCK_LANE;
-	     reg <= MIPITX_DSI_DATA_LANE3; reg += 4)
+	     reg <= (mipi_tx->driver_data->mt6580 ? MIPITX_DSI_DATA_LANE1 :
+		      MIPITX_DSI_DATA_LANE3); reg += 4)
 		mtk_phy_set_bits(mipi_tx->regs + reg, RG_DSI_LNTx_LDOOUT_EN);
 
 	mtk_phy_clear_bits(mipi_tx->regs + MIPITX_DSI_TOP_CON,
@@ -273,9 +300,17 @@ static void mtk_mipi_tx_power_off_signal(struct phy *phy)
 			 RG_DSI_PAD_TIE_LOW_EN);
 
 	for (reg = MIPITX_DSI_CLOCK_LANE;
-	     reg <= MIPITX_DSI_DATA_LANE3; reg += 4)
+	     reg <= (mipi_tx->driver_data->mt6580 ? MIPITX_DSI_DATA_LANE1 :
+		      MIPITX_DSI_DATA_LANE3); reg += 4)
 		mtk_phy_clear_bits(mipi_tx->regs + reg, RG_DSI_LNTx_LDOOUT_EN);
 }
+
+const struct mtk_mipitx_data mt6580_mipitx_data = {
+	.mt6580 = true,
+	.mipi_tx_clk_ops = &mtk_mipi_tx_pll_ops,
+	.mipi_tx_enable_signal = mtk_mipi_tx_power_on_signal,
+	.mipi_tx_disable_signal = mtk_mipi_tx_power_off_signal,
+};
 
 const struct mtk_mipitx_data mt2701_mipitx_data = {
 	.mppll_preserve = 3,

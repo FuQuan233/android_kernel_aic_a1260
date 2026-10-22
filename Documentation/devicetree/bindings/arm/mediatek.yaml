@@ -35,6 +35,7 @@ properties:
       - items:
           - enum:
               - mediatek,mt6580-evbp1
+              - wingtech,wt6580-we-n
           - const: mediatek,mt6580
       - items:
           - enum:

@@ -730,6 +730,19 @@ static const u16 mt8195_mutex_sof[DDP_MUTEX_SOF_MAX] = {
 		MT8195_MUTEX_SOF_DP_INTF1 | MT8195_MUTEX_EOF_DP_INTF1,
 };
 
+static const u8 mt6580_mutex_mod[DDP_COMPONENT_ID_MAX] = {
+	[DDP_COMPONENT_RDMA0] = 8,
+};
+
+static const struct mtk_mutex_data mt6580_mutex_driver_data = {
+	.mutex_mod = mt6580_mutex_mod,
+	.mutex_sof = mt2712_mutex_sof,
+	.mutex_mod_reg = MT2701_MUTEX0_MOD0,
+	.mutex_mod1_reg = MT2701_MUTEX0_MOD1,
+	.mutex_sof_reg = MT2701_MUTEX0_SOF0,
+	.no_clk = true,
+};
+
 static const struct mtk_mutex_data mt2701_mutex_driver_data = {
 	.mutex_mod = mt2701_mutex_mod,
 	.mutex_sof = mt2712_mutex_sof,
@@ -1130,6 +1143,7 @@ static int mtk_mutex_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id mutex_driver_dt_match[] = {
+	{ .compatible = "mediatek,mt6580-disp-mutex", .data = &mt6580_mutex_driver_data },
 	{ .compatible = "mediatek,mt2701-disp-mutex", .data = &mt2701_mutex_driver_data },
 	{ .compatible = "mediatek,mt2712-disp-mutex", .data = &mt2712_mutex_driver_data },
 	{ .compatible = "mediatek,mt6795-disp-mutex", .data = &mt6795_mutex_driver_data },

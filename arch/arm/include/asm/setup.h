@@ -22,6 +22,7 @@ static const struct tagtable __tagtable_##fn __tag = { tag, fn }
 extern int arm_add_memory(u64 start, u64 size);
 extern __printf(1, 2) void early_print(const char *str, ...);
 extern void dump_machine_table(void);
+void arm_early_trace(const char *stage);
 
 #ifdef CONFIG_ATAGS_PROC
 extern void save_atags(const struct tag *tags);

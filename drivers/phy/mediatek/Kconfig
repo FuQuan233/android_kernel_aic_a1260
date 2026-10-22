@@ -2,6 +2,17 @@
 #
 # Phy drivers for Mediatek devices
 #
+config PHY_MTK_MT6580_USB
+	tristate "MediaTek MT6580 USB2 PHY"
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	depends on OF && HAS_IOMEM
+	select GENERIC_PHY
+	help
+	  Support the MT6580 USB2 PHY using its vendor initialization
+	  sequence and slew-rate calibration. This initial driver supports
+	  the USB device role only and retains the firmware's PMIC supply
+	  setup. Enable it for a USB CDC ACM debug connection.
+
 config PHY_MTK_PCIE
 	tristate "MediaTek PCIe-PHY Driver"
 	depends on ARCH_MEDIATEK || COMPILE_TEST

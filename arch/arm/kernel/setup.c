@@ -85,6 +85,22 @@ EXPORT_SYMBOL(cacheid);
 
 unsigned int __atags_pointer __initdata;
 
+/* Opt-in checkpoints before initcall tracing becomes available. */
+static bool arm_early_trace_enabled __initdata;
+
+static int __init arm_early_trace_setup(char *str)
+{
+	arm_early_trace_enabled = true;
+	return 0;
+}
+early_param("arm_early_trace", arm_early_trace_setup);
+
+void __init arm_early_trace(const char *stage)
+{
+	if (arm_early_trace_enabled)
+		pr_info("ARM_EARLY: %s\n", stage);
+}
+
 unsigned int system_rev;
 EXPORT_SYMBOL(system_rev);
 
@@ -1136,6 +1152,7 @@ void __init setup_arch(char **cmdline_p)
 	early_ioremap_init();
 
 	parse_early_param();
+	arm_early_trace("setup: early parameters parsed");
 
 #ifdef CONFIG_MMU
 	early_mm_init(mdesc);
@@ -1148,22 +1165,31 @@ void __init setup_arch(char **cmdline_p)
 	 * before reserving/allocating any memory
 	 */
 	adjust_lowmem_bounds();
+	arm_early_trace("setup: first lowmem bounds done; memblock begin");
 	arm_memblock_init(mdesc);
+	arm_early_trace("setup: memblock done; second lowmem bounds begin");
 	/* Memory may have been removed so recalculate the bounds. */
 	adjust_lowmem_bounds();
 
+	arm_early_trace("setup: second lowmem bounds done; ioremap reset begin");
 	early_ioremap_reset();
+	arm_early_trace("setup: ioremap reset done; paging begin");
 
 	paging_init(mdesc);
+	arm_early_trace("setup: paging done; kasan begin");
 	kasan_init();
+	arm_early_trace("setup: kasan done; resources begin");
 	request_standard_resources(mdesc);
+	arm_early_trace("setup: resources done");
 
 	if (mdesc->restart) {
 		__arm_pm_restart = mdesc->restart;
 		register_restart_handler(&arm_restart_nb);
 	}
 
+	arm_early_trace("setup: unflatten device tree begin");
 	unflatten_device_tree();
+	arm_early_trace("setup: unflatten device tree done; CPU maps begin");
 
 	arm_dt_init_cpu_maps();
 	psci_dt_init();
@@ -1193,6 +1219,7 @@ void __init setup_arch(char **cmdline_p)
 
 	if (mdesc->init_early)
 		mdesc->init_early();
+	arm_early_trace("setup: complete");
 }
 
 bool arch_cpu_is_hotpluggable(int num)

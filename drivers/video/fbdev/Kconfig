@@ -1781,6 +1781,17 @@ config FB_HYPERV
 	  This driver is deprecated, please use the Hyper-V DRM driver at
 	  drivers/gpu/drm/hyperv (CONFIG_DRM_HYPERV) instead.
 
+config FB_MT6580_LK
+	bool "WT6580 LK framebuffer handover"
+	depends on FB=y && ARCH_MEDIATEK && OF
+	select FB_IOMEM_HELPERS
+	help
+	  Inspect MT6580 OVL/RDMA scanout left by LK and expose its reserved
+	  framebuffer through fbdev. Retain firmware scanout at probe and
+	  provide explicit diagnostic DSI reads, display on/off and JD9161
+	  reset/reinitialization. Intended for WT6580 display bring-up;
+	  display clocks, power supplies and PHY setup still depend on LK.
+
 config FB_SIMPLE
 	tristate "Simple framebuffer support"
 	depends on FB

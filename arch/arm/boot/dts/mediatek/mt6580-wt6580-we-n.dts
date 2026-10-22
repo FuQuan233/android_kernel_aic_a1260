@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/dts-v1/;
+#include "mt6580.dtsi"
+#include <dt-bindings/clock/mt6580-clk.h>
+
+/ {
+	model = "Wingtech WT6580 WE N (JD9161)";
+	compatible = "wingtech,wt6580-we-n", "mediatek,mt6580";
+	/* Match the cell widths used by the vendor LK's DT fixups. */
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	aliases {
+		serial0 = &uart0;
+		serial1 = &uart1;
+	};
+
+	chosen {
+		stdout-path = "serial0:921600n8";
+		bootargs = "earlycon console=ttyS0,921600n8 rdinit=/init";
+	};
+
+	/* Keep the vendor /memory path for old bootloader memory fixups. */
+	memory {
+		device_type = "memory";
+		/* Captured from the running device, excluding the top 6 MiB. */
+		reg = <0 0x80000000 0 0x3fa00000>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/* Keep the vendor kernel's dynamic connectivity/modem carve-outs. */
+		connectivity {
+			size = <0 0x200000>;
+			alignment = <0 0x200000>;
+			no-map;
+		};
+
+		modem {
+			size = <0 0x1800000>;
+			alignment = <0 0x2000000>;
+			alloc-ranges = <0 0x80000000 0 0x80000000>;
+			no-map;
+		};
+
+		ram-console@83f00000 {
+			reg = <0 0x83f00000 0 0x10000>;
+			no-map;
+		};
+
+		legacy-pstore-prefix@83f10000 {
+			reg = <0 0x83f10000 0 0xaf000>;
+			no-map;
+		};
+
+		/* Match the vendor ramoops console zone for recovery after reboot. */
+		ramoops@83fbf000 {
+			compatible = "ramoops";
+			reg = <0 0x83fbf000 0 0x10000>;
+			/* Avoid a small-page island beside a section in one ARM PMD. */
+			no-map;
+			console-size = <0x10000>;
+		};
+
+		legacy-pstore-suffix@83fcf000 {
+			reg = <0 0x83fcf000 0 0x31000>;
+			no-map;
+		};
+
+		minirdump@83ff0000 {
+			reg = <0 0x83ff0000 0 0x10000>;
+			no-map;
+		};
+
+		/* Packed live atag,videolfb; top 6 MiB is outside /memory. */
+		lk_framebuffer: framebuffer@bfa00000 {
+			reg = <0 0xbfa00000 0 0x600000>;
+			no-map;
+		};
+	};
+
+	/* Read existing scanout registers; retain LK's clocks, PHY and panel. */
+	display@14007000 {
+		compatible = "wingtech,wt6580-lkfb";
+		reg = <0 0x14007000 0 0x1000>,
+		      <0 0x14009000 0 0x1000>,
+		      <0 0x14012000 0 0x1000>,
+		      <0 0x14018000 0 0x1000>,
+		      <0 0x14000000 0 0x1000>;
+		reg-names = "ovl", "rdma", "dsi", "mipi", "mmsys";
+		memory-region = <&lk_framebuffer>;
+	};
+
+	watchdog@10007000 {
+		compatible = "mediatek,mt6580-wdt", "mediatek,mt6589-wdt";
+		reg = <0 0x10007000 0 0x100>;
+		timeout-sec = <30>;
+	};
+
+	reboot-mode@1000f000 {
+		compatible = "wingtech,wt6580-reboot-mode";
+		reg = <0 0x1000f000 0 0x1000>;
+	};
+
+	topckgen: clock-controller@10000000 {
+		compatible = "mediatek,mt6580-topckgen";
+		reg = <0 0x10000000 0 0x1000>;
+		#clock-cells = <1>;
+	};
+
+	apmixedsys: clock-controller@10018000 {
+		compatible = "mediatek,mt6580-apmixedsys";
+		reg = <0 0x10018000 0 0x1000>;
+		#clock-cells = <1>;
+	};
+
+	usbphy: phy@11110800 {
+		compatible = "mediatek,mt6580-usbphy";
+		reg = <0 0x11110800 0 0x800>;
+		clocks = <&apmixedsys CLK_MT6580_APMIXED_USB48M>;
+		clock-names = "ref";
+		#phy-cells = <0>;
+	};
+
+	usb: usb@11100000 {
+		compatible = "mediatek,mt6580-musb", "mediatek,mtk-musb";
+		reg = <0 0x11100000 0 0x1000>;
+		interrupts = <GIC_SPI 32 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-names = "mc";
+		clocks = <&topckgen CLK_MT6580_TOP_USB>,
+			 <&topckgen CLK_MT6580_TOP_USB>,
+			 <&apmixedsys CLK_MT6580_APMIXED_UNIV48M>;
+		clock-names = "main", "mcu", "univpll";
+		phys = <&usbphy>;
+		dr_mode = "peripheral";
+	};
+};
+
+/* All inherited MMIO ranges must follow the board's two-cell root. */
+&timer {
+	reg = <0 0x10008000 0 0x80>;
+};
+
+&sysirq {
+	reg = <0 0x10200100 0 0x1c>;
+	#address-cells = <0>;
+};
+
+&gic {
+	reg = <0 0x10211000 0 0x1000>,
+	      <0 0x10212000 0 0x2000>,
+	      <0 0x10214000 0 0x2000>,
+	      <0 0x10216000 0 0x2000>;
+	#address-cells = <0>;
+};
+
+&uart0 {
+	reg = <0 0x11005000 0 0x400>;
+	status = "okay";
+};
+
+&uart1 {
+	reg = <0 0x11006000 0 0x400>;
+};
