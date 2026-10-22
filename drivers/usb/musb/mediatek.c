@@ -391,6 +391,38 @@ static const struct musb_fifo_cfg mtk_musb_mode_cfg[] = {
 	{ .hw_ep_num = 7, .style = FIFO_RX, .maxpacket = 64, },
 };
 
+/*
+ * MT6580 has 8 KiB of FIFO RAM. Its vendor driver uses two 512-byte
+ * buffers for bulk EP1. Keep that layout for sustained gadget traffic;
+ * reducing EP6 to one 512-byte buffer per direction keeps the total,
+ * including the 64-byte EP0 FIFO, at 7808 bytes.
+ */
+static const struct musb_fifo_cfg mt6580_musb_mode_cfg[] = {
+	{ .hw_ep_num = 1, .style = FIFO_TX, .maxpacket = 512, .mode = BUF_DOUBLE, },
+	{ .hw_ep_num = 1, .style = FIFO_RX, .maxpacket = 512, .mode = BUF_DOUBLE, },
+	{ .hw_ep_num = 2, .style = FIFO_TX, .maxpacket = 512, },
+	{ .hw_ep_num = 2, .style = FIFO_RX, .maxpacket = 512, },
+	{ .hw_ep_num = 3, .style = FIFO_TX, .maxpacket = 512, },
+	{ .hw_ep_num = 3, .style = FIFO_RX, .maxpacket = 512, },
+	{ .hw_ep_num = 4, .style = FIFO_TX, .maxpacket = 512, },
+	{ .hw_ep_num = 4, .style = FIFO_RX, .maxpacket = 512, },
+	{ .hw_ep_num = 5, .style = FIFO_TX, .maxpacket = 512, },
+	{ .hw_ep_num = 5, .style = FIFO_RX, .maxpacket = 512, },
+	{ .hw_ep_num = 6, .style = FIFO_TX, .maxpacket = 512, },
+	{ .hw_ep_num = 6, .style = FIFO_RX, .maxpacket = 512, },
+	{ .hw_ep_num = 7, .style = FIFO_TX, .maxpacket = 512, },
+	{ .hw_ep_num = 7, .style = FIFO_RX, .maxpacket = 64, },
+};
+
+static const struct musb_hdrc_config mt6580_musb_hdrc_config = {
+	.fifo_cfg = mt6580_musb_mode_cfg,
+	.fifo_cfg_size = ARRAY_SIZE(mt6580_musb_mode_cfg),
+	.multipoint = true,
+	.dyn_fifo = true,
+	.num_eps = MTK_MUSB_MAX_EP_NUM,
+	.ram_bits = MTK_MUSB_RAM_BITS,
+};
+
 static const struct musb_hdrc_config mtk_musb_hdrc_config = {
 	.fifo_cfg = mtk_musb_mode_cfg,
 	.fifo_cfg_size = ARRAY_SIZE(mtk_musb_mode_cfg),
@@ -433,7 +465,12 @@ static int mtk_musb_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	pdata->config = &mtk_musb_hdrc_config;
+	if (of_device_is_compatible(np, "mediatek,mt6580-musb")) {
+		pdata->config = &mt6580_musb_hdrc_config;
+		dev_info(dev, "MT6580 8 KiB FIFO: bulk EP1 double buffered\n");
+	} else {
+		pdata->config = &mtk_musb_hdrc_config;
+	}
 	pdata->platform_ops = &mtk_musb_ops;
 	pdata->mode = usb_get_dr_mode(dev);
 
