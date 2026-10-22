@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "mt6580-wt6580-we-n.dts"
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/power/mt6580-power.h>
 
 / {
 	/delete-node/ display@14007000;
@@ -22,6 +23,45 @@
 			alloc-ranges = <0 0x84000000 0 0x2c000000>;
 			linux,cma-default;
 		};
+	};
+
+	infracfg: syscon@10001000 {
+		compatible = "mediatek,mt6580-infracfg", "syscon";
+		reg = <0 0x10001000 0 0x1000>;
+	};
+
+	scpsys: power-controller@10006000 {
+		compatible = "mediatek,mt6580-scpsys";
+		reg = <0 0x10006000 0 0x1000>;
+		#power-domain-cells = <1>;
+		infracfg = <&infracfg>;
+		clocks = <&topckgen CLK_MT6580_TOP_MPLL_D5>,
+			 <&topckgen CLK_MT6580_TOP_MFG>;
+		clock-names = "mm", "mfg";
+	};
+
+	mfgcfg: clock-controller@13000000 {
+		compatible = "mediatek,mt6580-mfgcfg";
+		reg = <0 0x13000000 0 0x1000>;
+		#clock-cells = <1>;
+		power-domains = <&scpsys MT6580_POWER_DOMAIN_MFG>;
+	};
+
+	gpu: gpu@13010000 {
+		compatible = "mediatek,mt6580-mali", "arm,mali-400";
+		reg = <0 0x13010000 0 0x10000>;
+		/* Vendor GIC IDs 176..181, expressed as SPI numbers. */
+		interrupts = <GIC_SPI 144 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_SPI 145 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_SPI 146 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_SPI 147 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_SPI 148 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_SPI 149 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-names = "gp", "gpmmu", "pp0", "ppmmu0", "pp1", "ppmmu1";
+		clocks = <&topckgen CLK_MT6580_TOP_MFG>,
+			 <&mfgcfg CLK_MT6580_MFG_BG3D>;
+		clock-names = "bus", "core";
+		power-domains = <&scpsys MT6580_POWER_DOMAIN_MFG>;
 	};
 
 	mmsys: syscon@14000000 {

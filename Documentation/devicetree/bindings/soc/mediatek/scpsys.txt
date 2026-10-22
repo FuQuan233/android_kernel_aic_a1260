@@ -15,9 +15,11 @@ power/power-domain.yaml. It provides the power domains defined in
 - include/dt-bindings/power/mt2701-power.h
 - include/dt-bindings/power/mt2712-power.h
 - include/dt-bindings/power/mt7622-power.h
+- include/dt-bindings/power/mt6580-power.h (MFG only)
 
 Required properties:
 - compatible: Should be one of:
+	- "mediatek,mt6580-scpsys"
 	- "mediatek,mt2701-scpsys"
 	- "mediatek,mt2712-scpsys"
 	- "mediatek,mt6735-scpsys"
@@ -35,6 +37,7 @@ Required properties:
                       These are clocks which hardware needs to be
                       enabled before enabling certain power domains.
 	Required clocks for MT2701 or MT7623: "mm", "mfg", "ethif"
+	Required clocks for MT6580: "mm" (MPLL_D5), "mfg" (MFG bus gate)
 	Required clocks for MT2712: "mm", "mfg", "venc", "jpgdec", "audio", "vdec"
 	Required clocks for MT6765: MUX: "mm", "mfg"
 				    CG: "mm-0", "mm-1", "mm-2", "mm-3", "isp-0",

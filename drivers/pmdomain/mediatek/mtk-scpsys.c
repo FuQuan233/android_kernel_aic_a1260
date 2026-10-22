@@ -444,6 +444,10 @@ static struct scp *init_scp(struct platform_device *pdev,
 	if (IS_ERR(scp->base))
 		return ERR_CAST(scp->base);
 
+	/* MT6580 SPM requires the project key before power-control writes. */
+	if (of_device_is_compatible(pdev->dev.of_node, "mediatek,mt6580-scpsys"))
+		writel(0x0b160001, scp->base);
+
 	scp->domains = devm_kcalloc(&pdev->dev,
 				num, sizeof(*scp->domains), GFP_KERNEL);
 	if (!scp->domains)
@@ -1009,6 +1013,30 @@ static const struct scp_subdomain scp_subdomain_mt8173[] = {
 	{MT8173_POWER_DOMAIN_MFG_2D, MT8173_POWER_DOMAIN_MFG},
 };
 
+/* MT6580 vendor MFG sequence: four SRAM banks and AXI protection bit 5. */
+static const struct scp_domain_data scp_domain_data_mt6580[] = {
+	{
+		.name = "mfg",
+		.sta_mask = PWR_STATUS_MFG,
+		.ctl_offs = SPM_MFG_PWR_CON,
+		.sram_pdn_bits = GENMASK(11, 8),
+		.sram_pdn_ack_bits = GENMASK(15, 12),
+		.bus_prot_mask = BIT(5),
+		.clk_id = { CLK_MM, CLK_MFG },
+		.caps = MTK_SCPD_ACTIVE_WAKEUP,
+	},
+};
+
+static const struct scp_soc_data mt6580_data = {
+	.domains = scp_domain_data_mt6580,
+	.num_domains = ARRAY_SIZE(scp_domain_data_mt6580),
+	.regs = {
+		.pwr_sta_offs = SPM_PWR_STATUS,
+		.pwr_sta2nd_offs = SPM_PWR_STATUS_2ND,
+	},
+	.bus_prot_reg_update = true,
+};
+
 static const struct scp_soc_data mt2701_data = {
 	.domains = scp_domain_data_mt2701,
 	.num_domains = ARRAY_SIZE(scp_domain_data_mt2701),
@@ -1081,6 +1109,9 @@ static const struct scp_soc_data mt8173_data = {
 
 static const struct of_device_id of_scpsys_match_tbl[] = {
 	{
+		.compatible = "mediatek,mt6580-scpsys",
+		.data = &mt6580_data,
+	}, {
 		.compatible = "mediatek,mt2701-scpsys",
 		.data = &mt2701_data,
 	}, {

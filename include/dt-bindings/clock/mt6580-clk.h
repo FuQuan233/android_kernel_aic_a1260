@@ -5,6 +5,8 @@
 /* Bring-up subset of the MT6580 clock tree. */
 #define CLK_MT6580_TOP_USB	0
 #define CLK_MT6580_TOP_MSDC0	1
+#define CLK_MT6580_TOP_MFG	2
+#define CLK_MT6580_TOP_MPLL_D5	3
 #define CLK_MT6580_APMIXED_UNIV48M	0
 #define CLK_MT6580_APMIXED_USB48M	1
 
@@ -12,5 +14,7 @@
 #define CLK_MT6580_MM_DSI_ENGINE	1
 #define CLK_MT6580_MM_DSI_DIGITAL	2
 #define CLK_MT6580_MM_NR_CLK	3
+
+#define CLK_MT6580_MFG_BG3D	0
 
 #endif
