@@ -98,25 +98,23 @@ static int mtk_disp_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 
 	if (!state->enabled ||
 	    (mdp->data->zero_width_requires_disable && !state->duty_cycle)) {
-		/* MT6580's BSP avoids HIGH_WIDTH=0: latch width 1 with PWM_EN=0.
-		 * Merely requesting an enabled zero-duty PWM can leave the old
-		 * backlight output active after DISP powers off.
+		/* MT6580 needs direct updates: the register/shadow values can
+		 * change without updating the output after a DISP power cycle.
+		 * Also follow the BSP's width-1, PWM_EN=0 shutdown sequence.
 		 */
-		if (mdp->data->zero_width_requires_disable)
+		if (mdp->data->zero_width_requires_disable) {
+			mtk_disp_pwm_update_bits(mdp, mdp->data->bls_debug,
+					 mdp->data->bls_debug_mask, mdp->data->bls_debug_mask);
 			mtk_disp_pwm_update_bits(mdp, mdp->data->con1,
 					 PWM_HIGH_WIDTH_MASK, BIT(PWM_HIGH_WIDTH_SHIFT));
+		}
 		mtk_disp_pwm_update_bits(mdp, DISP_PWM_EN,
 					 mdp->data->enable_mask, 0);
 		if (mdp->data->zero_width_requires_disable) {
-			mtk_disp_pwm_update_bits(mdp, mdp->data->commit,
-					 mdp->data->commit_mask, mdp->data->commit_mask);
-			mtk_disp_pwm_update_bits(mdp, mdp->data->commit,
-					 mdp->data->commit_mask, 0);
-			/* COMMIT crosses into the PWM clock domain. Gating the
-			 * source immediately can retain the previous output until
-			 * the next clock enable. Drain two programmed PWM periods.
+			/* Flush the disable and allow two output periods to settle
+			 * before gating the source clock.
 			 */
-			readl(mdp->base + mdp->data->commit);
+			readl(mdp->base + DISP_PWM_EN);
 			clk_div = FIELD_GET(PWM_CLKDIV_MASK,
 					    readl(mdp->base + mdp->data->con0));
 			period = FIELD_GET(PWM_PERIOD_MASK,
@@ -163,7 +161,7 @@ static int mtk_disp_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 
 	if (mdp->data->bls_debug && !mdp->data->has_commit) {
 		/*
-		 * For MT2701, disable double buffer before writing register
+		 * Disable double buffering before writing the registers
 		 * and select manual mode and use PWM_PERIOD/PWM_HIGH_WIDTH.
 		 */
 		mtk_disp_pwm_update_bits(mdp, mdp->data->bls_debug,
@@ -229,7 +227,7 @@ static int mtk_disp_pwm_get_state(struct pwm_chip *chip,
 	 * registers double buffer and manual commit to working register before
 	 * performing any read/write operation
 	 */
-	if (mdp->data->bls_debug)
+	if (mdp->data->bls_debug && !mdp->data->zero_width_requires_disable)
 		mtk_disp_pwm_update_bits(mdp, mdp->data->bls_debug,
 					 mdp->data->bls_debug_mask,
 					 mdp->data->bls_debug_mask);
@@ -301,9 +299,10 @@ static const struct mtk_pwm_data mt6580_pwm_data = {
 	.enable_mask = BIT(0),
 	.con0 = 0x10,
 	.con1 = 0x14,
-	.has_commit = true,
-	.commit = 0x8,
-	.commit_mask = BIT(0),
+	/* BSP disp_pwm_test configures 0x20=3 for immediate output updates. */
+	.has_commit = false,
+	.bls_debug = 0x20,
+	.bls_debug_mask = 0x3,
 	.zero_width_requires_disable = true,
 };
 

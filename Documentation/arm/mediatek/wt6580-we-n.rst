@@ -737,7 +737,7 @@ the firmware-selected 26 MHz or UPLL/12 source and connects ``pwm-backlight``
 to the DRM panel, allowing panel disable/enable to switch the light off/on.
 With no separate enable GPIO or regulator, ``pwm-backlight`` requests an
 enabled zero-duty waveform during blanking. The MT6580 provider translates
-that request to the BSP's width-1, PWM-disable and COMMIT sequence before
+that request to width 1 and PWM-disable in direct-update mode before
 gating the source; leaving PWM enabled at width zero did not reliably blank
 this board after display-domain power-off.
 The Composer interface defines brightness 0.0 as minimum visible brightness
@@ -1024,6 +1024,41 @@ some returned a value from a different offset. They cannot establish the
 latched output state. The debug PWM interface temporarily enables its
 clock, so checking the physical backlight is also necessary; a debug read
 alone cannot prove that the preceding shutdown completed before gating.
+
+Follow-up on build #37: the user reported that the screen could not be
+woken after blanking. ADB still executed commands and Android logged the
+physical power-key wake, an ON transition, then a timeout ten seconds
+later. No kernel crash was observed in that capture. This is an unresolved
+visible wake failure, not a passed backlight restore test or evidence of a
+whole-system suspend hang. Preserve #32 as the standard product boot until
+the failure is diagnosed. Captures are
+``out/a1260-runtime-pm/wake-failure-37{,-later}.txt``.
+
+Live diagnosis after reboot isolated the black-screen symptom to PWM output
+updates. With the display held awake, DSI was running at 300 MHz and RDMA
+had no underflows, but PWM_EN=1 and HIGH_WIDTH=1024 did not produce a high
+GPIO66 input readback. Extending the COMMIT pulse did not change this.
+Writing PWM debug 0x20=3, the BSP's immediate-update setting, and rewriting
+the duty/enable registers changed GPIO66 from low to high. The user confirmed
+the backlight and normal image returned. The provider now selects this
+direct-update mode for both nonzero duty and shutdown instead of relying
+on COMMIT; get_state does not change that mode as a side effect. The exact
+missing shadow-latch trigger has not been established. Evidence is in
+``out/a1260-runtime-pm/pwm-direct-live.txt`` and the physical user confirmation.
+
+The earlier USB enumeration failure followed an adbd restart while the
+screen was off. Restarting adbd with Android temporarily kept awake did
+reconnect, without rebooting the kernel. USB/system-suspend recovery must
+be investigated separately; the PWM finding does not establish its cause.
+
+Build #39 validation: Android boot completed, an off/on cycle powered DISP
+and MFG off and restored scanout without RDMA underflow or abnormal events.
+The user then manually confirmed complete backlight extinction and normal
+image/backlight recovery on the power key. The temporary plugged-in stay-on
+setting was restored from 2 to its original value 0. Standard product
+boot/kernel now use this build. This supersedes the #37 visible-wake failure;
+USB re-enumeration across system sleep is still unresolved. Evidence is
+``out/a1260-runtime-pm/pwm-direct-39-validation.txt``.
 
 These are display/GPU runtime power-cycle checks, not validation of complete
 system suspend with the new callbacks, DDR self-refresh or panel supply-rail
