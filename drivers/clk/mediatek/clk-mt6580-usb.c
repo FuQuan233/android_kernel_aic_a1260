@@ -263,6 +263,17 @@ static const char *mt6580_usb_parent(u32 sel)
 	}
 }
 
+static const char *mt6580_axi_parent(u32 sel)
+{
+	switch (sel) {
+	case 1: return "dummy26m";
+	case 2: return "mt6580_mpll_d11";
+	case 4: return "mt6580_mpll_d12";
+	/* MEMPLL (0xc) needs a DDR clock provider before it can be modeled. */
+	default: return NULL;
+	}
+}
+
 static const char *mt6580_mfg_parent(u32 sel0, u32 sel1)
 {
 	switch (sel1 & 0x38) {
@@ -302,6 +313,7 @@ static int mt6580_register_top_sources(struct device *dev, void __iomem *base,
 	const char *smi = mt6580_smi_parent((sel1 >> 16) & 0xf);
 	const char *usb = mt6580_usb_parent((sel1 >> 20) & 7);
 	const char *mfg = mt6580_mfg_parent(sel0 >> 8, (sel1 >> 8) & 0x3f);
+	const char *axi = mt6580_axi_parent((sel0 >> 4) & 0xf);
 	const char *nfi_d5 = NULL;
 	unsigned int i;
 	int ret;
@@ -324,6 +336,13 @@ static int mt6580_register_top_sources(struct device *dev, void __iomem *base,
 	if (IS_ERR(data->hws[CLK_MT6580_TOP_MPLL_D5]))
 		return PTR_ERR(data->hws[CLK_MT6580_TOP_MPLL_D5]);
 
+	/* CPU and unported infrastructure also use AXI: retain its source. */
+	ret = mt6580_register_parent_alias(dev, "mt6580_axi", axi, CLK_IS_CRITICAL);
+	if (ret)
+		return ret;
+	ret = mt6580_register_parent_alias(dev, "mt6580_i2c_src", "mt6580_axi", 0);
+	if (ret)
+		return ret;
 	ret = mt6580_register_parent_alias(dev, "mt6580_smi_src", smi, 0);
 	if (ret)
 		return ret;
@@ -364,6 +383,7 @@ static int mt6580_register_top_sources(struct device *dev, void __iomem *base,
 	}
 	dev_info(dev, "Firmware parents: SMI=%s USB=%s MFG=%s MSDC0=%s; mux=%#x/%#x\n",
 		 smi, usb, mfg, mt6580_msdc_parents[(sel0 >> 11) & 7], sel0, sel1);
+	dev_info(dev, "AXI parent=%s; I2C/APDMA follow AXI, AUXADC uses 26 MHz\n", axi);
 	return 0;
 }
 
@@ -404,23 +424,18 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 			"mt6580_therm", "dummy26m", 0, base + 0x24, 1,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 		data->hws[CLK_MT6580_TOP_AUXADC] = devm_clk_hw_register_gate(dev,
-			"mt6580_auxadc", NULL, 0, base + 0x24, 30,
+			"mt6580_auxadc", "dummy26m", 0, base + 0x24, 30,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 		data->hws[CLK_MT6580_TOP_MSDC0] = devm_clk_hw_register_gate(dev,
 			"mt6580_msdc0", "mt6580_msdc0_src", 0, base + 0x20, 17,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
-
 
 		/* CLK_GATING_CTRL1[13]: 1 gates the USB bus clock. */
 		data->hws[CLK_MT6580_TOP_USB] = devm_clk_hw_register_gate(dev,
 			"mt6580_usb_bus", "mt6580_usb_bus_src", 0, base + 0x24, 13,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 
-		/* Vendor I2C source is 125 MHz, divided by ten in the controller. */
-		source = devm_clk_hw_register_fixed_rate(dev, "mt6580_i2c_src",
-						       NULL, 0, 125000000);
-		if (IS_ERR(source))
-			return PTR_ERR(source);
+		/* AXI is divided by ten in the I2C controller. */
 		data->hws[CLK_MT6580_TOP_I2C1] = devm_clk_hw_register_gate(dev,
 			"mt6580_i2c1", "mt6580_i2c_src", 0, base + 0x24, 4,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
@@ -431,7 +446,7 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 			"mt6580_i2c2", "mt6580_i2c_src", 0, base + 0x24, 16,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 		data->hws[CLK_MT6580_TOP_APDMA] = devm_clk_hw_register_gate(dev,
-			"mt6580_apdma", "mt6580_i2c_src", 0, base + 0x24, 2,
+			"mt6580_apdma", "mt6580_axi", 0, base + 0x24, 2,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 		data->hws[CLK_MT6580_TOP_DISP_PWM] = devm_clk_hw_register_gate(dev,
 			"mt6580_disp_pwm", "mt6580_disp_pwm_src", 0, base + 0x20, 0,

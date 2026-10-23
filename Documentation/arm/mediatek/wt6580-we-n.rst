@@ -961,6 +961,16 @@ Documentation/gpu/mali-utgard-mt6580.rst for evidence and limitations.
 The complete PLL clock tree, modem/connectivity domains and SPM deep sleep
 remain unfinished.
 
+Build #33 connects I2C0/1/2 and APDMA to the firmware-selected AXI parent,
+instead of an independent 125 MHz fixed source. CLK_MUX_SEL0[7:4] is 4,
+selecting MPLL_D12; CCF therefore reports 125.125 MHz. The I2C controller
+retains its existing divide-by-ten timing. AXI carries a critical reference
+for the CPU and unported infrastructure. AUXADC now has the BSP 26 MHz
+parent. The DDR/MEMPLL AXI selection is rejected until a DDR clock provider
+exists. Android boot, input registration, charging and thermal reads passed
+on the device; evidence is in
+``out/a1260-runtime-pm/peripheral-clocks-validation.txt``.
+
 The MT6580 DSI handover explicitly enables engine/digital clocks before
 stopping inherited video and polling registers. The earlier code depended
 on firmware keeping both clocks enabled and timed out after late unused
