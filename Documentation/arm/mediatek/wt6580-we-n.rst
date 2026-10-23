@@ -976,5 +976,13 @@ cleanup, genpd reports ISP off and DISP/MFG on, and ISP control reads
 0x3f12 with bit 5 clear in both SPM status registers. Two screen-off/on
 cycles restore DSI video at 300 MHz with zero RDMA underflows or abnormal
 interrupts. Build #28 exposed the missing DSI clock acquisition described
-above; #29 corrects it. Battery-only PMIC power-off awaits the physical
-unplug/shutdown/power-key test; do not infer success from USB disconnect.
+above; #29 corrects it.
+
+Battery-only shutdown was exercised next: the device-side record detects
+USB power removal at uptime 249.48 s and requests Android's normal shutdown
+at 252.60 s. The owner reports the unit powered off and could be started
+with the power key. ADB returned on a fresh #29 boot; DSI video, zero RDMA
+underflows/abnormal interrupts, charging detection and calibrated thermal
+sampling recovered. No temporary maintenance wake lock survived the boot.
+This validates the observed battery-only shutdown/power-key startup cycle;
+charger-attached shutdown and off-state current measurement remain untested.
