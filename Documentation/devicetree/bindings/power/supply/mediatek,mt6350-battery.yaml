@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/mediatek,mt6350-battery.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: MediaTek MT6350 AUXADC battery monitor
+
+maintainers:
+  - FuQuan <i@fuquan.moe>
+
+description: |
+  Battery voltage, presence and thermistor monitor within MT6350. Capacity is
+  estimated from the board OCV curve; this is not a hardware coulomb counter.
+  The thermistor circuit uses the MT6580 BSP 10 kohm NTC with a 16.9 kohm
+  pull-up to 1.8 V and 27 kohm pull-down.
+
+allOf:
+  - $ref: power-supply.yaml#
+
+properties:
+  compatible:
+    const: mediatek,mt6350-battery
+  monitored-battery:
+    description: Battery characteristics and OCV/capacity tables.
+  power-supplies:
+    maxItems: 1
+
+required:
+  - compatible
+  - monitored-battery
+  - power-supplies
+
+additionalProperties: false

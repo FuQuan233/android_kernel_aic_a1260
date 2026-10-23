@@ -28,6 +28,8 @@ properties:
       - compatible
   regulators:
     $ref: /schemas/regulator/mediatek,mt6350-regulator.yaml#
+  pmic:
+    $ref: /schemas/mfd/mediatek,mt6397.yaml#
 
 required:
   - compatible

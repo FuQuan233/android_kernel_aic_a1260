@@ -15,6 +15,7 @@
 #include <linux/mfd/mt6328/registers.h>
 #include <linux/mfd/mt6331/core.h>
 #include <linux/mfd/mt6331/registers.h>
+#include <linux/mfd/mt6350/registers.h>
 #include <linux/mfd/mt6397/core.h>
 #include <linux/mfd/mt6397/registers.h>
 
@@ -176,6 +177,16 @@ int mt6397_irq_init(struct mt6397_chip *chip)
 	mutex_init(&chip->irqlock);
 
 	switch (chip->chip_id) {
+	case MT6350_CHIP_ID:
+		chip->int_con[0] = MT6350_INT_CON0;
+		chip->int_con[1] = MT6350_INT_CON1;
+		chip->int_status[0] = MT6350_INT_STATUS0;
+		chip->int_status[1] = MT6350_INT_STATUS1;
+		ret = regmap_update_bits(chip->regmap, MT6350_TOP_CKPDN0,
+					 BIT(10), 0);
+		if (ret)
+			return ret;
+		break;
 	case MT6323_CHIP_ID:
 		chip->int_con[0] = MT6323_INT_CON0;
 		chip->int_con[1] = MT6323_INT_CON1;

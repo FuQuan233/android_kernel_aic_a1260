@@ -645,9 +645,9 @@ separate starts would make the first DMA wait indefinitely for the second
 transaction. The hardware DCM register is explicitly disabled as in the BSP.
 
 The Paris pinctrl backend describes the vendor's 93 pins and IOCFG register
-fields, including 12-byte GPIO bank strides. Only GPIO0..15 EINT mappings are
-exposed; the other GPIO banks share interrupt channels and still need routing
-support. GPIO5 uses function 6/EINT5; GPIO2 is an active-low reset. The EINT
+fields, including 12-byte GPIO bank strides. GPIO0..15 and the dedicated PMIC
+route are exposed; the other GPIO banks share interrupt channels and still need
+routing support. GPIO5 uses function 6/EINT5; GPIO2 is an active-low reset. The EINT
 summary interrupt is SPI94, level high. Special reversed MSDC pull fields are
 not advertised as generic pull-select controls.
 
@@ -656,8 +656,8 @@ MT6350 VGP1 supplies 2.8 V. A hardware read before integration found CON0 at
 The regulator uses enable bit 15 and selector bits 7:5, with the BSP's voltage
 table. Firmware-initialized WACS2 access is shared through one regmap between
 VGP1 and the existing RTC reboot marker, rather than assigning the MMIO block
-to two independent drivers. PWRAP initialization, other MT6350 regulators,
-battery, PMIC interrupt support and suspend/resume remain unfinished.
+to two independent drivers. PWRAP initialization, other MT6350 regulators and
+suspend/resume remain unfinished. Battery and PMIC keys are described below.
 
 The Lineage device kernel fragment enables these drivers and evdev. No Android
 system/vendor change is required for standard direct multitouch input events.
@@ -679,3 +679,65 @@ shared regmap. The diagnostic sysfs path is
 ``/sys/bus/platform/devices/1000f000.pmic-wrap:reboot-mode/bootloader``.
 Normal Android reboots are verified. Re-entering fastboot after the shared
 transport refactor has not been hardware-tested.
+
+
+MT6350 battery, charger and power key
+-----------------------------------
+
+The hardware CID register reads ``0x2050``. The MT6397 MFD core now recognizes
+MT6350 ID ``0x50``, using the existing two-bank threaded IRQ controller with
+enable registers ``0x0160/0x0166`` and W1C status ``0x0172/0x0174``. Its
+interrupt clock is enabled through TOP_CKPDN0 bit 10. The legacy DT names
+GPIO13, but the vendor IRQ translator maps GPIO13/function 1 to built-in
+EINT17. The new DT uses hardware interrupt 17 directly and the pin descriptor
+uses function 1, preserving that route instead of shared EINT13/function 6.
+
+The standard ``mtk-pmic-keys`` driver uses status bit 1 at ``0x0142`` and
+PMIC IRQ 5 for KEY_POWER. MT6350 requires toggling INT_MISC_CON bit 4 after
+each press/release to select the next transition. Hardware reports balanced
+KEY_POWER DOWN/UP events, and the owner confirms Android can turn the screen
+off and back on. Evdev numbers change as devices are added; they are not an ABI.
+
+I2C0 at ``0x11009000`` uses GPIO58/SCL and GPIO61/SDA, APDMA channel
+``0x11000180`` and SPI40. The board's BQ24296 at address ``0x6b`` uses the
+existing BQ24190-family charger driver. The original DT has no independent
+charger IRQ, so an explicit 2000 ms polling mode reads actual status/fault
+registers and emits power_supply changes. No register reset is performed.
+The charger watchdog is disabled as in the mainline driver's host mode;
+the SoC watchdog remains active. Charge voltage/current limits are 4.2 V
+(hardware rounds to 4.192 V) and 512 mA. The board sets a 500 mA input limit,
+which must be restored after insertion because BC1.2 detection overwrites it.
+
+``mt6350-battery`` reads AUXADC BATSNS channel 7 and BATON1 channel 5. BATSNS
+is a 15-bit conversion with a 1.8 V reference and a factor-four divider.
+Temperature uses the reference BSP's 10 kohm NTC table, 16.9 kohm pull-up and
+27 kohm pull-down. ADC requests are serialized and timeout after 30 ms;
+failed conversions are reported as errors rather than fabricated values.
+Presence uses the enabled BATON detector's undetected bit at ``0x000e[12]``.
+
+The device tree carries the reference BSP's 0/25/50 C battery curves and
+1397 mAh design capacity. Capacity is an estimate from measured voltage and
+the nearest temperature curve, with the charger's real full status taking
+precedence. This is not the old software fuel-gauge integration or a hardware
+coulomb counter: charge counter/current readings and load compensation are
+not provided, and the percentage can jump when USB is inserted or removed.
+The battery characterization still needs calibration against the actual cell.
+
+The first hardware boot reports about 4.12 V and 27.3 C, presence true and
+charging complete. Android's standard Health service discovers both supplies
+and reports USB power and battery level. A real cable removal records
+``online=0``/Discharging, followed by ``online=1``/Charging/Full on reinsertion.
+
+The panel backlight is independent of the PMIC key. Its DISP_PWM at
+``0x1100f000`` has the MT8173-compatible EN/COMMIT/CON0/CON1 layout, GPIO66
+function 1 and a top clock gate at CLK_GATING_CTRL0 bit 0. The port retains
+the firmware-selected 26 MHz or UPLL/12 source and connects ``pwm-backlight``
+to the DRM panel, allowing panel disable/enable to switch the light off/on.
+With no separate enable GPIO or regulator, ``pwm-backlight`` intentionally
+keeps PWM enabled at zero duty during blanking so its output is reliably low.
+The Composer interface defines brightness 0.0 as minimum visible brightness
+and a negative value as off. The device HWC mapping therefore maps the active
+range to hardware levels 4..255; the separate ``bl_power`` path still blanks
+to zero duty. Android's framework brightness range is unchanged.
+Deep system suspend and PMIC rail shutdown are separate unfinished work;
+the temporary Android bring-up wake lock remains.

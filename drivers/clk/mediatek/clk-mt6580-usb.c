@@ -60,7 +60,7 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	if (of_device_is_compatible(dev->of_node, "mediatek,mt6580-mfgcfg"))
 		return mtk_clk_simple_probe(pdev);
 	if (top)
-		count = 6;
+		count = 8;
 
 	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
@@ -101,8 +101,19 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 		data->hws[CLK_MT6580_TOP_I2C1] = devm_clk_hw_register_gate(dev,
 			"mt6580_i2c1", "mt6580_i2c_src", 0, base + 0x24, 4,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
+		data->hws[CLK_MT6580_TOP_I2C0] = devm_clk_hw_register_gate(dev,
+			"mt6580_i2c0", "mt6580_i2c_src", 0, base + 0x24, 3,
+			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 		data->hws[CLK_MT6580_TOP_APDMA] = devm_clk_hw_register_gate(dev,
 			"mt6580_apdma", "mt6580_i2c_src", 0, base + 0x24, 2,
+			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
+		/* CLK_MUX_SEL0[18]: 26 MHz or UPLL/12; preserve the LK mux. */
+		source = devm_clk_hw_register_fixed_rate(dev, "mt6580_disp_pwm_src",
+			NULL, 0, readl(base) & BIT(18) ? 104000000 : 26000000);
+		if (IS_ERR(source))
+			return PTR_ERR(source);
+		data->hws[CLK_MT6580_TOP_DISP_PWM] = devm_clk_hw_register_gate(dev,
+			"mt6580_disp_pwm", "mt6580_disp_pwm_src", 0, base + 0x20, 0,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 
 		/* MFG power-on needs MPLL_D5 enabled before the top bus gate. */

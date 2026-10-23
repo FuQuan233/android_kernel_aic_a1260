@@ -10,6 +10,7 @@
 #include <linux/kernel.h>
 #include <linux/mfd/mt6323/registers.h>
 #include <linux/mfd/mt6331/registers.h>
+#include <linux/mfd/mt6350/registers.h>
 #include <linux/mfd/mt6357/registers.h>
 #include <linux/mfd/mt6358/registers.h>
 #include <linux/mfd/mt6359/registers.h>
@@ -56,6 +57,19 @@ struct mtk_pmic_regs {
 	u32 pmic_rst_reg;
 	u32 rst_lprst_mask; /* Long-press reset timeout bitmask */
 	bool key_release_irq;
+	bool toggle_intsel;
+};
+
+static const struct mtk_pmic_regs mt6350_regs = {
+	.keys_regs[MTK_PMIC_PWRKEY_INDEX] =
+		MTK_PMIC_KEYS_REGS(MT6350_CHRSTATUS, BIT(1),
+			MT6350_INT_MISC_CON, BIT(4), MTK_PMIC_PWRKEY_RST),
+	.keys_regs[MTK_PMIC_HOMEKEY_INDEX] =
+		MTK_PMIC_KEYS_REGS(MT6350_CHRSTATUS, BIT(2),
+			MT6350_INT_MISC_CON, BIT(3), MTK_PMIC_HOMEKEY_RST),
+	.pmic_rst_reg = MT6350_TOP_RST_MISC,
+	.rst_lprst_mask = MTK_PMIC_RST_DU_MASK,
+	.toggle_intsel = true,
 };
 
 static const struct mtk_pmic_regs mt6397_regs = {
@@ -147,6 +161,7 @@ struct mtk_pmic_keys {
 	struct input_dev *input_dev;
 	struct device *dev;
 	struct regmap *regmap;
+	bool toggle_intsel;
 	struct mtk_pmic_keys_info keys[MTK_PMIC_MAX_KEY_COUNT];
 };
 
@@ -207,11 +222,16 @@ static irqreturn_t mtk_pmic_keys_irq_handler_thread(int irq, void *data)
 	struct mtk_pmic_keys_info *info = data;
 	u32 key_deb, pressed;
 
-	regmap_read(info->keys->regmap, info->regs->deb_reg, &key_deb);
+	if (regmap_read(info->keys->regmap, info->regs->deb_reg, &key_deb))
+		return IRQ_HANDLED;
 
 	key_deb &= info->regs->deb_mask;
 
 	pressed = !key_deb;
+	/* MT6350 has one IRQ per key; select the opposite transition next. */
+	if (info->keys->toggle_intsel)
+		regmap_update_bits(info->keys->regmap, info->regs->intsel_reg,
+			info->regs->intsel_mask, pressed ? info->regs->intsel_mask : 0);
 
 	input_report_key(info->keys->input_dev, info->keycode, pressed);
 	input_sync(info->keys->input_dev);
@@ -231,7 +251,7 @@ static int mtk_pmic_key_setup(struct mtk_pmic_keys *keys,
 
 	ret = regmap_update_bits(keys->regmap, info->regs->intsel_reg,
 				 info->regs->intsel_mask,
-				 info->regs->intsel_mask);
+				 keys->toggle_intsel ? 0 : info->regs->intsel_mask);
 	if (ret < 0)
 		return ret;
 
@@ -308,6 +328,9 @@ static const struct of_device_id of_mtk_pmic_keys_match_tbl[] = {
 		.compatible = "mediatek,mt6331-keys",
 		.data = &mt6331_regs,
 	}, {
+		.compatible = "mediatek,mt6350-keys",
+		.data = &mt6350_regs,
+	}, {
 		.compatible = "mediatek,mt6357-keys",
 		.data = &mt6357_regs,
 	}, {
@@ -343,6 +366,7 @@ static int mtk_pmic_keys_probe(struct platform_device *pdev)
 	keys->dev = &pdev->dev;
 	keys->regmap = pmic_chip->regmap;
 	mtk_pmic_regs = of_id->data;
+	keys->toggle_intsel = mtk_pmic_regs->toggle_intsel;
 
 	keys->input_dev = input_dev = devm_input_allocate_device(keys->dev);
 	if (!input_dev) {

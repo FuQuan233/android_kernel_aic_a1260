@@ -45,6 +45,14 @@ config GENERIC_ADC_BATTERY
 	  Say Y here to enable support for the generic battery driver
 	  which uses IIO framework to read adc.
 
+config BATTERY_MT6350
+	tristate "MT6350 AUXADC battery monitor"
+	depends on MFD_MT6397
+	help
+	  Read MT6350 battery voltage, thermistor and presence, and use the
+	  board battery curve to estimate capacity. Charger state is supplied
+	  by a separate power supply referenced in the device tree.
+
 config IP5XXX_POWER
 	tristate "Injoinic IP5xxx power bank IC driver"
 	depends on I2C

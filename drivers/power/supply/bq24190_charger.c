@@ -227,6 +227,9 @@ struct bq24190_dev_info {
 	struct power_supply		*charger;
 	struct power_supply		*battery;
 	struct delayed_work		input_current_limit_work;
+	struct delayed_work		poll_work;
+	u32				poll_interval;
+	u32				iinlim;
 	char				model_name[I2C_NAME_SIZE];
 	bool				initialized;
 	bool				irq_event;
@@ -771,6 +774,15 @@ static int bq24190_set_config(struct bq24190_dev_info *bdi)
 	ret = bq24190_write(bdi, BQ24190_REG_CTTC, v);
 	if (ret < 0)
 		return ret;
+
+	if (bdi->iinlim) {
+		ret = bq24190_set_field_val(bdi, BQ24190_REG_ISC,
+			BQ24190_REG_ISC_IINLIM_MASK, BQ24190_REG_ISC_IINLIM_SHIFT,
+			bq24190_isc_iinlim_values, ARRAY_SIZE(bq24190_isc_iinlim_values),
+			bdi->iinlim);
+		if (ret < 0)
+			return ret;
+	}
 
 	if (bdi->sys_min) {
 		v = bdi->sys_min / 100 - 30; // manual section 9.5.1.2, table 9
@@ -1807,6 +1819,16 @@ static void bq24190_check_status(struct bq24190_dev_info *bdi)
 	}
 
 	if (ss_reg != bdi->ss_reg) {
+		/* BC1.2 input detection may replace IINLIM on every insertion. */
+		if (bdi->iinlim && !(bdi->ss_reg & BQ24190_REG_SS_PG_STAT_MASK) &&
+		    (ss_reg & BQ24190_REG_SS_PG_STAT_MASK)) {
+			ret = bq24190_set_field_val(bdi, BQ24190_REG_ISC,
+				BQ24190_REG_ISC_IINLIM_MASK, BQ24190_REG_ISC_IINLIM_SHIFT,
+				bq24190_isc_iinlim_values,
+				ARRAY_SIZE(bq24190_isc_iinlim_values), bdi->iinlim);
+			if (ret < 0)
+				dev_err(bdi->dev, "Can't restore input current limit: %d\n", ret);
+		}
 		/*
 		 * The device is in host mode so when PG_STAT goes from 1->0
 		 * (i.e., power removed) HIZ needs to be disabled.
@@ -1848,6 +1870,7 @@ static irqreturn_t bq24190_irq_handler_thread(int irq, void *data)
 	error = pm_runtime_resume_and_get(bdi->dev);
 	if (error < 0) {
 		dev_warn(bdi->dev, "pm_runtime_get failed: %i\n", error);
+		bdi->irq_event = false;
 		return IRQ_NONE;
 	}
 	bq24190_check_status(bdi);
@@ -1855,6 +1878,16 @@ static irqreturn_t bq24190_irq_handler_thread(int irq, void *data)
 	bdi->irq_event = false;
 
 	return IRQ_HANDLED;
+}
+
+static void bq24190_poll_work(struct work_struct *work)
+{
+	struct bq24190_dev_info *bdi = container_of(to_delayed_work(work),
+					struct bq24190_dev_info, poll_work);
+
+	bq24190_irq_handler_thread(0, bdi);
+	queue_delayed_work(system_freezable_wq, &bdi->poll_work,
+			   msecs_to_jiffies(bdi->poll_interval));
 }
 
 static int bq24190_check_chip(struct bq24190_dev_info *bdi)
@@ -1937,6 +1970,13 @@ static int bq24190_get_config(struct bq24190_dev_info *bdi)
 
 	idx = ARRAY_SIZE(bq24190_cvc_vreg_values) - 1;
 	bdi->vreg_max = bq24190_cvc_vreg_values[idx];
+
+	if (!device_property_read_u32(bdi->dev, "input-current-limit-microamp", &v)) {
+		if (v < bq24190_isc_iinlim_values[0] ||
+		    v > bq24190_isc_iinlim_values[ARRAY_SIZE(bq24190_isc_iinlim_values) - 1])
+			return -EINVAL;
+		bdi->iinlim = v;
+	}
 
 	if (device_property_read_u32(bdi->dev, s, &v) == 0) {
 		v /= 1000;
@@ -2093,8 +2133,11 @@ static int bq24190_probe(struct i2c_client *client)
 	i2c_set_clientdata(client, bdi);
 
 	if (client->irq <= 0) {
-		dev_err(dev, "Can't get irq info\n");
-		return -EINVAL;
+		ret = device_property_read_u32(dev, "poll-interval", &bdi->poll_interval);
+		if (ret || bdi->poll_interval < 100 || bdi->poll_interval > 60000)
+			return dev_err_probe(dev, -EINVAL,
+				"Need IRQ or poll-interval between 100 and 60000 ms\n");
+		INIT_DELAYED_WORK(&bdi->poll_work, bq24190_poll_work);
 	}
 
 	bdi->edev = devm_extcon_dev_allocate(dev, bq24190_usb_extcon_cable);
@@ -2162,20 +2205,25 @@ static int bq24190_probe(struct i2c_client *client)
 
 	bdi->initialized = true;
 
-	ret = devm_request_threaded_irq(dev, client->irq, NULL,
+	if (client->irq > 0) {
+		ret = devm_request_threaded_irq(dev, client->irq, NULL,
 			bq24190_irq_handler_thread,
 			IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
 			"bq24190-charger", bdi);
-	if (ret < 0) {
-		dev_err(dev, "Can't set up irq handler\n");
-		goto out_charger;
+		if (ret < 0) {
+			dev_err(dev, "Can't set up irq handler\n");
+			goto out_charger;
+		}
 	}
 
 	ret = bq24190_register_vbus_regulator(bdi);
 	if (ret < 0)
 		goto out_charger;
 
-	enable_irq_wake(client->irq);
+	if (client->irq > 0)
+		enable_irq_wake(client->irq);
+	else
+		queue_delayed_work(system_freezable_wq, &bdi->poll_work, 0);
 
 	pm_runtime_put_autosuspend(dev);
 
@@ -2199,6 +2247,8 @@ static void bq24190_remove(struct i2c_client *client)
 	int error;
 
 	cancel_delayed_work_sync(&bdi->input_current_limit_work);
+	if (bdi->poll_interval)
+		cancel_delayed_work_sync(&bdi->poll_work);
 	error = pm_runtime_resume_and_get(bdi->dev);
 	if (error < 0)
 		dev_warn(bdi->dev, "pm_runtime_get failed: %i\n", error);

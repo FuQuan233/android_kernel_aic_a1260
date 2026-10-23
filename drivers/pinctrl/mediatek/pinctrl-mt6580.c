@@ -375,7 +375,7 @@ static const char * const mt6580_base_names[] = {
 	"gpio", "iocfg-t", "iocfg-b", "iocfg-l", "iocfg-r",
 };
 
-/* Only GPIO0..15 are exposed as EINTs until shared routing is ported. */
+/* GPIO0..15 and the dedicated PMIC EINT17; other shared routing is pending. */
 static const struct mtk_eint_hw mt6580_eint_hw = {
 	.port_mask = 0,
 	.ports = 1,

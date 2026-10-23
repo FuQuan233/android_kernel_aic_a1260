@@ -22,6 +22,7 @@
 #include <linux/mfd/mt6323/registers.h>
 #include <linux/mfd/mt6328/registers.h>
 #include <linux/mfd/mt6331/registers.h>
+#include <linux/mfd/mt6350/registers.h>
 #include <linux/mfd/mt6357/registers.h>
 #include <linux/mfd/mt6358/registers.h>
 #include <linux/mfd/mt6359/registers.h>
@@ -145,6 +146,23 @@ static const struct mfd_cell mt6323_devs[] = {
 		.num_resources = ARRAY_SIZE(mt6323_pwrc_resources),
 		.resources = mt6323_pwrc_resources,
 		.of_compatible = "mediatek,mt6323-pwrc"
+	},
+};
+
+static const struct resource mt6350_keys_resources[] = {
+	DEFINE_RES_IRQ_NAMED(MT6350_IRQ_PWRKEY, "powerkey"),
+	DEFINE_RES_IRQ_NAMED(MT6350_IRQ_FCHRKEY, "homekey"),
+};
+
+static const struct mfd_cell mt6350_devs[] = {
+	{
+		.name = "mt6350-keys",
+		.of_compatible = "mediatek,mt6350-keys",
+		.resources = mt6350_keys_resources,
+		.num_resources = ARRAY_SIZE(mt6350_keys_resources),
+	}, {
+		.name = "mt6350-battery",
+		.of_compatible = "mediatek,mt6350-battery",
 	},
 };
 
@@ -303,6 +321,14 @@ static const struct chip_data mt6328_core = {
 	.irq_init = mt6397_irq_init,
 };
 
+static const struct chip_data mt6350_core = {
+	.cid_addr = MT6350_CID,
+	.cid_shift = 0,
+	.cells = mt6350_devs,
+	.cell_size = ARRAY_SIZE(mt6350_devs),
+	.irq_init = mt6397_irq_init,
+};
+
 static const struct chip_data mt6357_core = {
 	.cid_addr = MT6357_SWCID,
 	.cid_shift = 8,
@@ -407,6 +433,9 @@ static const struct of_device_id mt6397_of_match[] = {
 	}, {
 		.compatible = "mediatek,mt6331",
 		.data = &mt6331_mt6332_core,
+	}, {
+		.compatible = "mediatek,mt6350",
+		.data = &mt6350_core,
 	}, {
 		.compatible = "mediatek,mt6357",
 		.data = &mt6357_core,

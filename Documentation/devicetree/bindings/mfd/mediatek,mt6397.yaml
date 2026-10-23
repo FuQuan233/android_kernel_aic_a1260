@@ -37,6 +37,7 @@ properties:
           - mediatek,mt6323
           - mediatek,mt6331 # "mediatek,mt6331" for PMIC MT6331 and MT6332.
           - mediatek,mt6328
+          - mediatek,mt6350
           - mediatek,mt6358
           - mediatek,mt6359
           - mediatek,mt6397
@@ -201,6 +202,9 @@ properties:
     unevaluatedProperties: false
     description:
       Power and Home keys.
+
+  battery:
+    $ref: /schemas/power/supply/mediatek,mt6350-battery.yaml#
 
   power-controller:
     type: object

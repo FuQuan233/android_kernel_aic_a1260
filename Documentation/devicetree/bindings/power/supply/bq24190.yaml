@@ -30,6 +30,21 @@ properties:
   interrupts:
     maxItems: 1
 
+  poll-interval:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Status polling interval in milliseconds when INT is not wired.
+    minimum: 100
+    maximum: 60000
+
+  disable-reset:
+    type: boolean
+    description: Retain firmware register settings instead of resetting the chip.
+
+  input-current-limit-microamp:
+    minimum: 100000
+    maximum: 3000000
+    description: Initial input current limit, rounded down to a supported value.
+
   ce-gpios:
     description:
       Active low Charge Enable pin. Battery charging is enabled when
@@ -68,7 +83,10 @@ properties:
 required:
   - compatible
   - reg
-  - interrupts
+
+anyOf:
+  - required: [interrupts]
+  - required: [poll-interval]
 
 additionalProperties: false
 

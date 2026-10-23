@@ -6,6 +6,25 @@
 / {
 	/delete-node/ display@14007000;
 
+	disp_pwm: pwm@1100f000 {
+		compatible = "mediatek,mt6580-disp-pwm", "mediatek,mt8173-disp-pwm";
+		reg = <0 0x1100f000 0 0x1000>;
+		clocks = <&topckgen CLK_MT6580_TOP_DISP_PWM>,
+			 <&topckgen CLK_MT6580_TOP_DISP_PWM>;
+		clock-names = "main", "mm";
+		#pwm-cells = <2>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&lcd_pwm_pin>;
+	};
+
+	lcd_backlight: backlight {
+		compatible = "pwm-backlight";
+		pwms = <&disp_pwm 0 39385>;
+		brightness-levels = <0 255>;
+		num-interpolated-steps = <255>;
+		default-brightness-level = <192>;
+	};
+
 	/* The MT6350 supply remains enabled by LK until its driver is ported. */
 	panel_supply: regulator-panel {
 		compatible = "regulator-fixed";
@@ -101,6 +120,7 @@
 			compatible = "wingtech,wt6580-we-n-panel";
 			reg = <0>;
 			power-supply = <&panel_supply>;
+			backlight = <&lcd_backlight>;
 			reset-gpios = <&mmsys 0 GPIO_ACTIVE_LOW>;
 			port {
 				panel_in: endpoint {
@@ -122,5 +142,13 @@
 		clock-output-names = "mt6580_mipi_tx";
 		#clock-cells = <0>;
 		#phy-cells = <0>;
+	};
+};
+
+&pio {
+	lcd_pwm_pin: lcd-pwm-pin {
+		pins {
+			pinmux = <(MTK_PIN_NO(66) | 1)>;
+		};
 	};
 };

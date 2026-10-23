@@ -133,7 +133,8 @@ static const struct mtk_pin_desc mtk_pins_mt6580[] = {
 		MTK_FUNCTION(6, "EINT12"),
 		MTK_FUNCTION(7, "CONN_MCU_TCK")
 	),
-	MTK_PIN(13, "GPIO13", MTK_EINT_FUNCTION(6, 13), DRV_FIXED,
+	/* BSP gpio13/mode1 maps to built-in EINT17, not shared EINT13. */
+	MTK_PIN(13, "GPIO13", MTK_EINT_FUNCTION(1, 17), DRV_FIXED,
 		MTK_FUNCTION(0, "GPIO13"),
 		MTK_FUNCTION(1, "PMIC_EINT"),
 		MTK_FUNCTION(6, "EINT13")
