@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-2.0
+config MALI400
+	tristate "Mali-400 Utgard r8p0 legacy userspace driver (MT6580)"
+	depends on ARM && ARCH_MEDIATEK && OF && PM && HAS_DMA
+	depends on DRM_LIMA = n
+	select DMA_SHARED_BUFFER
+	select SYNC_FILE
+	help
+	  GPL Arm Utgard r8p0-00dev0 driver adapted for Linux 6.18 and the
+	  MT6580 Mali-400 MP2. Provides the original API 900 /dev/mali ABI
+	  for matching proprietary EGL/GLES userspace, with dma-buf and
+	  Linux sync_file support. This is separate from the KMS display driver.
+
+	  This integration holds the firmware-selected GPU clock and voltage
+	  while bound. DVFS, protected rendering and suspend are not supported.
+	  Disable Lima: both drivers target the same GPU and cannot own it
+	  simultaneously. No proprietary userspace binaries are included.
+
+config MALI400_DEBUG
+	bool "Utgard driver debugging and assertions"
+	depends on MALI400
+	help
+	  Compile the DDK's diagnostic messages and internal assertions.
+	  The mali_debug_level parameter controls message verbosity at runtime.

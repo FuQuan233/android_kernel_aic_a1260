@@ -15,6 +15,7 @@ GPU Driver Developer's Guide
    drm-client
    drm-compute
    drivers
+   mali-utgard-mt6580
    backlight
    vga-switcheroo
    vgaarbiter
