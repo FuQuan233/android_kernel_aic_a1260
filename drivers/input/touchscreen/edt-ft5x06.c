@@ -126,6 +126,7 @@ struct edt_ft5x06_ts_data {
 
 	struct mutex mutex;
 	bool factory_mode;
+	bool use_contact_count;
 	enum edt_pmode suspend_mode;
 	int threshold;
 	int gain;
@@ -150,6 +151,7 @@ struct edt_ft5x06_ts_data {
 
 struct edt_i2c_chip_data {
 	int  max_support_points;
+	bool use_contact_count;
 };
 
 static const struct regmap_config edt_ft5x06_i2c_regmap_config = {
@@ -312,6 +314,18 @@ static irqreturn_t edt_ft5x06_ts_isr(int irq, void *dev_id)
 		goto out;
 	}
 
+	/* FT6336U leaves zero-filled point records when TD_STATUS is zero.
+	 * Their event bits look like DOWN at (0, 0), but no contact exists.
+	 * Release the previous contacts instead of creating a stuck press.
+	 */
+	if (tsdata->use_contact_count && !(rdbuf[2] & 0x0f)) {
+		for (i = 0; i < tsdata->max_support_points; i++) {
+			input_mt_slot(tsdata->input, i);
+			input_mt_report_slot_state(tsdata->input, MT_TOOL_FINGER, false);
+		}
+		goto report;
+	}
+
 	for (i = 0; i < tsdata->max_support_points; i++) {
 		u8 *buf = &rdbuf[i * tsdata->point_len + tsdata->tdata_offset];
 
@@ -331,6 +345,8 @@ static irqreturn_t edt_ft5x06_ts_isr(int irq, void *dev_id)
 			swap(x, y);
 
 		id = (buf[2] >> 4) & 0x0f;
+		if (tsdata->use_contact_count && id >= tsdata->max_support_points)
+			continue;
 
 		input_mt_slot(tsdata->input, id);
 		if (input_mt_report_slot_state(tsdata->input, MT_TOOL_FINGER,
@@ -339,6 +355,7 @@ static irqreturn_t edt_ft5x06_ts_isr(int irq, void *dev_id)
 					       x, y, true);
 	}
 
+report:
 	input_mt_report_pointer_emulation(tsdata->input, true);
 	input_sync(tsdata->input);
 
@@ -1180,6 +1197,7 @@ static int edt_ft5x06_ts_probe(struct i2c_client *client)
 	}
 
 	tsdata->max_support_points = chip_data->max_support_points;
+	tsdata->use_contact_count = chip_data->use_contact_count;
 
 	tsdata->vcc = devm_regulator_get(&client->dev, "vcc");
 	if (IS_ERR(tsdata->vcc))
@@ -1494,6 +1512,11 @@ static const struct edt_i2c_chip_data edt_ft6236_data = {
 	.max_support_points = 2,
 };
 
+static const struct edt_i2c_chip_data edt_ft6336_data = {
+	.max_support_points = 2,
+	.use_contact_count = true,
+};
+
 static const struct edt_i2c_chip_data edt_ft8201_data = {
 	.max_support_points = 10,
 };
@@ -1530,7 +1553,7 @@ static const struct of_device_id edt_ft5x06_of_match[] = {
 	{ .compatible = "focaltech,ft5452", .data = &edt_ft5452_data },
 	/* Note focaltech vendor prefix for compatibility with ft6236.c */
 	{ .compatible = "focaltech,ft6236", .data = &edt_ft6236_data },
-	{ .compatible = "focaltech,ft6336u", .data = &edt_ft6236_data },
+	{ .compatible = "focaltech,ft6336u", .data = &edt_ft6336_data },
 	{ .compatible = "focaltech,ft8201", .data = &edt_ft8201_data },
 	{ .compatible = "focaltech,ft8716", .data = &edt_ft8716_data },
 	{ .compatible = "focaltech,ft8719", .data = &edt_ft8719_data },

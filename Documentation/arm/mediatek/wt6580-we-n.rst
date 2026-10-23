@@ -38,8 +38,8 @@ Confirmed board information
   See ``wt6580-stock-display.rst`` for addresses, values and limitations.
 * Touch controller uses the reference BSP's FT6336U configuration: I2C1
   address ``0x38``, reset GPIO2, GPIO5/EINT5 falling edge, 480x800.
-  The device owner confirms accurate taps, dragging and two-finger input
-  with the new 6.18 driver.
+  The device owner confirms accurate taps and dragging with the new 6.18
+  driver; two-finger input is unverified.
 * UART0: ``0x11005000``; GPT: ``0x10008000``; watchdog: ``0x10007000``.
 * eMMC boot partition: 16 MiB, ``/dev/block/mmcblk0p7``. The captured header
   is Android boot format v0, 2048-byte pages, kernel address
@@ -670,8 +670,8 @@ It advertises ``INPUT_PROP_DIRECT``, X=0..479, Y=0..799 and two MT slots.
 VGP1 remains enabled at 2.8 V. Actual interaction produces EINT5 interrupts,
 I2C completion interrupts, coordinate updates, tracking IDs and balanced
 BTN_TOUCH down/up events. Android InputReader classifies it as internal
-``TOUCH | TOUCH_MT``. The user confirms taps, swipes and two-finger operation
-with correct coordinates. Display RDMA reports zero underflows/abnormal events.
+``TOUCH | TOUCH_MT``. The user confirms taps and swipes with correct coordinates; two-finger
+operation is unverified. Display RDMA reports zero underflows/abnormal events.
 A transient display misalignment was reported and recovered without changes;
 the captured screenshot was normal, so its cause is not established.
 
@@ -903,3 +903,35 @@ blocker is released and actual backlight PWM is 0/39347 ns. The USB
 wakeup source remains active and automatic suspend success stays at zero
 while ADB shell commands continue to complete. This distinguishes an
 intentional USB activity lock from forcing the display to stay on.
+
+The first unplug regression on build #26 exposed a separate FT6336U
+empty-frame bug: TD_STATUS reported zero contacts, while the following
+point bytes were all zero (only the last byte was 0xff). The generic
+parser interpreted those as DOWN at (0,0), leaving BTN_TOUCH pressed.
+Five of six aborted suspend attempts named event2 (the touchscreen);
+the initial abort named the charger during the cable transition. The
+retry backoff consumed nearly the entire RTC alarm interval, leaving
+only 0.133 seconds of actual sleep. Sensor sampling and ADB recovered,
+but this was not a clean long-enough standby validation.
+
+The FT6336U match now handles zero-contact frames by releasing all slots,
+and rejects point IDs outside the two allocated slots. Other controller
+matches keep their existing parser behaviour. This complements quiescing
+INTN before hibernation; it does not make touch a wake source or suppress
+legitimate input wakeup accounting.
+
+On build #27 the same zero-contact raw payload leaves BTN_TOUCH released.
+The owner confirms tapping and swiping; captured events contain normal
+tracking-ID termination and balanced BTN_TOUCH DOWN/UP. The owner clarifies
+that two-finger operation has not been tried, so it remains unverified.
+
+The subsequent build #27 unplug regression passes with success=1, fail=0,
+no backoff and no event2 suspend abort. The test retains a maintenance
+lock for two seconds after unplug so the legitimate charger-transition
+event can settle, then releases it for Android SystemSuspend. Android
+records 19.210 seconds including 0.390 seconds overhead: 18.820 seconds
+of sleep. The RTC wakes through PMIC parent Linux IRQ47, thermal sampling resumes
+(MONCTL0=7, three nonzero MSR readings and TS_CON0=0), and temperature
+reads 43 C immediately after resume. Replug restores ADB and reacquires
+the MUSB activity lock. The temporary maintenance lock is released at
+the end; the normal schedutil policy and 1300 MHz cap remain active.
