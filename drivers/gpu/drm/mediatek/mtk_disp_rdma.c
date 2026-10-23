@@ -88,6 +88,7 @@ struct mtk_disp_rdma {
 	void				*vblank_cb_data;
 	u32				fifo_size;
 	u32 frame_ends, underflows, abnormal;
+	int irq;
 };
 
 static irqreturn_t mtk_disp_rdma_irq_handler(int irq, void *dev_id)
@@ -191,7 +192,13 @@ void mtk_rdma_start(struct device *dev)
 
 void mtk_rdma_stop(struct device *dev)
 {
+	struct mtk_disp_rdma *rdma = dev_get_drvdata(dev);
+
 	rdma_update_bits(dev, DISP_REG_RDMA_GLOBAL_CON, RDMA_ENGINE_EN, 0);
+	if (rdma->data->mt6580) {
+		writel(0, rdma->regs + DISP_REG_RDMA_INT_ENABLE);
+		synchronize_irq(rdma->irq);
+	}
 }
 
 void mtk_rdma_config(struct device *dev, unsigned int width,
@@ -333,7 +340,12 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 {
 	struct mtk_disp_rdma *rdma = dev_get_drvdata(dev);
 
-	return sysfs_emit(buf,
+	int ret, len;
+
+	ret = clk_prepare_enable(rdma->clk);
+	if (ret)
+		return ret;
+	len = sysfs_emit(buf,
 		"DRM RDMA inten=%08x status=%08x global=%08x size=%08x/%08x con=%08x addr=%08x pitch=%08x fifo=%08x gmc=%08x/%08x\n"
 		"frames=%u underflows=%u abnormal=%u fifo_min=%08x in=%u/%u out=%u/%u\n",
 		readl(rdma->regs), readl(rdma->regs + 4),
@@ -345,6 +357,8 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 		readl(rdma->regs + 0x44), readl(rdma->regs + 0xf0),
 		readl(rdma->regs + 0xf4), readl(rdma->regs + 0xf8),
 		readl(rdma->regs + 0xfc));
+	clk_disable_unprepare(rdma->clk);
+	return len;
 }
 static DEVICE_ATTR_RO(state);
 static struct attribute *mt6580_attrs[] = { &dev_attr_state.attr, NULL };
@@ -386,12 +400,19 @@ static int mtk_disp_rdma_probe(struct platform_device *pdev)
 	if (ret && (ret != -EINVAL))
 		return dev_err_probe(dev, ret, "Failed to get rdma fifo size\n");
 
+	priv->irq = irq;
+	priv->data = of_device_get_match_data(dev);
+	ret = clk_prepare_enable(priv->clk);
+	if (ret)
+		return ret;
+
 	/* Disable and clear pending interrupts */
 	writel(0x0, priv->regs + DISP_REG_RDMA_INT_ENABLE);
 	writel(0x0, priv->regs + DISP_REG_RDMA_INT_STATUS);
 
 	ret = devm_request_irq(dev, irq, mtk_disp_rdma_irq_handler,
 			       IRQF_TRIGGER_NONE, dev_name(dev), priv);
+	clk_disable_unprepare(priv->clk);
 	if (ret < 0)
 		return dev_err_probe(dev, ret, "Failed to request irq %d\n", irq);
 

@@ -727,7 +727,7 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
 	ret = mipi_dsi_pixel_format_to_bpp(dsi->format);
 	if (ret < 0) {
 		dev_err(dev, "Unknown MIPI DSI format %d\n", dsi->format);
-		return ret;
+		goto err_refcount;
 	}
 	bit_per_pixel = ret;
 
@@ -752,22 +752,24 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
 		writel(CMD_MODE, dsi->regs + DSI_MODE_CTRL);
 		ret = readl_poll_timeout(dsi->regs + DSI_INTSTA, status,
 					!(status & DSI_BUSY), 10, 100000);
-		clk_disable_unprepare(dsi->digital_clk);
-		clk_disable_unprepare(dsi->engine_clk);
 		if (ret)
-			goto err_refcount;
+			goto err_disable_mt6580_clks;
 		dsi->data_rate = 300000000;
 	}
 
 	ret = clk_set_rate(dsi->hs_clk, dsi->data_rate);
 	if (ret < 0) {
 		dev_err(dev, "Failed to set data rate: %d\n", ret);
-		goto err_refcount;
+		goto err_disable_mt6580_clks;
 	}
 
 	ret = phy_power_on(dsi->phy);
 	if (ret)
-		goto err_refcount;
+		goto err_disable_mt6580_clks;
+
+	/* MT6580 retains both clocks from before PHY setup until power-off. */
+	if (dsi->driver_data->mt6580)
+		goto clocks_ready;
 
 	ret = clk_prepare_enable(dsi->engine_clk);
 	if (ret < 0) {
@@ -781,6 +783,7 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
 		goto err_disable_engine_clk;
 	}
 
+clocks_ready:
 	mtk_dsi_enable(dsi);
 
 	if (dsi->driver_data->has_shadow_ctl)
@@ -800,6 +803,11 @@ err_disable_engine_clk:
 	clk_disable_unprepare(dsi->engine_clk);
 err_phy_power_off:
 	phy_power_off(dsi->phy);
+err_disable_mt6580_clks:
+	if (dsi->driver_data->mt6580) {
+		clk_disable_unprepare(dsi->digital_clk);
+		clk_disable_unprepare(dsi->engine_clk);
+	}
 err_refcount:
 	dsi->refcount--;
 	return ret;
@@ -831,10 +839,16 @@ static void mtk_dsi_poweroff(struct mtk_dsi *dsi)
 
 	mtk_dsi_disable(dsi);
 
-	clk_disable_unprepare(dsi->engine_clk);
+	if (dsi->driver_data->mt6580) {
+		writel(0, dsi->regs + DSI_INTEN);
+		synchronize_irq(dsi->irq);
+		phy_power_off(dsi->phy);
+	}
 	clk_disable_unprepare(dsi->digital_clk);
+	clk_disable_unprepare(dsi->engine_clk);
 
-	phy_power_off(dsi->phy);
+	if (!dsi->driver_data->mt6580)
+		phy_power_off(dsi->phy);
 
 	dsi->lanes_ready = false;
 }
@@ -1280,14 +1294,24 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 	};
 	struct mtk_dsi *dsi = dev_get_drvdata(dev);
 	unsigned int i;
-	int len;
+	int len, ret;
 
+	ret = clk_prepare_enable(dsi->engine_clk);
+	if (ret)
+		return ret;
+	ret = clk_prepare_enable(dsi->digital_clk);
+	if (ret) {
+		clk_disable_unprepare(dsi->engine_clk);
+		return ret;
+	}
 	len = sysfs_emit(buf, "DRM DSI rate=%u lanes=%u refs=%d enabled=%u ready=%u\n",
 			 dsi->data_rate, dsi->lanes, dsi->refcount,
 			 dsi->enabled, dsi->lanes_ready);
 	for (i = 0; i < ARRAY_SIZE(offsets); i++)
 		len += sysfs_emit_at(buf, len, "DSI %03x=%08x\n", offsets[i],
 				     readl(dsi->regs + offsets[i]));
+	clk_disable_unprepare(dsi->digital_clk);
+	clk_disable_unprepare(dsi->engine_clk);
 	return len;
 }
 static DEVICE_ATTR_RO(state);
@@ -1343,6 +1367,19 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, dsi);
 	if (dsi->driver_data->mt6580) {
+		/* Clear firmware IRQs before the provider can suspend DISP. */
+		ret = clk_prepare_enable(dsi->engine_clk);
+		if (ret)
+			return ret;
+		ret = clk_prepare_enable(dsi->digital_clk);
+		if (ret) {
+			clk_disable_unprepare(dsi->engine_clk);
+			return ret;
+		}
+		writel(0, dsi->regs + DSI_INTEN);
+		writel(0, dsi->regs + DSI_INTSTA);
+		clk_disable_unprepare(dsi->digital_clk);
+		clk_disable_unprepare(dsi->engine_clk);
 		ret = devm_device_add_group(dev, &mt6580_group);
 		if (ret)
 			return ret;

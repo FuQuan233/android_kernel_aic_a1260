@@ -25,6 +25,7 @@ static const struct mtk_gate mm_clks[] = {
 static const struct mtk_clk_desc mm_desc = {
 	.clks = mm_clks,
 	.num_clks = ARRAY_SIZE(mm_clks),
+	.need_runtime_pm = true,
 };
 
 static const struct platform_device_id mt6580_mm_ids[] = {

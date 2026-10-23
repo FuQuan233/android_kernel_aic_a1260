@@ -307,6 +307,8 @@ static int wt6580_probe(struct mipi_dsi_device *dsi)
 			  MIPI_DSI_MODE_LPM;
 	mipi_dsi_set_drvdata(dsi, ctx);
 	drm_panel_init(&ctx->panel, dev, &wt6580_funcs, DRM_MODE_CONNECTOR_DSI);
+	/* Keep the DSI clock provider's DISP domain on throughout reset/DCS. */
+	ctx->panel.prepare_prev_first = true;
 	ret = drm_panel_of_backlight(&ctx->panel);
 	if (ret)
 		return ret;

@@ -7,6 +7,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/io.h>
 #include <linux/module.h>
@@ -39,6 +40,7 @@ struct mtk_pwm_data {
 
 	unsigned int bls_debug;
 	u32 bls_debug_mask;
+	bool zero_width_requires_disable;
 };
 
 struct mtk_disp_pwm {
@@ -77,16 +79,6 @@ static int mtk_disp_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 	if (state->polarity != PWM_POLARITY_NORMAL)
 		return -EINVAL;
 
-	if (!state->enabled && mdp->enabled) {
-		mtk_disp_pwm_update_bits(mdp, DISP_PWM_EN,
-					 mdp->data->enable_mask, 0x0);
-		clk_disable_unprepare(mdp->clk_mm);
-		clk_disable_unprepare(mdp->clk_main);
-
-		mdp->enabled = false;
-		return 0;
-	}
-
 	if (!mdp->enabled) {
 		err = clk_prepare_enable(mdp->clk_main);
 		if (err < 0) {
@@ -102,6 +94,42 @@ static int mtk_disp_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 			clk_disable_unprepare(mdp->clk_main);
 			return err;
 		}
+	}
+
+	if (!state->enabled ||
+	    (mdp->data->zero_width_requires_disable && !state->duty_cycle)) {
+		/* MT6580's BSP avoids HIGH_WIDTH=0: latch width 1 with PWM_EN=0.
+		 * Merely requesting an enabled zero-duty PWM can leave the old
+		 * backlight output active after DISP powers off.
+		 */
+		if (mdp->data->zero_width_requires_disable)
+			mtk_disp_pwm_update_bits(mdp, mdp->data->con1,
+					 PWM_HIGH_WIDTH_MASK, BIT(PWM_HIGH_WIDTH_SHIFT));
+		mtk_disp_pwm_update_bits(mdp, DISP_PWM_EN,
+					 mdp->data->enable_mask, 0);
+		if (mdp->data->zero_width_requires_disable) {
+			mtk_disp_pwm_update_bits(mdp, mdp->data->commit,
+					 mdp->data->commit_mask, mdp->data->commit_mask);
+			mtk_disp_pwm_update_bits(mdp, mdp->data->commit,
+					 mdp->data->commit_mask, 0);
+			/* COMMIT crosses into the PWM clock domain. Gating the
+			 * source immediately can retain the previous output until
+			 * the next clock enable. Drain two programmed PWM periods.
+			 */
+			readl(mdp->base + mdp->data->commit);
+			clk_div = FIELD_GET(PWM_CLKDIV_MASK,
+					    readl(mdp->base + mdp->data->con0));
+			period = FIELD_GET(PWM_PERIOD_MASK,
+					   readl(mdp->base + mdp->data->con1));
+			rate = clk_get_rate(mdp->clk_main);
+			div = (u64)(period + 1) * (clk_div + 1) * USEC_PER_SEC;
+			if (rate)
+				fsleep(2 * DIV_ROUND_UP_ULL(div, rate) + 1);
+		}
+		clk_disable_unprepare(mdp->clk_mm);
+		clk_disable_unprepare(mdp->clk_main);
+		mdp->enabled = false;
+		return 0;
 	}
 
 	/*
@@ -153,6 +181,10 @@ static int mtk_disp_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 				 PWM_PERIOD_MASK | PWM_HIGH_WIDTH_MASK,
 				 value);
 
+	if (mdp->data->zero_width_requires_disable)
+		mtk_disp_pwm_update_bits(mdp, DISP_PWM_EN, mdp->data->enable_mask,
+					 mdp->data->enable_mask);
+
 	if (mdp->data->has_commit) {
 		mtk_disp_pwm_update_bits(mdp, mdp->data->commit,
 					 mdp->data->commit_mask,
@@ -162,8 +194,9 @@ static int mtk_disp_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 					 0x0);
 	}
 
-	mtk_disp_pwm_update_bits(mdp, DISP_PWM_EN, mdp->data->enable_mask,
-				 mdp->data->enable_mask);
+	if (!mdp->data->zero_width_requires_disable)
+		mtk_disp_pwm_update_bits(mdp, DISP_PWM_EN, mdp->data->enable_mask,
+					 mdp->data->enable_mask);
 	mdp->enabled = true;
 
 	return 0;
@@ -264,6 +297,16 @@ static int mtk_disp_pwm_probe(struct platform_device *pdev)
 	return 0;
 }
 
+static const struct mtk_pwm_data mt6580_pwm_data = {
+	.enable_mask = BIT(0),
+	.con0 = 0x10,
+	.con1 = 0x14,
+	.has_commit = true,
+	.commit = 0x8,
+	.commit_mask = BIT(0),
+	.zero_width_requires_disable = true,
+};
+
 static const struct mtk_pwm_data mt2701_pwm_data = {
 	.enable_mask = BIT(16),
 	.con0 = 0xa8,
@@ -295,6 +338,7 @@ static const struct mtk_pwm_data mt8183_pwm_data = {
 };
 
 static const struct of_device_id mtk_disp_pwm_of_match[] = {
+	{ .compatible = "mediatek,mt6580-disp-pwm", .data = &mt6580_pwm_data },
 	{ .compatible = "mediatek,mt2701-disp-pwm", .data = &mt2701_pwm_data},
 	{ .compatible = "mediatek,mt6595-disp-pwm", .data = &mt8173_pwm_data},
 	{ .compatible = "mediatek,mt8173-disp-pwm", .data = &mt8173_pwm_data},

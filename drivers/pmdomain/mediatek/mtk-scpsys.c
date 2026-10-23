@@ -1039,10 +1039,7 @@ static const struct scp_domain_data scp_domain_data_mt6580[] = {
 		.sram_pdn_ack_bits = BIT(12),
 		.bus_prot_mask = BIT(1),
 		.clk_id = { CLK_SMI },
-		/* SMI/LARB context restore is not implemented yet. Keep this
-		 * domain explicitly on instead of globally disabling genpd PM.
-		 */
-		.caps = MTK_SCPD_ALWAYS_ON,
+		/* MMSYS saves/restores SMI/LARB0 before releasing its PM reference. */
 	},
 	[MT6580_POWER_DOMAIN_ISP] = {
 		.name = "isp",

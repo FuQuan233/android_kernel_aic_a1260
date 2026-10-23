@@ -735,8 +735,11 @@ The panel backlight is independent of the PMIC key. Its DISP_PWM at
 function 1 and a top clock gate at CLK_GATING_CTRL0 bit 0. The port retains
 the firmware-selected 26 MHz or UPLL/12 source and connects ``pwm-backlight``
 to the DRM panel, allowing panel disable/enable to switch the light off/on.
-With no separate enable GPIO or regulator, ``pwm-backlight`` intentionally
-keeps PWM enabled at zero duty during blanking so its output is reliably low.
+With no separate enable GPIO or regulator, ``pwm-backlight`` requests an
+enabled zero-duty waveform during blanking. The MT6580 provider translates
+that request to the BSP's width-1, PWM-disable and COMMIT sequence before
+gating the source; leaving PWM enabled at width zero did not reliably blank
+this board after display-domain power-off.
 The Composer interface defines brightness 0.0 as minimum visible brightness
 and a negative value as off. The device HWC mapping therefore maps the active
 range to hardware levels 4..255; the separate ``bl_power`` path still blanks
@@ -948,9 +951,8 @@ SPM +0x238, SRAM bits 11:8 and acknowledgement bits 13:12, with no bus
 protection in the BSP sequence. MFG keeps its existing index 0; DISP and
 ISP are indices 1 and 2. Unused ISP is eligible for automatic power-off.
 
-DISP has an explicit ALWAYS_ON policy: its SMI/LARB register restore is
-not implemented. This permits generic clock/domain cleanup without losing
-firmware bus context. Build #31 adds Utgard runtime MFG gating, with real
+Build #35 replaces DISP's initial ALWAYS_ON policy with runtime PM and
+SMI/LARB0 context restoration. Build #31 added Utgard runtime MFG gating, with real
 render/resuspend and two display off/on cycles verified. Build #32 replaces
 the temporary critical MPLL_D5 reference with the firmware-selected SMI,
 USB, MFG, MSDC0 and display PWM parent relationships. The D5 descendants
@@ -975,6 +977,58 @@ The MT6580 DSI handover explicitly enables engine/digital clocks before
 stopping inherited video and polling registers. The earlier code depended
 on firmware keeping both clocks enabled and timed out after late unused
 clock cleanup. The normal PHY and display programming follows afterward.
+
+DISP context restoration
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The MT6580 MMSYS node now owns three register resources: MMSYS at
+0x14000000, LARB0 at 0x14016000 and SMI common at 0x14017000. Runtime
+suspend waits for LARB0 to be idle before saving the BSP common-register
+list, seven port OSTD settings, LARB control, virtual-channel settings,
+MMU/security/domain registers, MMSYS gates, DCM and reset outputs. genpd
+then asserts bus protection, powers down SRAM and removes DISP power.
+Resume opens the COMMON/LARB gates before restoring context; DRM rebuilds
+RDMA, mutex routing and DSI state. A future SMI/IOMMU driver must take over
+this LARB ownership rather than map the same resources concurrently.
+
+The display clock provider participates in runtime PM, so clock users hold
+MMSYS active. LCM reset GPIO operations also acquire a runtime reference.
+The panel requests host pre-enable before its prepare sequence, and DSI
+holds its clocks throughout PHY power-on/off. DSI and RDMA quiesce their
+IRQs before releasing clocks; probe and diagnostic register reads likewise
+hold the provider powered. The MMSYS ``power_context`` attribute only reads
+software counters and therefore does not wake a suspended display domain.
+
+Build #35 reached Android boot_completed with normal on-screen rendering
+confirmed by the user. Across four screen-off/on cycles, the two SPM power
+status words showed DISP bit 3 clear while off, and SMI/D5 enable counts
+were zero. Off-screen EGL rendering returned RGBA 0,255,0,255 without a GL
+error, after which both DISP and MFG were off (status 0xbe45/0xbe41).
+Reading DSI/RDMA diagnostic attributes while off safely resumed and released
+the domain. Configuration counters reached eight saves/eight restores with
+no busy rejection; subsequent RDMA underflow and abnormal counts stayed
+zero. The user confirmed touch remained normal after these cycles.
+
+That test exposed a separate backlight issue: the generic pwm-backlight
+zero-duty request left PWM enabled and the light remained on after DISP
+power-off. The BSP explicitly avoids HIGH_WIDTH=0, using width 1 with
+PWM_EN=0 followed by COMMIT instead. Applying that sequence live fully
+extinguished the backlight, as confirmed by the user. The MT6580 PWM
+compatible now implements this zero-duty behavior and releases its clocks;
+nonzero brightness continues through the normal PWM path.
+
+Build #37 also flushes COMMIT and waits two programmed PWM periods before
+gating the source (about 80 us for this board), allowing the output update
+to settle. Raw register reads with the PWM clock gated proved unreliable:
+some returned a value from a different offset. They cannot establish the
+latched output state. The debug PWM interface temporarily enables its
+clock, so checking the physical backlight is also necessary; a debug read
+alone cannot prove that the preceding shutdown completed before gating.
+
+These are display/GPU runtime power-cycle checks, not validation of complete
+system suspend with the new callbacks, DDR self-refresh or panel supply-rail
+power-off. The latter still uses the firmware-powered fixed regulator.
+Evidence for #35 is ``out/a1260-runtime-pm/disp-domain-validation.txt``.
 
 MT6350 RTC now registers a final SYS_OFF_MODE_POWER_OFF handler. It repeats
 the BSP PROT unlock (0x586a, 0x9136), disables RTC 32 kHz export only when

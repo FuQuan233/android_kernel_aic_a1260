@@ -164,6 +164,13 @@ the existing fixed source; AUXADC and display engine parents, other divider
 gates, PLL control and DISP context restoration remain incomplete. Full
 system suspend/resume with the new GPU callbacks remains unvalidated.
 
+The subsequent #33 peripheral-clock update connects I2C/APDMA to AXI and
+AUXADC to 26 MHz. Build #35 adds DISP runtime power-off with SMI/LARB0
+restoration: an EGL draw while DISP was off passed pixel readback and both
+DISP/MFG returned off afterward. Four display cycles kept RDMA error counts
+at zero. See ``Documentation/arm/mediatek/wt6580-we-n.rst`` for the display
+context sequence and the backlight zero-duty issue found during that test.
+
 Fixed-power validation
 ----------------------
 
