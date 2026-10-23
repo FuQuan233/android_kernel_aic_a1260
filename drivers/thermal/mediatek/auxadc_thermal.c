@@ -10,12 +10,14 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
+#include <linux/iopoll.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/nvmem-consumer.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/slab.h>
 #include <linux/io.h>
 #include <linux/thermal.h>
@@ -309,6 +311,7 @@ struct mtk_thermal_bank {
 };
 
 struct mtk_thermal_data {
+	bool mt6580;
 	s32 num_banks;
 	s32 num_sensors;
 	s32 auxadc_channel;
@@ -330,6 +333,10 @@ struct mtk_thermal_data {
 struct mtk_thermal {
 	struct device *dev;
 	void __iomem *thermal_base;
+	void __iomem *auxadc_base;
+	void __iomem *apmixed_base;
+	u32 auxadc_phys_base;
+	u32 apmixed_phys_base;
 
 	struct clk *clk_peri_therm;
 	struct clk *clk_auxadc;
@@ -542,6 +549,26 @@ static const struct mtk_thermal_data mt2701_thermal_data = {
 	.version = MTK_THERMAL_V1,
 };
 
+/* MT6580 uses three MCU sensors (mux 0/1/2), not the MT2701 ABB mux. */
+static const int mt6580_mux_values[] = { 0, 1, 2 };
+static const struct mtk_thermal_data mt6580_thermal_data = {
+	.mt6580 = true,
+	.auxadc_channel = 11,
+	.num_banks = 1,
+	.num_sensors = 3,
+	.vts_index = mt2701_vts_index,
+	.cali_val = 165,
+	.num_controller = 1,
+	.controller_offset = mt2701_tc_offset,
+	.bank_data = { { .num_sensors = 3, .sensors = mt2701_bank_data } },
+	.msr = mt2701_msr,
+	.adcpnp = mt2701_adcpnp,
+	.sensor_mux_values = mt6580_mux_values,
+	.version = MTK_THERMAL_V1,
+	.apmixed_buffer_ctl_reg = APMIXED_SYS_TS_CON0,
+	.apmixed_buffer_ctl_mask = ~GENMASK(7, 6),
+};
+
 /*
  * The MT8365 thermal controller has one bank, which can read up to
  * four temperature sensors simultaneously. The MT8365 has a total of 3
@@ -698,6 +725,23 @@ static const struct mtk_thermal_data mt7986_thermal_data = {
 static bool mtk_thermal_temp_is_valid(int temp)
 {
 	return (temp >= MT8173_TEMP_MIN) && (temp <= MT8173_TEMP_MAX);
+}
+
+/* Preserve the MT6580 BSP calibration's integer rounding and ADC offset. */
+static int raw_to_mcelsius_mt6580(struct mtk_thermal *mt, int sensno, s32 raw)
+{
+	int gain = 10000 + (mt->adc_ge - 512) * 10000 / 4096;
+	int oe = mt->adc_oe - 512;
+	int room, value;
+
+	raw &= 0xfff;
+	if (!raw)
+		return THERMAL_TEMP_INVALID;
+	room = ((mt->vts[sensno] + 3350 - oe) * 10000 / 4096) * 10000 / gain;
+	value = ((((raw - oe) * 10000) >> 12) * 10000 / gain) - room;
+	value = value * 15 / 18;
+	value = value * 100 / (165 + mt->o_slope);
+	return (mt->degc_cali * 5 - value) * 100;
 }
 
 /**
@@ -997,6 +1041,8 @@ static int mtk_thermal_extract_efuse_v1(struct mtk_thermal *mt, u32 *buf)
 		return -EINVAL;
 
 	mt->adc_ge = CALIB_BUF1_ADC_GE_V1(buf[1]);
+	if (mt->conf->mt6580)
+		mt->adc_oe = (buf[1] >> 12) & 0x3ff;
 
 	for (i = 0; i < mt->conf->num_sensors; i++) {
 		switch (mt->conf->vts_index[i]) {
@@ -1030,6 +1076,10 @@ static int mtk_thermal_extract_efuse_v1(struct mtk_thermal *mt, u32 *buf)
 		mt->o_slope = -CALIB_BUF0_O_SLOPE_V1(buf[0]);
 	else
 		mt->o_slope = CALIB_BUF0_O_SLOPE_V1(buf[0]);
+
+	/* With ID clear the factory did not calibrate the slope. */
+	if (mt->conf->mt6580 && !CALIB_BUF1_ID_V1(buf[1]))
+		mt->o_slope = 0;
 
 	return 0;
 }
@@ -1133,6 +1183,7 @@ out:
 }
 
 static const struct of_device_id mtk_thermal_of_match[] = {
+	{ .compatible = "mediatek,mt6580-thermal", .data = &mt6580_thermal_data },
 	{
 		.compatible = "mediatek,mt8173-thermal",
 		.data = (void *)&mt8173_thermal_data,
@@ -1190,6 +1241,54 @@ static void mtk_thermal_release_periodic_ts(struct mtk_thermal *mt,
 	tmp = readl(mt->thermal_base + TEMP_MSRCTL1);
 	writel((tmp & (~0x10e)), mt->thermal_base + TEMP_MSRCTL1);
 }
+
+static void mt6580_thermal_start(struct mtk_thermal *mt)
+{
+	/* Channel 11 belongs exclusively to the thermal AHB master. */
+	writel(readl(mt->auxadc_base) & ~BIT(11), mt->auxadc_base);
+	writel(BIT(11), mt->auxadc_base + AUXADC_CON1_CLR_V);
+	mtk_thermal_turn_on_buffer(mt, mt->apmixed_base);
+	writel(0, mt->thermal_base + TEMP_MSRCTL1);
+	mtk_thermal_init_bank(mt, 0, mt->apmixed_phys_base,
+			      mt->auxadc_phys_base, 0);
+	writel(BIT(11), mt->auxadc_base + AUXADC_CON1_SET_V);
+}
+
+static int mtk_thermal_suspend(struct device *dev)
+{
+	struct mtk_thermal *mt = dev_get_drvdata(dev);
+	u32 status;
+	int ret;
+
+	if (!mt->conf->mt6580)
+		return 0;
+	/* Pause the AHB master before switching off the sensor buffer. */
+	writel(readl(mt->thermal_base + TEMP_MSRCTL1) | 0x10e,
+	       mt->thermal_base + TEMP_MSRCTL1);
+	ret = readl_poll_timeout(mt->thermal_base + 0x418, status,
+				!(status >> 16), 2, 1000);
+	if (ret) {
+		writel(readl(mt->thermal_base + TEMP_MSRCTL1) & ~0x10e,
+		       mt->thermal_base + TEMP_MSRCTL1);
+		return ret;
+	}
+	writel(0, mt->thermal_base + TEMP_MONCTL0);
+	writel(readl(mt->apmixed_base + APMIXED_SYS_TS_CON0) | GENMASK(7, 6),
+	       mt->apmixed_base + APMIXED_SYS_TS_CON0);
+	return 0;
+}
+
+static int mtk_thermal_resume(struct device *dev)
+{
+	struct mtk_thermal *mt = dev_get_drvdata(dev);
+
+	if (mt->conf->mt6580)
+		mt6580_thermal_start(mt);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(mtk_thermal_pm_ops,
+			      mtk_thermal_suspend, mtk_thermal_resume);
 
 static int mtk_thermal_probe(struct platform_device *pdev)
 {
@@ -1268,22 +1367,34 @@ static int mtk_thermal_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	mt->auxadc_base = auxadc_base;
+	mt->apmixed_base = apmixed_base;
+	mt->auxadc_phys_base = auxadc_phys_base;
+	mt->apmixed_phys_base = apmixed_phys_base;
+	platform_set_drvdata(pdev, mt);
+
 	mtk_thermal_turn_on_buffer(mt, apmixed_base);
 
 	if (mt->conf->version != MTK_THERMAL_V1)
 		mtk_thermal_release_periodic_ts(mt, auxadc_base);
 
-	if (mt->conf->version == MTK_THERMAL_V1)
+	if (mt->conf->mt6580)
+		mt->raw_to_mcelsius = raw_to_mcelsius_mt6580;
+	else if (mt->conf->version == MTK_THERMAL_V1)
 		mt->raw_to_mcelsius = raw_to_mcelsius_v1;
 	else if (mt->conf->version == MTK_THERMAL_V2)
 		mt->raw_to_mcelsius = raw_to_mcelsius_v2;
 	else
 		mt->raw_to_mcelsius = raw_to_mcelsius_v3;
 
-	for (ctrl_id = 0; ctrl_id < mt->conf->num_controller ; ctrl_id++)
-		for (i = 0; i < mt->conf->num_banks; i++)
-			mtk_thermal_init_bank(mt, i, apmixed_phys_base,
-					      auxadc_phys_base, ctrl_id);
+	if (mt->conf->mt6580) {
+		mt6580_thermal_start(mt);
+	} else {
+		for (ctrl_id = 0; ctrl_id < mt->conf->num_controller; ctrl_id++)
+			for (i = 0; i < mt->conf->num_banks; i++)
+				mtk_thermal_init_bank(mt, i, apmixed_phys_base,
+						      auxadc_phys_base, ctrl_id);
+	}
 
 	tzdev = devm_thermal_of_zone_register(&pdev->dev, 0, mt,
 					      &mtk_thermal_ops);
@@ -1301,6 +1412,7 @@ static struct platform_driver mtk_thermal_driver = {
 	.probe = mtk_thermal_probe,
 	.driver = {
 		.name = "mtk-thermal",
+		.pm = pm_sleep_ptr(&mtk_thermal_pm_ops),
 		.of_match_table = mtk_thermal_of_match,
 	},
 };

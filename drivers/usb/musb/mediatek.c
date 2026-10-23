@@ -13,6 +13,7 @@
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeup.h>
 #include <linux/usb/role.h>
 #include <linux/usb/usb_phy_generic.h>
 #include "musb_core.h"
@@ -53,6 +54,7 @@ struct mtk_glue {
 	struct clk_bulk_data clks[MTK_MUSB_CLKS_NUM];
 	enum usb_role role;
 	struct usb_role_switch *role_sw;
+	bool mt6580;
 };
 
 static int mtk_musb_clks_get(struct mtk_glue *glue)
@@ -154,11 +156,27 @@ static irqreturn_t generic_interrupt(int irq, void *__hci)
 	unsigned long flags;
 	irqreturn_t retval = IRQ_NONE;
 	struct musb *musb = __hci;
+	struct mtk_glue *glue = dev_get_drvdata(musb->controller->parent);
 
 	spin_lock_irqsave(&musb->lock, flags);
 	musb->int_usb = musb_clearb(musb->mregs, MUSB_INTRUSB);
 	musb->int_rx = musb_clearw(musb->mregs, MUSB_INTRRX);
 	musb->int_tx = musb_clearw(musb->mregs, MUSB_INTRTX);
+
+	/*
+	 * The MT6580 device PHY cannot preserve an active link over system
+	 * suspend. Match the BSP USB suspend lock, without holding the screen
+	 * on or preventing sleep on a charger with no USB data connection.
+	 * Follow the core's RESUME -> SUSPEND/DISCONNECT -> RESET ordering.
+	 */
+	if (glue->mt6580 && !is_host_active(musb)) {
+		if (musb->int_usb & MUSB_INTR_RESUME)
+			pm_stay_awake(musb->controller);
+		if (musb->int_usb & (MUSB_INTR_SUSPEND | MUSB_INTR_DISCONNECT))
+			pm_relax(musb->controller);
+		if (musb->int_usb & MUSB_INTR_RESET)
+			pm_stay_awake(musb->controller);
+	}
 
 	if ((musb->int_usb & MUSB_INTR_RESET) && !is_host_active(musb)) {
 		/* ep0 FADDR must be 0 when (re)entering peripheral mode */
@@ -340,11 +358,22 @@ static u16 mtk_musb_set_toggle(struct musb_qh *qh, int is_out, struct urb *urb)
 	return 0;
 }
 
+static void mtk_musb_disable(struct musb *musb)
+{
+	struct mtk_glue *glue = dev_get_drvdata(musb->controller->parent);
+
+	/* Also release when the gadget is stopped or unbound by userspace. */
+	if (glue->mt6580)
+		pm_relax(musb->controller);
+}
+
 static int mtk_musb_exit(struct musb *musb)
 {
 	struct device *dev = musb->controller;
 	struct mtk_glue *glue = dev_get_drvdata(dev->parent);
 
+	if (glue->mt6580)
+		pm_relax(dev);
 	mtk_otg_switch_exit(glue);
 	phy_power_off(glue->phy);
 	phy_exit(glue->phy);
@@ -358,6 +387,7 @@ static int mtk_musb_exit(struct musb *musb)
 static const struct musb_platform_ops mtk_musb_ops = {
 	.quirks = MUSB_DMA_INVENTRA,
 	.init = mtk_musb_init,
+	.disable = mtk_musb_disable,
 	.get_toggle = mtk_musb_get_toggle,
 	.set_toggle = mtk_musb_set_toggle,
 	.exit = mtk_musb_exit,
@@ -465,7 +495,8 @@ static int mtk_musb_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	if (of_device_is_compatible(np, "mediatek,mt6580-musb")) {
+	glue->mt6580 = of_device_is_compatible(np, "mediatek,mt6580-musb");
+	if (glue->mt6580) {
 		pdata->config = &mt6580_musb_hdrc_config;
 		dev_info(dev, "MT6580 8 KiB FIFO: bulk EP1 double buffered\n");
 	} else {

@@ -795,18 +795,20 @@ CPU frequency and standby sleep
 -----------------------------
 
 The four A7 cores share one cpufreq-dt policy and one ARMPLL clock.
-The supported rates are the BSP level-0 low-frequency OPPs: 604.5, 754,
-903.5 and 1001 MHz. Every OPP uses the BSP's 1.15 V. Firmware was measured
-at 1001 MHz / 1.15 V before enabling the driver. Higher frequencies and
-voltage reduction require speed-bin and thermal validation and are not
-enabled. This is frequency scaling at the stock voltage, not validated
-full-range voltage DVFS. The GPU's independent MPLL source is unchanged.
+The supported rates follow the BSP level-0 (1.3 GHz segment) table:
+604.5, 754, 903.5, 1001, 1105, 1209 and 1300 MHz. The first four use
+1.15 V; 1105 MHz uses 1.19375 V and 1209 MHz uses 1.225 V. The BSP's
+1.30625 V request at 1300 MHz was observed to plateau at selector 0x60
+(1.3 V), despite target 0x61. The board therefore requests the measured
+1.3 V and caps its regulator constraint there. No undervolting or
+higher speed segment is enabled. The GPU's independent MPLL is unchanged.
 
 The CPU clock uses the BSP's MAINPLL handover, PLL2 gate, ARMPLL PCW and
 post-divider settings and 20 us PLL settling time. It preserves unrelated
 INFRACFG bits. MT6350 VPROC reports the actual hardware voltage at 0x0224
 and respects firmware's software/hardware voltage selection at 0x0216.
-The DT constrains VPROC to 1.15 V for the currently supported table.
+The DT constrains VPROC to 1.15--1.3 V; cpufreq-dt increases voltage before
+increasing frequency, and decreases frequency before lowering voltage.
 Schedutil is the default governor, with shared frequency statistics and
 Android UID time-in-state accounting. All CPUs have equal capacity.
 RT group scheduling defaults to disabled, retaining global RT throttling,
@@ -852,3 +854,52 @@ with screen_off_timeout retained at 60000 ms; the product default was
 already false. The temporary a1260-bringup kernel wake lock has been
 removed from the vendor init script after the wakeup tests. Holding an
 explicit maintenance lock during a host update is not a boot-time policy.
+
+
+Calibrated SoC thermal monitoring and USB standby policy
+------------------------------------------------------
+
+The thermal controller at 0x1100d000 controls AP AUXADC channel 11 via
+AHB. Its one bank contains three MCU sensors, selected with mux values
+0, 1 and 2; the MT2701 ABB mux value 16 does not apply. TOPCKGEN gates
+CLK_GATING_CTRL1[1] and [30] supply the thermal and AUXADC clocks.
+The sensor buffer is TS_CON0[7:6] at APMIXED+0x600, while sensor selection
+uses TS_CON1 at +0x604. The BSP gain, ADC offset, temperature, sensor
+voltage and signed slope conversion retain their integer rounding.
+
+The read-only generic MediaTek eFuse provider supplies the thermal cell
+at offset 0x194, length 12 (BSP devinfo indices 36--38). Live eFuse reads
+match the original device backup; no per-device calibration words are
+hardcoded in the DTS. The thermal zone reports the maximum of all three
+sensors. The board currently uses a conservative 75 C passive trip with
+5 C hysteresis and cpufreq cooling, and a 105 C critical shutdown trip.
+These are bring-up board policy limits, not characterized silicon limits.
+Critical shutdown has not been induced on hardware. Suspend pauses the
+thermal AHB master, waits for idle and switches off the analog buffer;
+resume restores channel 11, the buffer and all three sampling points.
+
+An active MT6580 peripheral USB bus holds the MUSB device wakeup source,
+as the BSP USB connection lock did. Bus RESET/RESUME acquires it;
+SUSPEND/DISCONNECT and stopping/unbinding the gadget release it. A PC
+connection can therefore keep ADB available with the screen off. This
+is not a permanent boot-time lock or a blanket charging lock. USB host
+suspend/resume preservation remains a separate hardware requirement;
+the current PHY forces device VBUS/session validity. Screen locking and
+backlight shutoff remain under Android control; stay_on_while_plugged_in
+is zero and the current screen timeout is 60 seconds.
+
+Initial thermal/DVFS validation reads approximately 39--58 C over idle,
+Android startup and the short CPU checks. Lowering only the passive trip
+from 75 C to 35 C temporarily reduced the policy cap from 1001 to
+903.5 MHz; restoring 75 C restored the cap. Two rounds over all seven
+OPPs and repeated 604.5/1300 MHz transitions pass integer hashes,
+400000 shared atomic updates per run and 7200 total cross-CPU clock
+migrations without time reversal. PLL PCWs and PMIC actual selector
+readbacks match the selected frequency and the voltage plateau above.
+These checks are short bring-up validation, not long-term qualification.
+
+With build #24, screen-off Android state is Asleep, the display suspend
+blocker is released and actual backlight PWM is 0/39347 ns. The USB
+wakeup source remains active and automatic suspend success stays at zero
+while ADB shell commands continue to complete. This distinguishes an
+intentional USB activity lock from forcing the display to stay on.

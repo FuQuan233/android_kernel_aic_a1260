@@ -5,6 +5,7 @@
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/pinctrl/mt65xx.h>
+#include <dt-bindings/thermal/thermal.h>
 
 / {
 	model = "Wingtech WT6580 WE N (JD9161)";
@@ -27,12 +28,66 @@
 		bootargs = "earlycon console=ttyS0,921600n8 rdinit=/init";
 	};
 
+	/* Conservative board limits while higher CPU OPPs are being qualified. */
+	thermal-zones {
+		soc-thermal {
+			polling-delay-passive = <250>;
+			polling-delay = <1000>;
+			thermal-sensors = <&thermal 0>;
+			trips {
+				soc_passive: passive {
+					temperature = <75000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				soc_critical: critical {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
+			cooling-maps {
+				map0 {
+					trip = <&soc_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+	};
+
+	efuse: efuse@10009000 {
+		compatible = "mediatek,mt6580-efuse", "mediatek,efuse";
+		reg = <0 0x10009000 0 0x1000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		thermal_calibration: calibration@194 {
+			reg = <0x194 0xc>;
+		};
+	};
+
+	auxadc: adc@11003000 {
+		compatible = "mediatek,mt6580-auxadc";
+		reg = <0 0x11003000 0 0x1000>;
+	};
+
+	thermal: thermal@1100d000 {
+		compatible = "mediatek,mt6580-thermal";
+		reg = <0 0x1100d000 0 0x1000>;
+		interrupts = <GIC_SPI 37 IRQ_TYPE_LEVEL_LOW>;
+		clocks = <&topckgen CLK_MT6580_TOP_THERM>,
+			 <&topckgen CLK_MT6580_TOP_AUXADC>;
+		clock-names = "therm", "auxadc";
+		mediatek,auxadc = <&auxadc>;
+		mediatek,apmixedsys = <&apmixedsys>;
+		nvmem-cells = <&thermal_calibration>;
+		nvmem-cell-names = "calibration-data";
+		#thermal-sensor-cells = <1>;
+	};
+
 	cpu_opp_table: opp-table-cpu {
 		compatible = "operating-points-v2";
 		opp-shared;
-		/* The level-0 BSP uses 1.15 V for all four low-frequency OPPs.
-		 * Keep the boot voltage; higher OPPs need bin/thermal validation.
-		 */
+		/* MT6580 BSP level-0 (1.3 GHz segment), without undervolting. */
 		opp-604500000 {
 			opp-hz = /bits/ 64 <604500000>;
 			opp-microvolt = <1150000>;
@@ -52,6 +107,24 @@
 		opp-1001000000 {
 			opp-hz = /bits/ 64 <1001000000>;
 			opp-microvolt = <1150000>;
+			clock-latency-ns = <100000>;
+		};
+		opp-1105000000 {
+			opp-hz = /bits/ 64 <1105000000>;
+			opp-microvolt = <1193750>;
+			clock-latency-ns = <100000>;
+		};
+		opp-1209000000 {
+			opp-hz = /bits/ 64 <1209000000>;
+			opp-microvolt = <1225000>;
+			clock-latency-ns = <100000>;
+		};
+		opp-1300000000 {
+			opp-hz = /bits/ 64 <1300000000>;
+			/* BSP requests 1.30625 V, but this PMIC reports code 0x60
+			 * (1.3 V) even with target 0x61. Use the measured plateau.
+			 */
+			opp-microvolt = <1300000>;
 			clock-latency-ns = <100000>;
 		};
 	};
@@ -465,9 +538,9 @@
 
 			vproc: buck_vproc {
 				regulator-name = "vproc";
-				/* BSP level-0 OPPs at or below the verified boot clock. */
+				/* BSP level-0 OPP range; never undervolt the MAINPLL handover. */
 				regulator-min-microvolt = <1150000>;
-				regulator-max-microvolt = <1150000>;
+				regulator-max-microvolt = <1300000>;
 				regulator-always-on;
 				regulator-boot-on;
 			};
@@ -749,6 +822,7 @@
 
 /* All inherited MMIO ranges must follow the board's two-cell root. */
 &cpu0 {
+	#cooling-cells = <2>;
 	clocks = <&apmixedsys CLK_MT6580_APMIXED_CPU>;
 	operating-points-v2 = <&cpu_opp_table>;
 	cpu-supply = <&vproc>;

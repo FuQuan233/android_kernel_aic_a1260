@@ -19,7 +19,7 @@ struct mt6580_cpu_clk {
 	void __iomem *infra;
 };
 
-/* BSP low-frequency OPPs. The cluster shares one ARMPLL and divider. */
+/* BSP level-0 OPPs. The cluster shares one ARMPLL and divider. */
 static const struct {
 	unsigned long rate;
 	u32 pcw;
@@ -29,6 +29,9 @@ static const struct {
 	{ 754000000, 0x010e8000, 8 },
 	{ 903500000, 0x01116000, 8 },
 	{ 1001000000, 0x0009a000, 8 },
+	{ 1105000000, 0x000aa000, 8 },
+	{ 1209000000, 0x000ba000, 8 },
+	{ 1300000000, 0x000c8000, 8 },
 };
 
 static unsigned long mt6580_cpu_recalc_rate(struct clk_hw *hw,
@@ -75,7 +78,8 @@ static int mt6580_cpu_set_rate(struct clk_hw *hw, unsigned long rate,
 		return -EINVAL;
 
 	/* Follow the BSP MAINPLL handover; never reprogram the live CPU PLL.
-	 * All supported OPPs retain the BSP's 1.15 V intermediate voltage.
+	 * cpufreq-dt raises VPROC before increasing the clock and lowers it
+	 * after decreasing the clock. All OPPs meet MAINPLL's 1.15 V minimum.
 	 * Preserve unrelated mux, gate and divider bits, including firmware DCM.
 	 */
 	spin_lock_irqsave(&mt6580_usb_clk_lock, flags);
@@ -175,7 +179,7 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	if (of_device_is_compatible(dev->of_node, "mediatek,mt6580-mfgcfg"))
 		return mtk_clk_simple_probe(pdev);
 	if (top)
-		count = 9;
+		count = 11;
 
 	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
@@ -186,6 +190,12 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	data->num = count;
 
 	if (top) {
+		data->hws[CLK_MT6580_TOP_THERM] = devm_clk_hw_register_gate(dev,
+			"mt6580_therm", NULL, 0, base + 0x24, 1,
+			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
+		data->hws[CLK_MT6580_TOP_AUXADC] = devm_clk_hw_register_gate(dev,
+			"mt6580_auxadc", NULL, 0, base + 0x24, 30,
+			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 		/* Keep LK's mux selection; rates from the MT6580 clock manager. */
 		static const unsigned long msdc_rates[] = {
 			125130000, 150150000, 187690000, 178280000,
