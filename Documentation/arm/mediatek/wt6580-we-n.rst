@@ -741,3 +741,50 @@ range to hardware levels 4..255; the separate ``bl_power`` path still blanks
 to zero duty. Android's framework brightness range is unchanged.
 Deep system suspend and PMIC rail shutdown are separate unfinished work;
 the temporary Android bring-up wake lock remains.
+
+
+Physical remote keys on AW9523 and AW9106
+---------------------------------------
+
+The original device DT configures AW9523 on I2C1/0x5b (GPIO72 reset,
+GPIO4 active-low INTN) and AW9106 on I2C2/0x5b (GPIO73 SHDN, GPIO6 INTN).
+I2C2 uses GPIO60/SCL2, GPIO63/SDA2, APDMA 0x11000280 and SPI42; its clock
+gate is CLK_GATING_CTRL1 bit 16 (unlike I2C0/1 bits 3/4). I2C1 continues to share its bus with touch.
+
+The stock 3.18.79 kernel is the authority for the key topology and codes.
+The later, untracked 8x7 QWERTY source in the reference tree is unrelated.
+The stock AW9523 handler at 0xc0657384 reads INPUT0 and INPUT1 and reports
+16 independent active-high inputs; no matrix columns are scanned. Its key
+array at 0xc0a81868 is, in GPIO order::
+
+    106 60 103 28 59 105 108 158 139 63 62 61 115 114 102 64
+
+The AW9106 handler at 0xc0657f90 combines (INPUT_B & 0x0f) | (INPUT_A << 4).
+Its six-element array at 0xc0a81bf8 is 0,0,0,66,65,0: OUT3 and OUT4 are
+active-high keys, while remaining channels are reserved for LED functions.
+These are static findings, not confirmation of the physical button labels.
+
+AW9523 uses the existing pinctrl/GPIO driver; its reset descriptor uses the
+existing driver's raw-high convention. AW9106 has a six-line GPIO driver
+using OUT0..5 numbering, independent reads of both read-to-clear input banks,
+threaded nested interrupts and masks updated under a mutex. Only requested
+pins switch to GPIO, after being made inputs; LED channels are not configured by the GPIO driver.
+AW9106 SHDN is asserted low and released for at least 5 ms before I2C access.
+No pull-up/down is fabricated: the board supplies the input bias externally.
+
+The common gpio-keys device is named a1260-remote and uses 16 ms software
+debounce. Android's a1260-remote.kl preserves the original mtk-kpd.kl mapping,
+including Linux 60 -> HOME, 61 -> BACK, 28 -> DPAD_CENTER, 62/63 -> channel
+up/down, 158 -> F2 and 102 -> F3. Remaining function keys retain their
+original Android F-key identities; their factory IR/app actions are not
+implemented by merely reporting the keys.
+
+Reverse-engineering evidence is retained locally in out/a1260-keys-rea,
+including stock image identity, exact function slices, recovered symbols,
+raw key arrays and REA Evidence IDs. No stock kernel binary is committed.
+The owner confirms the physical responses and positions. The recording covers
+16 distinct key codes with balanced presses/releases, including both AW9106
+keys. After the I2C2 gate fix, both chips and gpio-keys register automatically
+on reboot. The existing AW9523 regmap now uses single-register reads to avoid
+the MT6580 adapter's combined-read limit; IRQ defaults are left unspecified
+until the GPIO consumer selects both edges.

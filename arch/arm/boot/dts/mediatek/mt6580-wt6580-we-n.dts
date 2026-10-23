@@ -19,11 +19,144 @@
 		mmc0 = &mmc0;
 		i2c0 = &i2c0;
 		i2c1 = &i2c1;
+		i2c2 = &i2c2;
 	};
 
 	chosen {
 		stdout-path = "serial0:921600n8";
 		bootargs = "earlycon console=ttyS0,921600n8 rdinit=/init";
+	};
+
+	/* Native GPIO/scan-code order recovered from the original 3.18 kernel. */
+	remote_keys: remote-keys {
+		compatible = "gpio-keys";
+		label = "a1260-remote";
+
+		key-0 {
+			label = "remote-aw9523-0";
+			linux,code = <KEY_RIGHT>;
+			gpios = <&remote_gpio 0 GPIO_ACTIVE_HIGH>;
+			debounce-interval = <16>;
+		};
+
+		key-1 {
+			label = "remote-aw9523-1";
+			linux,code = <KEY_F2>;
+			gpios = <&remote_gpio 1 GPIO_ACTIVE_HIGH>;
+			debounce-interval = <16>;
+		};
+
+		key-2 {
+			label = "remote-aw9523-2";
+			linux,code = <KEY_UP>;
+			gpios = <&remote_gpio 2 GPIO_ACTIVE_HIGH>;
+			debounce-interval = <16>;
+		};
+
+		key-3 {
+			label = "remote-aw9523-3";
+			linux,code = <KEY_ENTER>;
+			gpios = <&remote_gpio 3 GPIO_ACTIVE_HIGH>;
+			debounce-interval = <16>;
+		};
+
+		key-4 {
+			label = "remote-aw9523-4";
+			linux,code = <KEY_F1>;
+			gpios = <&remote_gpio 4 GPIO_ACTIVE_HIGH>;
+			debounce-interval = <16>;
+		};
+
+		key-5 {
+			label = "remote-aw9523-5";
+			linux,code = <KEY_LEFT>;
+			gpios = <&remote_gpio 5 GPIO_ACTIVE_HIGH>;
+			debounce-interval = <16>;
+		};
+
+		key-6 {
+			label = "remote-aw9523-6";
+			linux,code = <KEY_DOWN>;
+			gpios = <&remote_gpio 6 GPIO_ACTIVE_HIGH>;
+			debounce-interval = <16>;
+		};
+
+		key-7 {
+			label = "remote-aw9523-7";
+			linux,code = <KEY_BACK>;
+			gpios = <&remote_gpio 7 GPIO_ACTIVE_HIGH>;
+			debounce-interval = <16>;
+		};
+
+		key-8 {
+			label = "remote-aw9523-8";
+			linux,code = <KEY_MENU>;
+			gpios = <&remote_gpio 8 GPIO_ACTIVE_HIGH>;
+			debounce-interval = <16>;
+		};
+
+		key-9 {
+			label = "remote-aw9523-9";
+			linux,code = <KEY_F5>;
+			gpios = <&remote_gpio 9 GPIO_ACTIVE_HIGH>;
+			debounce-interval = <16>;
+		};
+
+		key-10 {
+			label = "remote-aw9523-10";
+			linux,code = <KEY_F4>;
+			gpios = <&remote_gpio 10 GPIO_ACTIVE_HIGH>;
+			debounce-interval = <16>;
+		};
+
+		key-11 {
+			label = "remote-aw9523-11";
+			linux,code = <KEY_F3>;
+			gpios = <&remote_gpio 11 GPIO_ACTIVE_HIGH>;
+			debounce-interval = <16>;
+		};
+
+		key-12 {
+			label = "remote-aw9523-12";
+			linux,code = <KEY_VOLUMEUP>;
+			gpios = <&remote_gpio 12 GPIO_ACTIVE_HIGH>;
+			debounce-interval = <16>;
+		};
+
+		key-13 {
+			label = "remote-aw9523-13";
+			linux,code = <KEY_VOLUMEDOWN>;
+			gpios = <&remote_gpio 13 GPIO_ACTIVE_HIGH>;
+			debounce-interval = <16>;
+		};
+
+		key-14 {
+			label = "remote-aw9523-14";
+			linux,code = <KEY_HOME>;
+			gpios = <&remote_gpio 14 GPIO_ACTIVE_HIGH>;
+			debounce-interval = <16>;
+		};
+
+		key-15 {
+			label = "remote-aw9523-15";
+			linux,code = <KEY_F6>;
+			gpios = <&remote_gpio 15 GPIO_ACTIVE_HIGH>;
+			debounce-interval = <16>;
+		};
+
+		key-aw9106-3 {
+			label = "remote-aw9106-3";
+			linux,code = <KEY_F8>;
+			gpios = <&remote_aux_gpio 3 GPIO_ACTIVE_HIGH>;
+			debounce-interval = <16>;
+		};
+
+		key-aw9106-4 {
+			label = "remote-aw9106-4";
+			linux,code = <KEY_F7>;
+			gpios = <&remote_aux_gpio 4 GPIO_ACTIVE_HIGH>;
+			debounce-interval = <16>;
+		};
 	};
 
 	/* Battery characterization and NTC values from the MT6580 reference BSP. */
@@ -388,6 +521,30 @@
 			};
 		};
 
+		i2c2_pins: i2c2-pins {
+			pins {
+				pinmux = <(MTK_PIN_NO(60) | 1)>,
+					 <(MTK_PIN_NO(63) | 1)>;
+				input-enable;
+			};
+		};
+
+		remote_irq_pin: remote-irq-pin {
+			pins {
+				pinmux = <(MTK_PIN_NO(4) | 6)>;
+				input-enable;
+				bias-disable;
+			};
+		};
+
+		remote_aux_irq_pin: remote-aux-irq-pin {
+			pins {
+				pinmux = <(MTK_PIN_NO(6) | 6)>;
+				input-enable;
+				bias-disable;
+			};
+		};
+
 		touch_pins: touch-pins {
 			pins {
 				pinmux = <(MTK_PIN_NO(5) | 6)>;
@@ -439,6 +596,22 @@
 		#address-cells = <1>;
 		#size-cells = <0>;
 
+		remote_gpio: gpio@5b {
+			compatible = "awinic,aw9523-pinctrl";
+			reg = <0x5b>;
+			interrupt-parent = <&pio>;
+			interrupts = <4 IRQ_TYPE_LEVEL_LOW>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			gpio-ranges = <&remote_gpio 0 0 16>;
+			/* This driver expresses RSTN as raw low then raw high. */
+			reset-gpios = <&pio 72 GPIO_ACTIVE_HIGH>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&remote_irq_pin>;
+		};
+
 		touchscreen@38 {
 			compatible = "focaltech,ft6336u";
 			reg = <0x38>;
@@ -450,6 +623,35 @@
 			vcc-supply = <&vtouch>;
 			touchscreen-size-x = <480>;
 			touchscreen-size-y = <800>;
+		};
+	};
+
+	i2c2: i2c@1100b000 {
+		compatible = "mediatek,mt6580-i2c";
+		reg = <0 0x1100b000 0 0x1000>, <0 0x11000280 0 0x80>;
+		interrupts = <GIC_SPI 42 IRQ_TYPE_LEVEL_LOW>;
+		clocks = <&topckgen CLK_MT6580_TOP_I2C2>,
+			 <&topckgen CLK_MT6580_TOP_APDMA>;
+		clock-names = "main", "dma";
+		clock-div = <10>;
+		clock-frequency = <100000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&i2c2_pins>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		remote_aux_gpio: gpio@5b {
+			compatible = "awinic,aw9106";
+			reg = <0x5b>;
+			interrupt-parent = <&pio>;
+			interrupts = <6 IRQ_TYPE_LEVEL_LOW>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			reset-gpios = <&pio 73 GPIO_ACTIVE_LOW>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&remote_aux_irq_pin>;
 		};
 	};
 

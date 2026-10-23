@@ -1122,6 +1122,18 @@ config GPIO_ADNP
 	  enough to represent all pins, but the driver will assume a
 	  register layout for 64 pins (8 registers).
 
+config GPIO_AW9106
+	tristate "Awinic AW9106 I2C GPIO expander"
+	select GPIOLIB_IRQCHIP
+	select REGMAP_I2C
+	help
+	  GPIO and interrupt support for the six multifunction I/O pins of
+	  the Awinic AW9106. GPIO offsets correspond to OUT0 through OUT5.
+	  Only requested channels are switched to GPIO mode.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called gpio-aw9106.
+
 config GPIO_FXL6408
 	tristate "FXL6408 I2C GPIO expander"
 	select GPIO_REGMAP

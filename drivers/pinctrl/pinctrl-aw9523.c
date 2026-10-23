@@ -831,7 +831,7 @@ static int aw9523_init_irq(struct aw9523 *awi, int irq)
 	girq->parent_handler = NULL;
 	girq->num_parents = 0;
 	girq->parents = NULL;
-	girq->default_type = IRQ_TYPE_EDGE_BOTH;
+	girq->default_type = IRQ_TYPE_NONE;
 	girq->handler = handle_simple_irq;
 	girq->threaded = true;
 
@@ -878,6 +878,8 @@ static const struct regmap_config aw9523_regmap = {
 	.reg_bits = 8,
 	.val_bits = 8,
 	.reg_stride = 1,
+	/* Some I2C adapters cannot read the full default cache in one transfer. */
+	.use_single_read = true,
 
 	.precious_reg = aw9523_precious_reg,
 	.readable_reg = aw9523_readable_reg,

@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/gpio/awinic,aw9106.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Awinic AW9106 GPIO controller
+
+maintainers:
+  - FuQuan <i@fuquan.moe>
+
+description: |
+  The AW9106 provides six I/O channels that can operate as GPIOs or LED
+  outputs. GPIO offsets 0 through 5 correspond to the OUT0 through OUT5
+  package pin names. OUT0 through OUT3 occupy bits 0 through 3 of register
+  bank 1, while OUT4 and OUT5 occupy bits 0 and 1 of bank 0.
+
+  GPIO inputs require external bias resistors; the active-low INTN output
+  requires an external pull-up.
+  Only channels requested as GPIOs are switched to GPIO mode. The GPIO
+  driver does not configure the remaining channels as LED outputs.
+
+properties:
+  compatible:
+    const: awinic,aw9106
+
+  reg:
+    maxItems: 1
+
+  gpio-controller: true
+
+  '#gpio-cells':
+    const: 2
+
+  gpio-line-names:
+    maxItems: 6
+
+  interrupt-controller: true
+
+  '#interrupt-cells':
+    const: 2
+    description: GPIO offset and interrupt flags; both-edge interrupts only.
+
+  interrupts:
+    maxItems: 1
+    description: The active-low INTN output.
+
+  reset-gpios:
+    maxItems: 1
+    description: The active-low SHDN reset input.
+
+required:
+  - compatible
+  - reg
+  - gpio-controller
+  - '#gpio-cells'
+  - reset-gpios
+
+dependencies:
+  interrupt-controller: [ interrupts, '#interrupt-cells' ]
+  '#interrupt-cells': [ interrupt-controller ]
+  interrupts: [ interrupt-controller ]
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        gpio-expander@5b {
+            compatible = "awinic,aw9106";
+            reg = <0x5b>;
+            gpio-controller;
+            #gpio-cells = <2>;
+            interrupt-controller;
+            #interrupt-cells = <2>;
+            interrupt-parent = <&pio>;
+            interrupts = <6 IRQ_TYPE_LEVEL_LOW>;
+            reset-gpios = <&pio 73 GPIO_ACTIVE_LOW>;
+        };
+    };

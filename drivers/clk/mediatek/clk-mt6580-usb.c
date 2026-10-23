@@ -60,7 +60,7 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	if (of_device_is_compatible(dev->of_node, "mediatek,mt6580-mfgcfg"))
 		return mtk_clk_simple_probe(pdev);
 	if (top)
-		count = 8;
+		count = 9;
 
 	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
@@ -103,6 +103,9 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 		data->hws[CLK_MT6580_TOP_I2C0] = devm_clk_hw_register_gate(dev,
 			"mt6580_i2c0", "mt6580_i2c_src", 0, base + 0x24, 3,
+			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
+		data->hws[CLK_MT6580_TOP_I2C2] = devm_clk_hw_register_gate(dev,
+			"mt6580_i2c2", "mt6580_i2c_src", 0, base + 0x24, 16,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 		data->hws[CLK_MT6580_TOP_APDMA] = devm_clk_hw_register_gate(dev,
 			"mt6580_apdma", "mt6580_i2c_src", 0, base + 0x24, 2,
