@@ -42,6 +42,7 @@ properties:
       - items:
           - enum:
               - mediatek,mt7622-efuse
+              - mediatek,mt6580-efuse
               - mediatek,mt7623-efuse
               - mediatek,mt7981-efuse
               - mediatek,mt7986-efuse
