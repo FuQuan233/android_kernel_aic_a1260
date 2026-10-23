@@ -27,6 +27,35 @@
 		bootargs = "earlycon console=ttyS0,921600n8 rdinit=/init";
 	};
 
+	cpu_opp_table: opp-table-cpu {
+		compatible = "operating-points-v2";
+		opp-shared;
+		/* The level-0 BSP uses 1.15 V for all four low-frequency OPPs.
+		 * Keep the boot voltage; higher OPPs need bin/thermal validation.
+		 */
+		opp-604500000 {
+			opp-hz = /bits/ 64 <604500000>;
+			opp-microvolt = <1150000>;
+			clock-latency-ns = <100000>;
+			opp-suspend;
+		};
+		opp-754000000 {
+			opp-hz = /bits/ 64 <754000000>;
+			opp-microvolt = <1150000>;
+			clock-latency-ns = <100000>;
+		};
+		opp-903500000 {
+			opp-hz = /bits/ 64 <903500000>;
+			opp-microvolt = <1150000>;
+			clock-latency-ns = <100000>;
+		};
+		opp-1001000000 {
+			opp-hz = /bits/ 64 <1001000000>;
+			opp-microvolt = <1150000>;
+			clock-latency-ns = <100000>;
+		};
+	};
+
 	/* Native GPIO/scan-code order recovered from the original 3.18 kernel. */
 	remote_keys: remote-keys {
 		compatible = "gpio-keys";
@@ -434,6 +463,15 @@
 		regulators {
 			compatible = "mediatek,mt6350-regulator";
 
+			vproc: buck_vproc {
+				regulator-name = "vproc";
+				/* BSP level-0 OPPs at or below the verified boot clock. */
+				regulator-min-microvolt = <1150000>;
+				regulator-max-microvolt = <1150000>;
+				regulator-always-on;
+				regulator-boot-on;
+			};
+
 			vtouch: ldo_vgp1 {
 				regulator-name = "vtouch";
 				regulator-min-microvolt = <2800000>;
@@ -466,6 +504,11 @@
 				monitored-battery = <&battery_cell>;
 				power-supplies = <&charger>;
 			};
+
+			rtc {
+				compatible = "mediatek,mt6350-rtc";
+				wakeup-source;
+			};
 		};
 	};
 
@@ -477,7 +520,7 @@
 
 	apmixedsys: clock-controller@10018000 {
 		compatible = "mediatek,mt6580-apmixedsys";
-		reg = <0 0x10018000 0 0x1000>;
+		reg = <0 0x10018000 0 0x1000>, <0 0x10001000 0 0x1000>;
 		#clock-cells = <1>;
 	};
 
@@ -705,6 +748,34 @@
 };
 
 /* All inherited MMIO ranges must follow the board's two-cell root. */
+&cpu0 {
+	clocks = <&apmixedsys CLK_MT6580_APMIXED_CPU>;
+	operating-points-v2 = <&cpu_opp_table>;
+	cpu-supply = <&vproc>;
+	capacity-dmips-mhz = <1024>;
+};
+
+&cpu1 {
+	clocks = <&apmixedsys CLK_MT6580_APMIXED_CPU>;
+	operating-points-v2 = <&cpu_opp_table>;
+	cpu-supply = <&vproc>;
+	capacity-dmips-mhz = <1024>;
+};
+
+&cpu2 {
+	clocks = <&apmixedsys CLK_MT6580_APMIXED_CPU>;
+	operating-points-v2 = <&cpu_opp_table>;
+	cpu-supply = <&vproc>;
+	capacity-dmips-mhz = <1024>;
+};
+
+&cpu3 {
+	clocks = <&apmixedsys CLK_MT6580_APMIXED_CPU>;
+	operating-points-v2 = <&cpu_opp_table>;
+	cpu-supply = <&vproc>;
+	capacity-dmips-mhz = <1024>;
+};
+
 &timer {
 	reg = <0 0x10008000 0 0x80>;
 };

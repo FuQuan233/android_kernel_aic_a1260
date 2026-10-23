@@ -67,6 +67,7 @@ properties:
           - enum:
               - mediatek,mt6323-rtc
               - mediatek,mt6331-rtc
+              - mediatek,mt6350-rtc
               - mediatek,mt6358-rtc
               - mediatek,mt6397-rtc
           - items:

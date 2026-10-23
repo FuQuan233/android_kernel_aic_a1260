@@ -2,6 +2,13 @@
 #
 # ARM CPU Idle drivers
 #
+config ARM_MT6580_CPUIDLE
+	bool "CPU idle driver for MediaTek MT6580"
+	depends on ARCH_MEDIATEK && ARM
+	help
+	  Register Cortex-A7 WFI standby idle and its accounting. This does not
+	  power down the cluster or DDR, which require a separate SPM backend.
+
 config ARM_CPUIDLE
 	bool "Generic ARM CPU idle Driver"
 	depends on ARM

@@ -65,6 +65,8 @@
 
 struct mtk_rtc_data {
 	u32                     wrtgr;
+	bool                    unlock;
+	u8                      year_offset;
 };
 
 struct mt6397_rtc {

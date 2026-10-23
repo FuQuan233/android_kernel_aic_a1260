@@ -11,6 +11,9 @@
 #include <linux/smp.h>
 
 #include <asm/barrier.h>
+#include <asm/cacheflush.h>
+#include <asm/cp15.h>
+#include <asm/proc-fns.h>
 #include <asm/smp_plat.h>
 
 #define MT6580_INFRACFG_AO	0x10001000
@@ -117,9 +120,66 @@ static void __init mt6580_smp_prepare_cpus(unsigned int max_cpus)
 	writel(__pa_symbol(secondary_startup_arm), mt6580_infracfg + BOOT_ADDR);
 }
 
+#ifdef CONFIG_HOTPLUG_CPU
+static int mt6580_cpu_disable(unsigned int cpu)
+{
+	return cpu_logical_map(cpu) ? 0 : -EPERM;
+}
+
+static void mt6580_cpu_die(unsigned int cpu)
+{
+	/* Leave the shared L2 coherent for the other cores before SPM isolation. */
+	v7_exit_coherency_flush(louis);
+	for (;;)
+		cpu_do_idle();
+}
+
+static int mt6580_cpu_kill(unsigned int cpu)
+{
+	unsigned int id = cpu_logical_map(cpu);
+	u32 power = 0x218 + (id - 1) * 4;
+	u32 l1 = 0x264 + (id - 1) * 8;
+	u32 mask = BIT(13 - id), val;
+	int ret;
+
+	/* SLEEP_TIMER_STA has a separate STANDBYWFI bit for each A7 core. */
+	ret = readl_poll_timeout(mt6580_spm + 0x720, val,
+				val & BIT(16 + id), 10, 100000);
+	if (ret)
+		goto timeout;
+	writel(SPM_REGWR_EN, mt6580_spm + POWERON_CONFIG_EN);
+	mt6580_spm_update(power, 0, PWR_ISO | SRAM_CKISO);
+	mt6580_spm_update(power, SRAM_ISOINT_B, 0);
+	mt6580_spm_update(l1, 0, L1_PDN);
+	ret = readl_poll_timeout(mt6580_spm + l1, val,
+				val & L1_PDN_ACK, 1, 100000);
+	if (ret)
+		goto timeout;
+	mt6580_spm_update(power, PWR_RST_B, PWR_CLK_DIS);
+	mt6580_spm_update(power, PWR_ON | PWR_ON_2ND, 0);
+	ret = readl_poll_timeout(mt6580_spm + PWR_STATUS, val,
+				!(val & mask), 1, 100000);
+	if (ret)
+		goto timeout;
+	ret = readl_poll_timeout(mt6580_spm + PWR_STATUS_2ND, val,
+				!(val & mask), 1, 100000);
+	if (!ret)
+		return 1;
+timeout:
+	pr_err("MT6580: CPU%u power-down timed out: WFI=%#x power=%#x L1=%#x\n",
+	       cpu, readl(mt6580_spm + 0x720), readl(mt6580_spm + power),
+	       readl(mt6580_spm + l1));
+	return 0;
+}
+#endif
+
 static const struct smp_operations mt6580_smp_ops __initconst = {
 	.smp_prepare_cpus = mt6580_smp_prepare_cpus,
 	.smp_boot_secondary = mt6580_boot_secondary,
-	/* No cpu_die: refuse hot-unplug until the power-down path is ported. */
+#ifdef CONFIG_HOTPLUG_CPU
+	.cpu_disable = mt6580_cpu_disable,
+	.cpu_die = mt6580_cpu_die,
+	.cpu_kill = mt6580_cpu_kill,
+#endif
 };
 CPU_METHOD_OF_DECLARE(mt6580_smp, "mediatek,mt6580-smp", &mt6580_smp_ops);

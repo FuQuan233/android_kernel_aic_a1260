@@ -142,6 +142,13 @@ static int mt6397_irq_pm_notifier(struct notifier_block *notifier,
 
 	switch (pm_event) {
 	case PM_SUSPEND_PREPARE:
+		/* MT6350 children arm their wake IRQs in ->suspend(). Apply
+		 * their mask in the parent's late phase, after those callbacks.
+		 */
+		if (chip->chip_id == MT6350_CHIP_ID) {
+			enable_irq_wake(chip->irq);
+			break;
+		}
 		regmap_write(chip->regmap,
 			     chip->int_con[0], chip->wake_mask[0]);
 		regmap_write(chip->regmap,
@@ -153,6 +160,10 @@ static int mt6397_irq_pm_notifier(struct notifier_block *notifier,
 		break;
 
 	case PM_POST_SUSPEND:
+		if (chip->chip_id == MT6350_CHIP_ID) {
+			disable_irq_wake(chip->irq);
+			break;
+		}
 		regmap_write(chip->regmap,
 			     chip->int_con[0], chip->irq_masks_cur[0]);
 		regmap_write(chip->regmap,
@@ -168,6 +179,36 @@ static int mt6397_irq_pm_notifier(struct notifier_block *notifier,
 	}
 
 	return NOTIFY_DONE;
+}
+
+int mt6350_irq_suspend_late(struct device *dev)
+{
+	struct mt6397_chip *chip = dev_get_drvdata(dev);
+	int i, ret;
+
+	if (chip->chip_id != MT6350_CHIP_ID)
+		return 0;
+	for (i = 0; i < 2; i++) {
+		ret = regmap_write(chip->regmap, chip->int_con[i], chip->wake_mask[i]);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+int mt6350_irq_resume_early(struct device *dev)
+{
+	struct mt6397_chip *chip = dev_get_drvdata(dev);
+	int i, ret;
+
+	if (chip->chip_id != MT6350_CHIP_ID)
+		return 0;
+	for (i = 0; i < 2; i++) {
+		ret = regmap_write(chip->regmap, chip->int_con[i], chip->irq_masks_cur[i]);
+		if (ret)
+			return ret;
+	}
+	return 0;
 }
 
 int mt6397_irq_init(struct mt6397_chip *chip)

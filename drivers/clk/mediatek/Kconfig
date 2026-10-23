@@ -19,12 +19,12 @@ config COMMON_CLK_MEDIATEK_FHCTL
 	  spread spectrum clocking features.
 
 config COMMON_CLK_MT6580_USB
-	bool "MT6580 USB and display clock subset"
+	bool "MT6580 CPU, peripheral and display clock subset"
 	depends on ARCH_MEDIATEK || COMPILE_TEST
 	help
 	  Register the USB bus gate in TOPCKGEN and the two 48 MHz gates
-	  in APMIXEDSYS. This is an initial USB subset of the MT6580 clock
-	  tree; PLL frequency programming remains under firmware control.
+	  in APMIXEDSYS. Also register the shared ARMPLL CPU clock with
+	  MAINPLL handover for the BSP's 604.5 through 1001 MHz OPPs.
 	  Also register the MMSYS display clocks used by the optional DRM
 	  path. MMSYS0 clocks retain the BSP always-on policy. Enable this
 	  for the wt6580_we_n bring-up images.

@@ -154,6 +154,11 @@ static const struct resource mt6350_keys_resources[] = {
 	DEFINE_RES_IRQ_NAMED(MT6350_IRQ_FCHRKEY, "homekey"),
 };
 
+static const struct resource mt6350_rtc_resources[] = {
+	DEFINE_RES_MEM(0x8000, 0x40),
+	DEFINE_RES_IRQ(MT6350_IRQ_RTC),
+};
+
 static const struct mfd_cell mt6350_devs[] = {
 	{
 		.name = "mt6350-keys",
@@ -163,6 +168,11 @@ static const struct mfd_cell mt6350_devs[] = {
 	}, {
 		.name = "mt6350-battery",
 		.of_compatible = "mediatek,mt6350-battery",
+	}, {
+		.name = "mt6350-rtc",
+		.of_compatible = "mediatek,mt6350-rtc",
+		.resources = mt6350_rtc_resources,
+		.num_resources = ARRAY_SIZE(mt6350_rtc_resources),
 	},
 };
 
@@ -460,11 +470,16 @@ static const struct platform_device_id mt6397_id[] = {
 };
 MODULE_DEVICE_TABLE(platform, mt6397_id);
 
+static const struct dev_pm_ops mt6397_pm_ops = {
+	LATE_SYSTEM_SLEEP_PM_OPS(mt6350_irq_suspend_late, mt6350_irq_resume_early)
+};
+
 static struct platform_driver mt6397_driver = {
 	.probe = mt6397_probe,
 	.driver = {
 		.name = "mt6397",
 		.of_match_table = mt6397_of_match,
+		.pm = pm_sleep_ptr(&mt6397_pm_ops),
 	},
 	.id_table = mt6397_id,
 };

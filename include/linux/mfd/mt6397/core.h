@@ -78,5 +78,7 @@ struct mt6397_chip {
 
 int mt6358_irq_init(struct mt6397_chip *chip);
 int mt6397_irq_init(struct mt6397_chip *chip);
+int mt6350_irq_suspend_late(struct device *dev);
+int mt6350_irq_resume_early(struct device *dev);
 
 #endif /* __MFD_MT6397_CORE_H__ */

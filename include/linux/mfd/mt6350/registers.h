@@ -22,5 +22,6 @@
 #define MT6350_IRQ_PWRKEY		5
 #define MT6350_IRQ_CHRDET		10
 #define MT6350_IRQ_FCHRKEY	17
+#define MT6350_IRQ_RTC		20
 
 #endif

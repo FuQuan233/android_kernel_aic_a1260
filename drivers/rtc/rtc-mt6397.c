@@ -77,7 +77,7 @@ static int __mtk_rtc_read_time(struct mt6397_rtc *rtc,
 	tm->tm_mday = data[RTC_OFFSET_DOM];
 	tm->tm_wday = data[RTC_OFFSET_DOW];
 	tm->tm_mon = data[RTC_OFFSET_MTH] & RTC_TC_MTH_MASK;
-	tm->tm_year = data[RTC_OFFSET_YEAR];
+	tm->tm_year = data[RTC_OFFSET_YEAR] + rtc->data->year_offset;
 
 	ret = regmap_read(rtc->regmap, rtc->addr_base + RTC_TC_SEC, sec);
 exit:
@@ -119,7 +119,7 @@ static int mtk_rtc_set_time(struct device *dev, struct rtc_time *tm)
 	data[RTC_OFFSET_DOM] = tm->tm_mday;
 	data[RTC_OFFSET_DOW] = tm->tm_wday;
 	data[RTC_OFFSET_MTH] = tm->tm_mon;
-	data[RTC_OFFSET_YEAR] = tm->tm_year;
+	data[RTC_OFFSET_YEAR] = tm->tm_year - rtc->data->year_offset;
 
 	mutex_lock(&rtc->lock);
 	ret = regmap_bulk_write(rtc->regmap, rtc->addr_base + RTC_TC_SEC,
@@ -165,7 +165,7 @@ static int mtk_rtc_read_alarm(struct device *dev, struct rtc_wkalrm *alm)
 	tm->tm_hour = data[RTC_OFFSET_HOUR] & RTC_AL_HOU_MASK;
 	tm->tm_mday = data[RTC_OFFSET_DOM] & RTC_AL_DOM_MASK;
 	tm->tm_mon = data[RTC_OFFSET_MTH] & RTC_AL_MTH_MASK;
-	tm->tm_year = data[RTC_OFFSET_YEAR] & RTC_AL_YEA_MASK;
+	tm->tm_year = (data[RTC_OFFSET_YEAR] & RTC_AL_YEA_MASK) + rtc->data->year_offset;
 
 	tm->tm_mon--;
 
@@ -201,7 +201,7 @@ static int mtk_rtc_set_alarm(struct device *dev, struct rtc_wkalrm *alm)
 	data[RTC_OFFSET_MTH] = ((data[RTC_OFFSET_MTH] & ~(RTC_AL_MTH_MASK)) |
 				(tm->tm_mon & RTC_AL_MTH_MASK));
 	data[RTC_OFFSET_YEAR] = ((data[RTC_OFFSET_YEAR] & ~(RTC_AL_YEA_MASK)) |
-				(tm->tm_year & RTC_AL_YEA_MASK));
+				((tm->tm_year - rtc->data->year_offset) & RTC_AL_YEA_MASK));
 
 	if (alm->enabled) {
 		ret = regmap_bulk_write(rtc->regmap,
@@ -275,6 +275,19 @@ static int mtk_rtc_probe(struct platform_device *pdev)
 	if (IS_ERR(rtc->rtc_dev))
 		return PTR_ERR(rtc->rtc_dev);
 
+	/* MT6350's boot firmware may leave the RTC write interface locked. */
+	if (rtc->data->unlock) {
+		ret = regmap_write(rtc->regmap, rtc->addr_base + 0x36, 0x586a);
+		if (!ret)
+			ret = mtk_rtc_write_trigger(rtc);
+		if (!ret)
+			ret = regmap_write(rtc->regmap, rtc->addr_base + 0x36, 0x9136);
+		if (!ret)
+			ret = mtk_rtc_write_trigger(rtc);
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret, "RTC write unlock failed\n");
+	}
+
 	ret = devm_request_threaded_irq(&pdev->dev, rtc->irq, NULL,
 					mtk_rtc_irq_handler_thread,
 					IRQF_ONESHOT | IRQF_TRIGGER_HIGH,
@@ -293,6 +306,12 @@ static int mtk_rtc_probe(struct platform_device *pdev)
 	rtc->rtc_dev->range_max = mktime64(2027, 12, 31, 23, 59, 59);
 	rtc->rtc_dev->start_secs = mktime64(1968, 1, 2, 0, 0, 0);
 	rtc->rtc_dev->set_start_time = true;
+	if (rtc->data->year_offset) {
+		/* MT6350 stores year zero as 1968, matching its factory BSP. */
+		rtc->rtc_dev->range_min = mktime64(1968, 1, 1, 0, 0, 0);
+		rtc->rtc_dev->range_max = mktime64(2095, 12, 31, 23, 59, 59);
+		rtc->rtc_dev->set_start_time = false;
+	}
 
 	return devm_rtc_register_device(rtc->rtc_dev);
 }
@@ -330,8 +349,15 @@ static const struct mtk_rtc_data mt6397_rtc_data = {
 	.wrtgr = RTC_WRTGR_MT6397,
 };
 
+static const struct mtk_rtc_data mt6350_rtc_data = {
+	.wrtgr = RTC_WRTGR_MT6397,
+	.unlock = true,
+	.year_offset = 68,
+};
+
 static const struct of_device_id mt6397_rtc_of_match[] = {
 	{ .compatible = "mediatek,mt6323-rtc", .data = &mt6397_rtc_data },
+	{ .compatible = "mediatek,mt6350-rtc", .data = &mt6350_rtc_data },
 	{ .compatible = "mediatek,mt6357-rtc", .data = &mt6358_rtc_data },
 	{ .compatible = "mediatek,mt6358-rtc", .data = &mt6358_rtc_data },
 	{ .compatible = "mediatek,mt6397-rtc", .data = &mt6397_rtc_data },

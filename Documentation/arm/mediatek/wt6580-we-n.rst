@@ -548,9 +548,10 @@ the reference BSP's entry wrapper performs no additional work for cluster 0.
 SPM ``0x10006000`` powers CPU1--3, waits for both power status registers,
 restores L1 SRAM and removes isolation/clock gating before releasing reset.
 Polling has bounded timeouts so a failed power acknowledgement is logged
-instead of hanging the boot CPU indefinitely. CPU hot-unplug is deliberately
-unsupported until its power-down path is ported. CPU/GPU DVFS and system
-suspend remain separate tasks.
+instead of hanging the boot CPU indefinitely. CPU1--3 hot-unplug now flushes
+L1/coherency, waits for STANDBYWFI, isolates the core and powers down its
+L1 SRAM and power rails. CPU0 cannot be offlined. Re-online uses the same
+reset vector and SRAM power-on sequence as boot.
 
 ``tools/wt6580/smp-check.c`` is a native userspace hardware check. It pins
 four workers to CPUs 0--3, compares their integer results, verifies a shared
@@ -739,8 +740,8 @@ The Composer interface defines brightness 0.0 as minimum visible brightness
 and a negative value as off. The device HWC mapping therefore maps the active
 range to hardware levels 4..255; the separate ``bl_power`` path still blanks
 to zero duty. Android's framework brightness range is unchanged.
-Deep system suspend and PMIC rail shutdown are separate unfinished work;
-the temporary Android bring-up wake lock remains.
+SPM deep sleep and PMIC rail shutdown remain separate work. Standby s2idle
+and removal of the temporary Android wake lock are described below.
 
 
 Physical remote keys on AW9523 and AW9106
@@ -788,3 +789,66 @@ keys. After the I2C2 gate fix, both chips and gpio-keys register automatically
 on reboot. The existing AW9523 regmap now uses single-register reads to avoid
 the MT6580 adapter's combined-read limit; IRQ defaults are left unspecified
 until the GPIO consumer selects both edges.
+
+
+CPU frequency and standby sleep
+-----------------------------
+
+The four A7 cores share one cpufreq-dt policy and one ARMPLL clock.
+The supported rates are the BSP level-0 low-frequency OPPs: 604.5, 754,
+903.5 and 1001 MHz. Every OPP uses the BSP's 1.15 V. Firmware was measured
+at 1001 MHz / 1.15 V before enabling the driver. Higher frequencies and
+voltage reduction require speed-bin and thermal validation and are not
+enabled. This is frequency scaling at the stock voltage, not validated
+full-range voltage DVFS. The GPU's independent MPLL source is unchanged.
+
+The CPU clock uses the BSP's MAINPLL handover, PLL2 gate, ARMPLL PCW and
+post-divider settings and 20 us PLL settling time. It preserves unrelated
+INFRACFG bits. MT6350 VPROC reports the actual hardware voltage at 0x0224
+and respects firmware's software/hardware voltage selection at 0x0216.
+The DT constrains VPROC to 1.15 V for the currently supported table.
+Schedutil is the default governor, with shared frequency statistics and
+Android UID time-in-state accounting. All CPUs have equal capacity.
+RT group scheduling defaults to disabled, retaining global RT throttling,
+so Android task-profile groups without an RT runtime allocation can still
+run permitted SCHED_FIFO tasks. A7 SMT scheduling is disabled.
+
+The MT6580 cpuidle driver uses WFI for runtime idle and system standby.
+Its suspend-to-idle entry allows the generic core to freeze the per-CPU
+ticks and timekeeping; the physical counter continues across this light
+sleep and supplies elapsed time on resume. This is s2idle, not SPM cluster
+power-down or DDR self-refresh. Those deeper states require a separate
+SPM/PCM and CPU context-save port.
+
+The MT6350 RTC at 0x8000 uses the existing MediaTek RTC driver, PMIC IRQ20,
+the factory 1968 year origin and the two-key RTC write unlock. Its hardware
+calendar covers 1968--2095. Alarm and time writes preserve RTC reboot and
+factory scratch fields. PMIC wake masks are now applied in the parent late
+suspend callback, after the power-key and RTC children arm their IRQs. The
+old PM notifier applied an empty mask before those child callbacks ran.
+The PMIC parent EINT remains a wake source and normal masks are restored
+before the children resume.
+
+Hardware validation includes all four frequencies with matching register
+readback and integer/coherence checks, 6000 cross-CPU migrations without
+a monotonic-clock reversal, and three rounds of CPU1--3 power-off/on.
+Both SPM status registers confirmed all three core power bits clear while
+offline, and the four-core check passed after every restart. Device and
+noirq suspend/resume checks passed, followed by three RTC-triggered
+s2idle cycles and an Android SystemSuspend-triggered cycle. The final
+build eliminates repeated input-wakeup aborts by disabling the FT6336U
+IRQ before sending its hibernate command; automatic suspend then succeeds
+on its first attempt, with no reported suspend failures. ADB reconnects
+and the KMS framebuffer survives;
+the owner confirms power-key wake from actual standby, with display and
+touch intact. The physical-counter suspend-to-idle entry freezes timekeeping
+correctly, so Android counts sleep separately from suspend overhead.
+The final build completes two automatic suspend cycles (power-key and RTC
+wake), with success=2 and fail=0. Android accounts 61.382 seconds of sleep
+separately from 0.753 seconds of total suspend overhead.
+
+Android's existing stay_on_while_plugged_in setting was 15. It is now 0,
+with screen_off_timeout retained at 60000 ms; the product default was
+already false. The temporary a1260-bringup kernel wake lock has been
+removed from the vendor init script after the wakeup tests. Holding an
+explicit maintenance lock during a host update is not a boot-time policy.

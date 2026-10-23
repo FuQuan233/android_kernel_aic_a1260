@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Peripheral and GPU clocks from the MT6580 vendor clock manager. */
+/* CPU, peripheral and GPU clocks from the MT6580 vendor clock manager. */
 #include <linux/clk-provider.h>
+#include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -11,6 +12,120 @@
 #include <dt-bindings/clock/mt6580-clk.h>
 
 static DEFINE_SPINLOCK(mt6580_usb_clk_lock);
+
+struct mt6580_cpu_clk {
+	struct clk_hw hw;
+	void __iomem *pll;
+	void __iomem *infra;
+};
+
+/* BSP low-frequency OPPs. The cluster shares one ARMPLL and divider. */
+static const struct {
+	unsigned long rate;
+	u32 pcw;
+	u32 div;
+} mt6580_cpu_rates[] = {
+	{ 604500000, 0x000ba000, 10 }, /* ARMPLL 1209 MHz, CPU divide by two */
+	{ 754000000, 0x010e8000, 8 },
+	{ 903500000, 0x01116000, 8 },
+	{ 1001000000, 0x0009a000, 8 },
+};
+
+static unsigned long mt6580_cpu_recalc_rate(struct clk_hw *hw,
+					   unsigned long parent_rate)
+{
+	struct mt6580_cpu_clk *cpu = container_of(hw, struct mt6580_cpu_clk, hw);
+	u32 con = readl(cpu->pll + 0x104);
+	u32 div = readl(cpu->infra + 8) & 0x1f;
+	u64 rate = (u64)(con & GENMASK(20, 0)) * 26000000;
+
+	rate >>= 14 + ((con >> 24) & 7);
+	if (div >= 9 && div <= 11)
+		rate = rate * (12 - div) / 4;
+	else if (div >= 17 && div <= 20)
+		rate = rate * (21 - div) / 5;
+	else if (div >= 25 && div <= 29)
+		rate = rate * (30 - div) / 6;
+	return rate;
+}
+
+static long mt6580_cpu_round_rate(struct clk_hw *hw, unsigned long rate,
+				unsigned long *parent_rate)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(mt6580_cpu_rates) - 1; i++)
+		if (rate <= mt6580_cpu_rates[i].rate)
+			break;
+	return mt6580_cpu_rates[i].rate;
+}
+
+static int mt6580_cpu_set_rate(struct clk_hw *hw, unsigned long rate,
+			       unsigned long parent_rate)
+{
+	struct mt6580_cpu_clk *cpu = container_of(hw, struct mt6580_cpu_clk, hw);
+	unsigned long flags;
+	u32 mux, div, gate, con;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(mt6580_cpu_rates); i++)
+		if (rate == mt6580_cpu_rates[i].rate)
+			break;
+	if (i == ARRAY_SIZE(mt6580_cpu_rates))
+		return -EINVAL;
+
+	/* Follow the BSP MAINPLL handover; never reprogram the live CPU PLL.
+	 * All supported OPPs retain the BSP's 1.15 V intermediate voltage.
+	 * Preserve unrelated mux, gate and divider bits, including firmware DCM.
+	 */
+	spin_lock_irqsave(&mt6580_usb_clk_lock, flags);
+	mux = readl(cpu->infra);
+	div = readl(cpu->infra + 8);
+	gate = readl(cpu->infra + 0xa00);
+	writel(gate & ~BIT(1), cpu->infra + 0xa00);
+	writel((mux & ~GENMASK(3, 2)) | (3 << 2), cpu->infra);
+	readl(cpu->infra);
+	con = readl(cpu->pll + 0x104);
+	con &= ~(GENMASK(26, 24) | GENMASK(20, 0));
+	writel(con | mt6580_cpu_rates[i].pcw | BIT(31), cpu->pll + 0x104);
+	udelay(20);
+	writel((div & ~GENMASK(4, 0)) | mt6580_cpu_rates[i].div, cpu->infra + 8);
+	writel((mux & ~GENMASK(3, 2)) | BIT(2), cpu->infra);
+	readl(cpu->infra);
+	writel(gate, cpu->infra + 0xa00);
+	spin_unlock_irqrestore(&mt6580_usb_clk_lock, flags);
+	return 0;
+}
+
+static const struct clk_ops mt6580_cpu_ops = {
+	.recalc_rate = mt6580_cpu_recalc_rate,
+	.round_rate = mt6580_cpu_round_rate,
+	.set_rate = mt6580_cpu_set_rate,
+};
+
+static struct clk_hw *mt6580_register_cpu_clk(struct platform_device *pdev,
+					    void __iomem *base)
+{
+	struct device *dev = &pdev->dev;
+	struct mt6580_cpu_clk *cpu;
+	struct clk_init_data init = {
+		.name = "mt6580_cpu",
+		.ops = &mt6580_cpu_ops,
+		.flags = CLK_IS_CRITICAL | CLK_GET_RATE_NOCACHE,
+	};
+	int ret;
+
+	cpu = devm_kzalloc(dev, sizeof(*cpu), GFP_KERNEL);
+	if (!cpu)
+		return ERR_PTR(-ENOMEM);
+	cpu->pll = base;
+	cpu->infra = devm_platform_ioremap_resource(pdev, 1);
+	if (IS_ERR(cpu->infra))
+		return ERR_CAST(cpu->infra);
+	cpu->hw.init = &init;
+	ret = devm_clk_hw_register(dev, &cpu->hw);
+	return ret ? ERR_PTR(ret) : &cpu->hw;
+}
 
 static const struct mtk_gate_regs mt6580_mfg_regs = {
 	.sta_ofs = 0, .set_ofs = 4, .clr_ofs = 8,
@@ -54,7 +169,7 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	struct clk_hw *source;
 	void __iomem *base;
 	bool top = of_device_is_compatible(dev->of_node, "mediatek,mt6580-topckgen");
-	unsigned int count = 2;
+	unsigned int count = 3;
 	unsigned int i;
 
 	if (of_device_is_compatible(dev->of_node, "mediatek,mt6580-mfgcfg"))
@@ -137,7 +252,8 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 		dev_info(dev, "MFG firmware mux %#x, source %lu Hz\n",
 			 (readl(base + 4) >> 8) & 0x3f, mt6580_mfg_rate(base));
 	} else {
-		/* Do not invent PLL programming before its rates are ported. */
+		data->hws[CLK_MT6580_APMIXED_CPU] = mt6580_register_cpu_clk(pdev, base);
+		/* USB retains the firmware's UNIVPLL rate and enable state. */
 		if (!(readl(base + 0x140) & BIT(0)))
 			return dev_err_probe(dev, -EIO,
 					     "UNIVPLL is off; firmware clock setup required\n");
@@ -184,5 +300,5 @@ static struct platform_driver mt6580_usb_clk_driver = {
 };
 module_platform_driver(mt6580_usb_clk_driver);
 
-MODULE_DESCRIPTION("MT6580 peripheral and GPU clocks");
+MODULE_DESCRIPTION("MT6580 CPU, peripheral and GPU clocks");
 MODULE_LICENSE("GPL");

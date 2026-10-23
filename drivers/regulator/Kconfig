@@ -882,10 +882,11 @@ config REGULATOR_MT6315
 	  through regulator interface.
 
 config REGULATOR_MT6350
-	tristate "MediaTek MT6350 VGP1 regulator"
+	tristate "MediaTek MT6350 VPROC and VGP1 regulators"
 	depends on MTK_MT6580_PMIC_WRAP
 	help
-	  Control the MT6350 VGP1 supply through the MT6580 PMIC wrapper.
+	  Control the MT6350 CPU VPROC and touchscreen VGP1 supplies through
+	  the MT6580 PMIC wrapper.
 
 config REGULATOR_MT6323
 	tristate "MediaTek MT6323 PMIC"

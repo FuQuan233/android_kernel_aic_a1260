@@ -1379,6 +1379,12 @@ static int edt_ft5x06_ts_suspend(struct device *dev)
 	if (tsdata->suspend_mode == EDT_PMODE_NOT_SUPPORTED)
 		return 0;
 
+	/* Hibernate can itself change INTN. Quiesce the power-off path before
+	 * sending the command so it cannot queue input while tasks are frozen.
+	 */
+	if (tsdata->suspend_mode == EDT_PMODE_POWEROFF)
+		disable_irq(tsdata->client->irq);
+
 	/* Enter hibernate mode. */
 	ret = regmap_write(tsdata->regmap, PMOD_REGISTER_OPMODE,
 			   PMOD_REGISTER_HIBERNATE);
@@ -1394,8 +1400,6 @@ static int edt_ft5x06_ts_suspend(struct device *dev)
 	 * settings. Disable the irq to avoid adjusting each host till the
 	 * device is back in a full functional state.
 	 */
-	disable_irq(tsdata->client->irq);
-
 	gpiod_set_value_cansleep(reset_gpio, 1);
 	usleep_range(1000, 2000);
 
