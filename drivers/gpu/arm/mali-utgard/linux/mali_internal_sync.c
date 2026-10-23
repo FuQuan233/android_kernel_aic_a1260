@@ -31,6 +31,7 @@
 
 
 static const struct dma_fence_ops dma_fence_ops;
+static bool mali_internal_fence_signaled(struct dma_fence *fence);
 
 
 static struct mali_internal_sync_point *mali_internal_fence_to_sync_pt(struct dma_fence *fence)
@@ -109,6 +110,7 @@ void mali_internal_sync_timeline_signal(struct mali_internal_sync_timeline *sync
 {
 	unsigned long flags;
 	struct mali_internal_sync_point *sync_pt, *next;
+	LIST_HEAD(signaled);
 
 	MALI_DEBUG_ASSERT_POINTER(sync_timeline);
 
@@ -116,11 +118,37 @@ void mali_internal_sync_timeline_signal(struct mali_internal_sync_timeline *sync
 
 	list_for_each_entry_safe(sync_pt, next, &sync_timeline->sync_pt_list_head,
 				 sync_pt_list) {
-		if (dma_fence_is_signaled_locked(&sync_pt->base))
-			list_del_init(&sync_pt->sync_pt_list);
+		bool already_signaled = test_bit(DMA_FENCE_FLAG_SIGNALED_BIT,
+						 &sync_pt->base.flags);
+
+		/* Unlike dma_fence_is_signaled_locked(), this predicate does not
+		 * invoke callbacks. Keep the legacy negative-status error handling.
+		 */
+		if (!already_signaled && !mali_internal_fence_signaled(&sync_pt->base))
+			continue;
+
+		/* The active list is a weak reference. A final put may already be
+		 * waiting in release() for this lock, so never resurrect refcount 0.
+		 * The same lock keeps that release from unlinking/freeing the point
+		 * while we try to acquire the temporary signalling reference.
+		 */
+		if (!kref_get_unless_zero(&sync_pt->base.refcount))
+			continue;
+
+		list_move_tail(&sync_pt->sync_pt_list, &signaled);
+		if (!already_signaled)
+			dma_fence_signal_locked(&sync_pt->base);
 	}
 
 	spin_unlock_irqrestore(&sync_timeline->sync_pt_list_lock, flags);
+
+	/* A callback may have dropped every other fence reference. The final
+	 * put must happen outside the lock taken again by release().
+	 */
+	list_for_each_entry_safe(sync_pt, next, &signaled, sync_pt_list) {
+		list_del_init(&sync_pt->sync_pt_list);
+		dma_fence_put(&sync_pt->base);
+	}
 }
 
 struct mali_internal_sync_point *mali_internal_sync_point_create(struct mali_internal_sync_timeline *sync_timeline, int size)

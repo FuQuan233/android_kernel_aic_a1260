@@ -49,6 +49,17 @@ Linux 6.18 adaptation
   fence space and publishes a WRITE fence. A fence holds the module alive
   until its final reference is released. Cancellation stops callbacks
   before canceling their deferred work.
+* A PP job owns its implicit-dependency waiter. It is installed before native
+  sync-fence processing, including the already-signaled early-return path.
+  An already-signaled native fence does not retire a separate ``dma_resv``
+  dependency. Session abort retires successfully cancelled callback references
+  through the same completion worker, then waits for both dependency classes.
+* Native sync-file references are acquired before the timeline IRQ spinlock:
+  the modern compatibility helper creates a file and may sleep. Signalling
+  native timeline points holds a nonzero temporary fence reference through
+  callbacks, then drops it outside the point-list lock. A callback that releases
+  an aggregate fence therefore cannot recursively release its child on that
+  same held lock.
 * OF IRQs are resolved by name with ``platform_get_irq_byname_optional``;
   deferred clock-provider probe errors are preserved.
 * The platform holds real clock and MFG runtime-PM references for its bind
@@ -73,7 +84,28 @@ advanced and completed successfully. Android native-fence export/poll and
 KMS DMA-BUF/EGLImage/FBO readback were also verified. These observations
 validate actual GPU work, not just driver strings or successful ioctls.
 
-Full Android graphics integration, memory pressure/COW/swap stress, DVFS,
+Android window rendering exposed a legacy ordering bug: an already-signaled
+native fence skipped allocation of the implicit-dependency waiter, but the
+dependency completion work still ran and dereferenced NULL. Installing the
+job-owned waiter first preserves the real pending dependency and removes this
+failure path. The session-abort path also uses the pending count instead of
+manually invoking a second completion callback.
+
+The Android 17 product now uses the original driver for SurfaceFlinger,
+SystemUI, Launcher and Settings. A normal built-in-driver kernel with
+``CONFIG_DEBUG_SPINLOCK=n`` reaches boot completion, draws/readbacks the
+test triangle and switches between Settings and Launcher. The userspace
+bridge preserves the original RGB native-handle ABI while retaining the
+modern mapper and DRM display stack. The original hardware-check helper
+requires this device's actual devinfo data; proprietary libraries and that
+data are packaged locally outside this kernel tree.
+
+An earlier built-in-driver boot encountered RCU stalls and display/MMC
+timeouts. Its precise cause was not captured. The fence ordering/lifetime
+fixes above correct identified defects; a successful short runtime does
+not establish long-term stability.
+
+Memory pressure/COW/swap stress, broader application compatibility, DVFS,
 protected rendering and suspend/resume require additional validation. The
 current clock/voltage policy is deliberately fixed and the existing bringup
 wake lock must remain until system suspend is repaired.

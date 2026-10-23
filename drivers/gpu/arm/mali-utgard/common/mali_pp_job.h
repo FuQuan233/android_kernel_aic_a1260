@@ -101,6 +101,10 @@ struct mali_pp_job {
 	u32 perf_counter_value1[_MALI_PP_MAX_SUB_JOBS];    /**< Value of performance counter 1 (to be returned to user space), one for each sub job */
 
 #if defined(CONFIG_MALI_DMA_BUF_FENCE)
+	/* Job-owned waiter: implicit dependencies must survive ordinary waiter
+	 * allocation failures and early exits from native sync-fence handling.
+	 * It is not linked into the timeline's reusable waiter pool. */
+	struct mali_timeline_waiter dma_fence_waiter;
 	struct mali_dma_fence_context dma_fence_context; /**< The mali dma fence context to record dma fence waiters that this job wait for */
 	struct dma_fence *rendered_dma_fence; /**< the new dma fence link to this job */
 #endif

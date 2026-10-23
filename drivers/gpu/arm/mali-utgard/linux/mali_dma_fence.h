@@ -74,6 +74,14 @@ _mali_osk_errcode_t mali_dma_fence_context_add_waiters(struct mali_dma_fence_con
 		struct dma_resv *dma_reservation_object);
 
 /**
+ * Cancel outstanding dependency callbacks during session abort.
+ * A successfully removed callback retires one pending dependency, just as its
+ * signal callback would. Completion still runs once through the context work.
+ * The caller holds the timeline lock, keeping the job/waiter alive.
+ */
+void mali_dma_fence_context_cancel_waiters(struct mali_dma_fence_context *dma_fence_context);
+
+/**
  * Release the dma fence context
  * @param dma_fence_text The mali dma fence context.
  */

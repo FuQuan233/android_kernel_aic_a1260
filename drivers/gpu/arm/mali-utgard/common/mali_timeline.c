@@ -813,15 +813,6 @@ static void mali_timeline_cancel_sync_fence_waiters(struct mali_timeline_system 
 	_MALI_OSK_LIST_FOREACHENTRY(tracker, tracker_next, &tracker_list, struct mali_timeline_tracker, sync_fence_cancel_list) {
 		mali_timeline_sync_fence_callback(tracker->sync_fence, &tracker->sync_fence_waiter);
 	}
-
-	/* Sleep until all sync fence callbacks are done and all timelines are empty. */
-	for (i = 0; i < MALI_TIMELINE_MAX; ++i) {
-		struct mali_timeline *timeline = system->timelines[i];
-
-		MALI_DEBUG_ASSERT_POINTER(timeline);
-
-		_mali_osk_wait_queue_wait_event(system->wait_queue, mali_timeline_has_no_trackers, (void *) timeline);
-	}
 }
 
 #endif /* defined(CONFIG_SYNC) || defined(CONFIG_SYNC_FILE) */
@@ -829,72 +820,36 @@ static void mali_timeline_cancel_sync_fence_waiters(struct mali_timeline_system 
 #if defined(CONFIG_MALI_DMA_BUF_FENCE)
 static void mali_timeline_cancel_dma_fence_waiters(struct mali_timeline_system *system)
 {
-	u32 i, j;
 	u32 tid = _mali_osk_get_tid();
-	struct mali_pp_job *pp_job = NULL;
-	struct mali_pp_job *next_pp_job = NULL;
-	struct mali_timeline *timeline = NULL;
-	struct mali_timeline_tracker *tracker, *tracker_next;
-	_MALI_OSK_LIST_HEAD_STATIC_INIT(pp_job_list);
+	struct mali_timeline *timeline;
+	struct mali_timeline_tracker *tracker;
 
 	MALI_DEBUG_ASSERT_POINTER(system);
-	MALI_DEBUG_ASSERT_POINTER(system->session);
 	MALI_DEBUG_ASSERT(system->session->is_aborting);
 
 	mali_spinlock_reentrant_wait(system->spinlock, tid);
-
-	/* Cancel dma fence waiters. */
 	timeline = system->timelines[MALI_TIMELINE_PP];
-	MALI_DEBUG_ASSERT_POINTER(timeline);
 
-	tracker_next = timeline->tracker_tail;
-	while (NULL != tracker_next) {
-		mali_bool dma_fence_is_signaled = MALI_TRUE;
-		tracker = tracker_next;
-		tracker_next = tracker->timeline_next;
+	for (tracker = timeline->tracker_tail; tracker; tracker = tracker->timeline_next) {
+		struct mali_pp_job *job;
 
-		if (NULL == tracker->waiter_dma_fence) continue;
-		pp_job = (struct mali_pp_job *)tracker->job;
-		MALI_DEBUG_ASSERT_POINTER(pp_job);
-		MALI_DEBUG_PRINT(3, ("Mali Timeline: Cancelling dma fence waiter for tracker 0x%08X.\n", tracker));
-
-		for (j = 0; j < pp_job->dma_fence_context.num_dma_fence_waiter; j++) {
-			if (pp_job->dma_fence_context.mali_dma_fence_waiters[j]) {
-				/* Cancel a previously callback from the fence.
-				* This function returns true if the callback is successfully removed,
-				* or false if the fence has already been signaled.
-				*/
-				bool ret = dma_fence_remove_callback(pp_job->dma_fence_context.mali_dma_fence_waiters[j]->fence,
-								 &pp_job->dma_fence_context.mali_dma_fence_waiters[j]->base);
-				if (ret) {
-					dma_fence_is_signaled = MALI_FALSE;
-				}
-			}
-		}
-
-		/* Callbacks were not called, move pp job to local list. */
-		if (MALI_FALSE == dma_fence_is_signaled)
-			_mali_osk_list_add(&pp_job->list, &pp_job_list);
+		if (!tracker->waiter_dma_fence)
+			continue;
+		job = tracker->job;
+		/* Successful cancellation retires exactly the reference that its
+		 * signal callback can no longer retire. The last reference queues
+		 * the existing completion work; there is no second, manual callback. */
+		mali_dma_fence_context_cancel_waiters(&job->dma_fence_context);
 	}
-
 	mali_spinlock_reentrant_signal(system->spinlock, tid);
-
-	/* Manually call dma fence callback in order to release waiter and trigger activation of tracker. */
-	_MALI_OSK_LIST_FOREACHENTRY(pp_job, next_pp_job, &pp_job_list, struct mali_pp_job, list) {
-		mali_timeline_dma_fence_callback((void *)pp_job);
-	}
-
-	/* Sleep until all dma fence callbacks are done and all timelines are empty. */
-	for (i = 0; i < MALI_TIMELINE_MAX; ++i) {
-		struct mali_timeline *timeline = system->timelines[i];
-		MALI_DEBUG_ASSERT_POINTER(timeline);
-		_mali_osk_wait_queue_wait_event(system->wait_queue, mali_timeline_has_no_trackers, (void *) timeline);
-	}
 }
 #endif
 #endif
 void mali_timeline_system_abort(struct mali_timeline_system *system)
 {
+#if defined(CONFIG_SYNC) || defined(CONFIG_SYNC_FILE) || defined(CONFIG_MALI_DMA_BUF_FENCE)
+	u32 i;
+#endif
 	MALI_DEBUG_CODE(u32 tid = _mali_osk_get_tid(););
 
 	MALI_DEBUG_ASSERT_POINTER(system);
@@ -909,6 +864,17 @@ void mali_timeline_system_abort(struct mali_timeline_system *system)
 
 #if defined(CONFIG_MALI_DMA_BUF_FENCE)
 	mali_timeline_cancel_dma_fence_waiters(system);
+#endif
+
+#if defined(CONFIG_SYNC) || defined(CONFIG_SYNC_FILE) || defined(CONFIG_MALI_DMA_BUF_FENCE)
+	/* Cancel both dependency classes first. Waiting after only one class
+	 * can deadlock on a tracker still held by the other class. */
+	for (i = 0; i < MALI_TIMELINE_MAX; i++) {
+		struct mali_timeline *timeline = system->timelines[i];
+
+		_mali_osk_wait_queue_wait_event(system->wait_queue,
+				mali_timeline_has_no_trackers, timeline);
+	}
 #endif
 
 	/* Should not be any waiters or trackers left at this point. */
@@ -1090,18 +1056,19 @@ static void mali_timeline_system_allocate_waiters(struct mali_timeline_system *s
 static void mali_timeline_system_create_waiters_and_unlock(struct mali_timeline_system *system,
 		struct mali_timeline_tracker *tracker,
 		struct mali_timeline_waiter *waiter_tail,
-		struct mali_timeline_waiter *waiter_head)
+		struct mali_timeline_waiter *waiter_head
+#if defined(CONFIG_SYNC) || defined(CONFIG_SYNC_FILE)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 6, 0)
+		, struct sync_fence *sync_fence
+#else
+		, struct mali_internal_sync_fence *sync_fence
+#endif
+#endif
+		)
 {
 	int i;
 	u32 tid = _mali_osk_get_tid();
 	mali_scheduler_mask schedule_mask = MALI_SCHEDULER_MASK_EMPTY;
-#if defined(CONFIG_SYNC) || defined(CONFIG_SYNC_FILE)
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 6, 0)
-	struct sync_fence *sync_fence = NULL;
-#else
-	struct mali_internal_sync_fence *sync_fence = NULL;
-#endif
-#endif /* defined(CONFIG_SYNC) || defined(CONFIG_SYNC_FILE) */
 
 	MALI_DEBUG_ASSERT_POINTER(system);
 	MALI_DEBUG_ASSERT_POINTER(tracker);
@@ -1111,6 +1078,25 @@ static void mali_timeline_system_create_waiters_and_unlock(struct mali_timeline_
 	MALI_DEBUG_ASSERT(NULL == tracker->waiter_head);
 	MALI_DEBUG_ASSERT(NULL == tracker->waiter_tail);
 	MALI_DEBUG_ASSERT(NULL != tracker->job);
+
+#if defined(CONFIG_MALI_DMA_BUF_FENCE)
+	if (MALI_TIMELINE_TRACKER_PP == tracker->type) {
+		struct mali_pp_job *job = (struct mali_pp_job *)tracker->job;
+
+		if (job->dma_fence_context.num_dma_fence_waiter) {
+			struct mali_timeline_waiter *waiter = &job->dma_fence_waiter;
+
+			/* Install before native-fence processing: its already-signaled
+			 * path goes to exit, but implicit dependencies still need a
+			 * trigger reference. This job-owned waiter cannot fail to allocate
+			 * and must never be returned to the ordinary waiter pool. */
+			waiter->point = MALI_TIMELINE_NO_POINT;
+			waiter->tracker = tracker;
+			tracker->waiter_dma_fence = waiter;
+			tracker->trigger_ref_count++;
+		}
+	}
+#endif
 
 	/* Creating waiter object for all the timelines the fence is put on. Inserting this waiter
 	 * into the timelines sorted list of waiters */
@@ -1177,11 +1163,6 @@ static void mali_timeline_system_create_waiters_and_unlock(struct mali_timeline_
 	if (-1 != tracker->fence.sync_fd) {
 		int ret;
 		struct mali_timeline_waiter *waiter;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 6, 0)
-		sync_fence = sync_fence_fdget(tracker->fence.sync_fd);
-#else
-		sync_fence = mali_internal_sync_fence_fdget(tracker->fence.sync_fd);
-#endif
 		if (unlikely(NULL == sync_fence)) {
 			MALI_PRINT_ERROR(("Mali Timeline: failed to get sync fence from fd %d\n", tracker->fence.sync_fd));
 			goto exit;
@@ -1240,44 +1221,6 @@ static void mali_timeline_system_create_waiters_and_unlock(struct mali_timeline_
 		sync_fence = NULL;
 	}
 #endif /* defined(CONFIG_SYNC) || defined(CONFIG_SYNC_FILE)*/
-#if defined(CONFIG_MALI_DMA_BUF_FENCE)
-	if ((NULL != tracker->timeline) && (MALI_TIMELINE_PP == tracker->timeline->id)) {
-
-		struct mali_pp_job *job = (struct mali_pp_job *)tracker->job;
-
-		if (0 < job->dma_fence_context.num_dma_fence_waiter) {
-			struct mali_timeline_waiter *waiter;
-			/* Check if we have a zeroed waiter object available. */
-			if (unlikely(NULL == waiter_tail)) {
-				MALI_PRINT_ERROR(("Mali Timeline: failed to allocate memory for waiter\n"));
-				goto exit;
-			}
-
-			/* Grab new zeroed waiter object. */
-			waiter = waiter_tail;
-			waiter_tail = waiter_tail->tracker_next;
-
-			/* Increase the trigger ref count of the tracker. */
-			tracker->trigger_ref_count++;
-
-			waiter->point   = MALI_TIMELINE_NO_POINT;
-			waiter->tracker = tracker;
-
-			/* Insert waiter on tracker's singly-linked waiter list. */
-			if (NULL == tracker->waiter_head) {
-				/* list is empty */
-				MALI_DEBUG_ASSERT(NULL == tracker->waiter_tail);
-				tracker->waiter_tail = waiter;
-			} else {
-				tracker->waiter_head->tracker_next = waiter;
-			}
-			tracker->waiter_head = waiter;
-
-			/* Also store waiter in separate field for easy access by sync callback. */
-			tracker->waiter_dma_fence = waiter;
-		}
-	}
-#endif /* defined(CONFIG_MALI_DMA_BUF_FENCE)*/
 
 #if defined(CONFIG_MALI_DMA_BUF_FENCE) ||defined(CONFIG_SYNC) || defined(CONFIG_SYNC_FILE)
 exit:
@@ -1317,6 +1260,13 @@ mali_timeline_point mali_timeline_system_add_tracker(struct mali_timeline_system
 	int num_waiters = 0;
 	struct mali_timeline_waiter *waiter_tail, *waiter_head;
 	u32 tid = _mali_osk_get_tid();
+#if defined(CONFIG_SYNC) || defined(CONFIG_SYNC_FILE)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 6, 0)
+	struct sync_fence *sync_fence = NULL;
+#else
+	struct mali_internal_sync_fence *sync_fence = NULL;
+#endif
+#endif
 
 	mali_timeline_point point = MALI_TIMELINE_NO_POINT;
 
@@ -1333,17 +1283,25 @@ mali_timeline_point mali_timeline_system_add_tracker(struct mali_timeline_system
 	MALI_DEBUG_ASSERT(0 < tracker->trigger_ref_count);
 	tracker->system = system;
 
+#if defined(CONFIG_SYNC) || defined(CONFIG_SYNC_FILE)
+	/* The modern fdget shim allocates a sync_file with GFP_KERNEL. All
+	 * submissions enter here from process context: acquire its reference
+	 * before disabling interrupts and taking the timeline lock. The waiter
+	 * helper consumes it, either installing the callback or putting it after
+	 * unlocking on every failed/already-signaled path. */
+	if (-1 != tracker->fence.sync_fd) {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 6, 0)
+		sync_fence = sync_fence_fdget(tracker->fence.sync_fd);
+#else
+		sync_fence = mali_internal_sync_fence_fdget(tracker->fence.sync_fd);
+#endif
+	}
+#endif
+
 	mali_spinlock_reentrant_wait(system->spinlock, tid);
 
 	num_waiters = mali_timeline_fence_num_waiters(&tracker->fence);
 
-#if defined(CONFIG_MALI_DMA_BUF_FENCE)
-	if (MALI_TIMELINE_PP == timeline_id) {
-		struct mali_pp_job *job = (struct mali_pp_job *)tracker->job;
-		if (0 < job->dma_fence_context.num_dma_fence_waiter)
-			num_waiters++;
-	}
-#endif
 
 	/* Allocate waiters. */
 	mali_timeline_system_allocate_waiters(system, &waiter_tail, &waiter_head, num_waiters);
@@ -1366,7 +1324,11 @@ mali_timeline_point mali_timeline_system_add_tracker(struct mali_timeline_system
 
 	/* Create waiters for tracker based on supplied fence.  Each waiter will increase the
 	 * trigger ref count. */
-	mali_timeline_system_create_waiters_and_unlock(system, tracker, waiter_tail, waiter_head);
+	mali_timeline_system_create_waiters_and_unlock(system, tracker, waiter_tail, waiter_head
+#if defined(CONFIG_SYNC) || defined(CONFIG_SYNC_FILE)
+			, sync_fence
+#endif
+			);
 	tracker = NULL;
 
 	/* At this point the tracker object might have been freed so we should no longer
@@ -1875,9 +1837,11 @@ void mali_timeline_dma_fence_callback(void *pp_job_ptr)
 	waiter = tracker->waiter_dma_fence;
 	MALI_DEBUG_ASSERT_POINTER(waiter);
 
-	schedule_mask |= mali_timeline_system_release_waiter(system, waiter);
-
+	/* Consume the sole implicit-waiter ownership under the timeline lock.
+	 * Clearing it is a state transition, not a bypass of an unmet fence. */
+	tracker->waiter_dma_fence = NULL;
 	is_aborting = system->session->is_aborting;
+	schedule_mask |= mali_timeline_system_release_waiter(system, waiter);
 
 	/* If aborting, wake up sleepers that are waiting for dma fence callbacks to complete. */
 	if (is_aborting) {

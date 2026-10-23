@@ -224,6 +224,21 @@ unsigned int count = 0, i;
 }
 
 
+void mali_dma_fence_context_cancel_waiters(struct mali_dma_fence_context *dma_fence_context)
+{
+	u32 i;
+
+	for (i = 0; i < dma_fence_context->num_dma_fence_waiter; i++) {
+		struct mali_dma_fence_waiter *waiter =
+			dma_fence_context->mali_dma_fence_waiters[i];
+
+		/* false means the signal callback has already retired this reference.
+		 * Do not invoke the timeline callback separately: work may be queued. */
+		if (waiter && dma_fence_remove_callback(waiter->fence, &waiter->base))
+			mali_dma_fence_context_dec_count(dma_fence_context);
+	}
+}
+
 void mali_dma_fence_context_term(struct mali_dma_fence_context *dma_fence_context)
 {
 	MALI_DEBUG_ASSERT_POINTER(dma_fence_context);
