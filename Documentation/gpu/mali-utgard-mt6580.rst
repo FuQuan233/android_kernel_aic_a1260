@@ -62,13 +62,16 @@ Linux 6.18 adaptation
   same held lock.
 * OF IRQs are resolved by name with ``platform_get_irq_byname_optional``;
   deferred clock-provider probe errors are preserved.
-* The platform holds real clock and MFG runtime-PM references for its bind
-  lifetime, retains the firmware-selected frequency and voltage, and does
-  not write PMIC rails. Per-job references are checked for balance.
+* Per-job and internal-domain references now feed Linux runtime PM, with
+  asynchronous resume requests under DDK locks and a 100 ms autosuspend
+  delay. Runtime suspend gates the GPU clocks and allows genpd to power off
+  MFG; resume enables the clocks before restoring DDK groups, L2 and MMU
+  state. Frequency and voltage remain firmware-selected; no PMIC rail is
+  changed. Probe holds an initialization reference until registration ends.
 
 The DDK's ``mali_kernel_linux.h`` defines ``CONFIG_PM_RUNTIME`` itself on
 modern PM-enabled kernels, causing its software runtime-active flag to start
-false. The fixed-power platform is already active when probing, so Linux
+false. The platform is already active when probing, so Linux
 will not issue a runtime-resume callback for its first reference. After all
 GP/PP/L2 objects are registered, ``mali_pm_init_end()`` explicitly resumes
 the DDK software state. Without this step jobs stay pending before hardware
@@ -76,6 +79,63 @@ submission; no GP/PP interrupt is generated.
 
 Validation and limits
 =====================
+
+Runtime PM and shared-clock validation (2026-10-23)
+--------------------------------------------------
+
+The fixed-power results below describe the working baseline, not the new
+runtime-PM trial. The trial releases the probe reference and autosuspends
+after 100 ms, gating BG3D and allowing genpd to power off MFG. The user
+observed a black screen, repeated reboots, and a Windows USB enumeration
+failure. No UART or pstore from this trial is available yet. Further flashing
+was stopped at the user's request while the failure was investigated. The
+working #29 image was preserved separately.
+
+Static analysis identifies an incomplete shared-clock dependency as a leading
+suspect. MFG power-off releases TOP_MPLL_D5 (TOPCKGEN + 0x30, bit 2), while
+the current SMI and USB bus gates have NULL parents. The MT6580 BSP's
+mt_clkmgr.c mux tables show that CLK_MUX_SEL1[19:16] == 9 selects MPLL_D5
+for SMI, and [22:20] == 4 selects MPLL_D20 for USB. MPLL_D20 is derived
+from MPLL_D10, itself derived from MPLL_D5. Thus either selected consumer
+can lose its source when GPU runtime PM drops the last modeled D5 reference.
+The BSP also models D5 descendants for other mux selections (MSDC and NFI).
+This dependency omission is established from source. The failing boot's
+reset cause was not captured.
+
+Before another power-gating trial, model the firmware-selected parent paths
+and their shared references, or temporarily retain the shared D5 source until
+all consumers are represented. Do not treat increasing the autosuspend delay
+as a fix. A successful rebuild alone cannot validate power cycling, GPU
+context restoration, or the root cause of this reboot.
+
+The follow-up #31 test image retains only the shared D5 source with
+``CLK_IS_CRITICAL``. GPU autosuspend, BG3D gating and MFG genpd power-off
+remain enabled, and probe logs the firmware SMI/USB mux selections and MPLL
+divider-enable register. This is a temporary guard, not a complete clock-tree
+implementation: remove it after the live shared consumers and divider branches
+have parent references. The #31 image restored boot and ADB, as confirmed by
+the user and ``sys.boot_completed=1``. Its probe log shows SMI mux 0x9
+(D5), USB mux 0x2 (UPLL_D16). Thus SMI really uses the missing shared
+parent on this board; USB does not directly use D5 in this configuration.
+The earlier USB enumeration failure may have been a secondary symptom.
+
+Runtime validation started with the GPU suspended, then compiled shaders,
+drew a triangle, completed ``glFinish`` and read RGBA ``0,255,0,255`` with
+GL error 0. After one second the GPU was suspended again and suspended-time
+accounting had advanced. Two screen-off/on cycles restored DSI video output,
+with RDMA underflows and abnormal counts both zero and ADB still usable.
+genpd reported MFG off, both GPU and its clock provider suspended; SPM MFG
+control was 0xff12 and MFG bit 4 was clear in both power-status registers.
+No new Oops, runtime-PM or power-domain failure was found in the boot log.
+Full system suspend/resume with the new GPU callbacks and long-duration
+stress remain unvalidated. DISP itself is still explicitly always-on.
+
+The image is ``out/a1260-runtime-pm/boot-gpu-d5-retained.img``; the same
+boot/kernel pair now supplies the canonical product output. Evidence is in
+``out/a1260-runtime-pm/d5-retained-validation.txt``.
+
+Fixed-power validation
+----------------------
 
 On the AIC A1260, the original Android 8.1 r8p0 userspace initialized EGL 1.4,
 compiled/linked shaders, drew a triangle and completed ``glFinish`` and pixel

@@ -950,9 +950,12 @@ ISP are indices 1 and 2. Unused ISP is eligible for automatic power-off.
 
 DISP has an explicit ALWAYS_ON policy: its SMI/LARB register restore is
 not implemented. This permits generic clock/domain cleanup without losing
-firmware bus context. MFG still has the Utgard bind-lifetime reference.
-These changes do not implement GPU runtime power gating, a complete PLL
-clock tree, modem/connectivity power domains, or SPM deep sleep.
+firmware bus context. Build #31 adds Utgard runtime MFG gating, with real
+render/resuspend and two display off/on cycles verified. A temporary critical
+MPLL_D5 reference protects the unmodeled shared SMI parent; see
+Documentation/gpu/mali-utgard-mt6580.rst for evidence and limitations.
+The complete PLL clock tree, modem/connectivity domains and SPM deep sleep
+remain unfinished.
 
 The MT6580 DSI handover explicitly enables engine/digital clocks before
 stopping inherited video and polling registers. The earlier code depended

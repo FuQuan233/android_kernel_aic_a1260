@@ -25,6 +25,7 @@
 #include <linux/bug.h>
 #include <linux/of.h>
 #include <linux/clk.h>
+#include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
 
 #include <linux/mali/mali_utgard.h>
@@ -596,6 +597,9 @@ static int mali_probe(struct platform_device *pdev)
 				if (0 == err) {
 					MALI_DEBUG_PRINT(2, ("mali_probe(): Successfully initialized driver for platform device %s\n", pdev->name));
 
+					/* Release the platform initialization reference. */
+					pm_runtime_mark_last_busy(&pdev->dev);
+					pm_runtime_put_autosuspend(&pdev->dev);
 					return 0;
 				} else {
 					MALI_PRINT_ERROR(("mali_probe(): failed to register sysfs entries"));
@@ -645,6 +649,9 @@ static void mali_remove(struct platform_device *pdev)
 #endif
 
 	MALI_DEBUG_PRINT(2, ("mali_remove() called for platform device %s\n", pdev->name));
+	/* Reacquire the initialization reference for powered teardown. */
+	if (pm_runtime_resume_and_get(&pdev->dev) < 0)
+		return;
 	mali_sysfs_unregister();
 	mali_miscdevice_unregister();
 	mali_terminate_subsystems();
@@ -702,6 +709,7 @@ static void mali_miscdevice_unregister(void)
 
 static int mali_driver_suspend_scheduler(struct device *dev)
 {
+	int ret;
 #ifdef CONFIG_MALI_DEVFREQ
 	struct mali_device *mdev = dev_get_drvdata(dev);
 	if (!mdev)
@@ -721,8 +729,10 @@ static int mali_driver_suspend_scheduler(struct device *dev)
 				      0,
 				      0,
 				      0, 0, 0);
-	mali_platform_power_mode_change(MALI_POWER_MODE_DEEP_SLEEP);
-	return 0;
+	ret = pm_runtime_force_suspend(dev);
+	if (ret)
+		mali_pm_os_resume();
+	return ret;
 }
 
 static int mali_driver_resume_scheduler(struct device *dev)
@@ -732,7 +742,10 @@ static int mali_driver_resume_scheduler(struct device *dev)
 	if (!mdev)
 		return -ENODEV;
 #endif
-	mali_platform_power_mode_change(MALI_POWER_MODE_ON);
+	int ret = pm_runtime_force_resume(dev);
+
+	if (ret)
+		return ret;
 
 	/* Tracing the frequency and voltage after mali is resumed */
 #if defined(CONFIG_MALI400_PROFILING) && defined(CONFIG_MALI_DVFS)
@@ -768,6 +781,7 @@ static int mali_driver_runtime_suspend(struct device *dev)
 #endif
 
 	if (MALI_TRUE == mali_pm_runtime_suspend()) {
+		mali_platform_runtime_suspend();
 		/* Tracing the frequency and voltage after mali is suspended */
 		_mali_osk_profiling_add_event(MALI_PROFILING_EVENT_TYPE_SINGLE |
 					      MALI_PROFILING_EVENT_CHANNEL_GPU |
@@ -790,6 +804,11 @@ static int mali_driver_runtime_suspend(struct device *dev)
 
 static int mali_driver_runtime_resume(struct device *dev)
 {
+	int ret = mali_platform_runtime_resume();
+
+	if (ret)
+		return ret;
+
 #ifdef CONFIG_MALI_DEVFREQ
 	struct mali_device *mdev = dev_get_drvdata(dev);
 	if (!mdev)

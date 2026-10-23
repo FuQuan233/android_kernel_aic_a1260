@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Firmware-retaining MT6580 integration. No DVFS or regulator writes. */
+/* MT6580 runtime clock gating; genpd controls MFG, frequency stays fixed. */
 #include <linux/platform_device.h>
 #include <linux/clk.h>
 #include <linux/pm_runtime.h>
@@ -31,11 +31,13 @@ int mali_platform_device_init(struct platform_device *pdev)
 		clk_bulk_disable_unprepare(mali_num_clocks, mali_clocks);
 		return ret;
 	}
+	pm_runtime_set_autosuspend_delay(&pdev->dev, 100);
+	pm_runtime_use_autosuspend(&pdev->dev);
 	pm_runtime_enable(&pdev->dev);
-	/* Keep MFG alive while bound; the DDK tracks internal group activation. */
+	/* Keep initialization powered until the DDK has registered all groups. */
 	pm_runtime_get_noresume(&pdev->dev);
 	dev_info(&pdev->dev,
-		 "Utgard r8p0: retaining firmware clock/voltage, no DVFS\n");
+		 "Utgard r8p0: runtime MFG gating, fixed firmware clock/voltage\n");
 	return 0;
 }
 
@@ -47,7 +49,12 @@ int mali_platform_device_deinit(struct platform_device *pdev)
 	return 0;
 }
 
-void mali_platform_power_mode_change(mali_power_mode mode)
+int mali_platform_runtime_resume(void)
 {
-	/* Fixed-power platform: clocks and MFG remain held until removal. */
+	return clk_bulk_prepare_enable(mali_num_clocks, mali_clocks);
+}
+
+void mali_platform_runtime_suspend(void)
+{
+	clk_bulk_disable_unprepare(mali_num_clocks, mali_clocks);
 }

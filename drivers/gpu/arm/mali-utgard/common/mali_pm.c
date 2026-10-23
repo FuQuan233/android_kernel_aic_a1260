@@ -307,10 +307,12 @@ void mali_pm_init_end(void)
 	}
 
     /* mali_kernel_linux.h synthesizes CONFIG_PM_RUNTIME on modern kernels,
-     * so the DDK starts with runtime_active=false. Our fixed-power platform
+     * so the DDK starts with runtime_active=false. Our platform
      * is already pm_runtime_set_active(), and Linux therefore will not call
      * runtime_resume when the first reference is taken. Initialize the DDK
-     * state explicitly once all groups and L2 objects have been registered. */
+     * state explicitly once all groups and L2 objects have been registered.
+     * The platform initialization reference prevents autosuspend until probe
+     * has finished. Subsequent resumes use the real runtime PM callback. */
     mali_pm_runtime_resume();
 	_mali_osk_pm_dev_ref_put();
 }

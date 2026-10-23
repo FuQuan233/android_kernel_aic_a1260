@@ -67,6 +67,7 @@ void mali_pmm_tri_mode(mali_power_mode mode);
 void mali_pmm_utilization_handler(struct mali_gpu_utilization_data *data);
 unsigned int gpu_get_current_utilization(void);
 
-void mali_platform_power_mode_change(mali_power_mode power_mode);
+int mali_platform_runtime_resume(void);
+void mali_platform_runtime_suspend(void);
 
 #endif

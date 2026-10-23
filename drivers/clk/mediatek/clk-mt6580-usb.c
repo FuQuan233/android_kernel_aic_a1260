@@ -143,6 +143,7 @@ static const struct mtk_gate mt6580_mfg_clks[] = {
 static const struct mtk_clk_desc mt6580_mfg_desc = {
 	.clks = mt6580_mfg_clks,
 	.num_clks = ARRAY_SIZE(mt6580_mfg_clks),
+	.need_runtime_pm = true,
 };
 
 /* Preserve firmware muxes; no DVFS or voltage changes during bring-up. */
@@ -248,14 +249,28 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 			"mt6580_disp_pwm", "mt6580_disp_pwm_src", 0, base + 0x20, 0,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 
-		/* MFG power-on needs MPLL_D5 enabled before the top bus gate. */
+		/*
+		 * MFG power-on needs MPLL_D5 before the top bus gate, but D5 is
+		 * shared: SMI can select it directly and USB can select D20 via
+		 * D10. MSDC and NFI also have D5-derived mux choices in the BSP.
+		 * Those firmware-selected parents are not all represented yet.
+		 * Keep this source on so MFG runtime suspend cannot cut another
+		 * bus's clock. This does not keep BG3D or the MFG domain powered.
+		 * TODO: remove CLK_IS_CRITICAL once all live D5 consumers have
+		 * real parent references, including the D10/D20/D40 branches.
+		 */
 		source = devm_clk_hw_register_fixed_rate(dev, "mt6580_mpll_d5_src",
 						       NULL, 0, 300300000);
 		if (IS_ERR(source))
 			return PTR_ERR(source);
 		data->hws[CLK_MT6580_TOP_MPLL_D5] = devm_clk_hw_register_gate(dev,
-			"mt6580_mpll_d5", "mt6580_mpll_d5_src", 0, base + 0x30, 2,
+			"mt6580_mpll_d5", "mt6580_mpll_d5_src",
+			CLK_IS_CRITICAL, base + 0x30, 2,
 			0, &mt6580_usb_clk_lock);
+		dev_info(dev,
+			 "Shared D5 retained: SMI mux %#x, USB mux %#x, MPLL dividers %#x\n",
+			 (readl(base + 4) >> 16) & 0xf,
+			 (readl(base + 4) >> 20) & 7, readl(base + 0x30));
 		source = devm_clk_hw_register_fixed_rate(dev, "mt6580_mfg_src",
 						       NULL, 0, mt6580_mfg_rate(base));
 		if (IS_ERR(source))
