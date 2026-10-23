@@ -5,6 +5,7 @@
 */
 
 #include <linux/err.h>
+#include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/mfd/mt6397/core.h>
 #include <linux/module.h>
@@ -12,6 +13,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
+#include <linux/reboot.h>
 #include <linux/rtc.h>
 #include <linux/mfd/mt6397/rtc.h>
 #include <linux/mod_devicetable.h>
@@ -35,6 +37,68 @@ static int mtk_rtc_write_trigger(struct mt6397_rtc *rtc)
 			"failed to write WRTGR: %d\n", ret);
 
 	return ret;
+}
+
+/* MT6350's MMIO PWRAP regmap uses a spinlock and atomic polling. */
+static int mt6350_rtc_poweroff_write(struct mt6397_rtc *rtc, u32 reg, u32 val)
+{
+	unsigned int busy;
+	int ret;
+
+	ret = regmap_write(rtc->regmap, rtc->addr_base + reg, val);
+	if (ret)
+		return ret;
+	ret = regmap_write(rtc->regmap, rtc->addr_base + rtc->data->wrtgr, 1);
+	if (ret)
+		return ret;
+
+	return regmap_read_poll_timeout_atomic(rtc->regmap,
+			rtc->addr_base + RTC_BBPU, busy,
+			!(busy & RTC_BBPU_CBUSY), 10, 100000);
+}
+
+static int mt6350_rtc_poweroff(struct sys_off_data *data)
+{
+	struct mt6397_rtc *rtc = data->cb_data;
+	unsigned int users;
+	int ret;
+
+	/* Match the MT6350 BSP: unlock, preserve 32 kHz users, drop BBPU.
+	 * This is the final atomic callback, after devices and other CPUs stop;
+	 * do not take rtc->lock or use the sleeping RTC trigger helper here.
+	 */
+	ret = mt6350_rtc_poweroff_write(rtc, 0x36, 0x586a);
+	if (ret)
+		goto fail;
+	ret = mt6350_rtc_poweroff_write(rtc, 0x36, 0x9136);
+	if (ret)
+		goto fail;
+	ret = regmap_read(rtc->regmap, rtc->addr_base + 0x2c, &users);
+	if (ret)
+		goto fail;
+	if (!(users & GENMASK(12, 8))) {
+		unsigned int con;
+
+		ret = regmap_read(rtc->regmap, rtc->addr_base + 0x3e, &con);
+		if (ret)
+			goto fail;
+		/* F32KOB disables the unused RTC clock output. */
+		ret = mt6350_rtc_poweroff_write(rtc, 0x3e, con | BIT(5));
+		if (ret)
+			goto fail;
+	}
+
+	pr_emerg("MT6350: dropping RTC BBPU power hold\n");
+	/* PWREN | AUTO; BBPU bit 2 cleared. Keep RTC alarm power-on possible. */
+	ret = mt6350_rtc_poweroff_write(rtc, RTC_BBPU,
+				       RTC_BBPU_KEY | BIT(0) | BIT(3));
+	if (!ret) {
+		mdelay(1000);
+		ret = -ETIMEDOUT;
+	}
+fail:
+	pr_emerg("MT6350: power-off did not complete: %d\n", ret);
+	return NOTIFY_DONE;
 }
 
 static irqreturn_t mtk_rtc_irq_handler_thread(int irq, void *data)
@@ -313,7 +377,14 @@ static int mtk_rtc_probe(struct platform_device *pdev)
 		rtc->rtc_dev->set_start_time = false;
 	}
 
-	return devm_rtc_register_device(rtc->rtc_dev);
+	ret = devm_rtc_register_device(rtc->rtc_dev);
+	if (ret)
+		return ret;
+	if (rtc->data->poweroff)
+		return devm_register_sys_off_handler(&pdev->dev,
+			SYS_OFF_MODE_POWER_OFF, SYS_OFF_PRIO_DEFAULT,
+			mt6350_rtc_poweroff, rtc);
+	return 0;
 }
 
 #ifdef CONFIG_PM_SLEEP
@@ -352,6 +423,7 @@ static const struct mtk_rtc_data mt6397_rtc_data = {
 static const struct mtk_rtc_data mt6350_rtc_data = {
 	.wrtgr = RTC_WRTGR_MT6397,
 	.unlock = true,
+	.poweroff = true,
 	.year_offset = 68,
 };
 

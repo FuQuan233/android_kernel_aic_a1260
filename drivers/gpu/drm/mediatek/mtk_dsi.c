@@ -736,11 +736,24 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
 	if (dsi->driver_data->mt6580) {
 		u32 status;
 
-		/* Stop inherited video before changing its PLL or timings. */
+		/* Firmware clocks may already have been gated by clk_disable_unused.
+		 * Accessing DSI without these clocks returns invalid/busy status.
+		 * Quiesce inherited video before changing its PLL or timings.
+		 */
+		ret = clk_prepare_enable(dsi->engine_clk);
+		if (ret)
+			goto err_refcount;
+		ret = clk_prepare_enable(dsi->digital_clk);
+		if (ret) {
+			clk_disable_unprepare(dsi->engine_clk);
+			goto err_refcount;
+		}
 		writel(0, dsi->regs + DSI_START);
 		writel(CMD_MODE, dsi->regs + DSI_MODE_CTRL);
 		ret = readl_poll_timeout(dsi->regs + DSI_INTSTA, status,
 					!(status & DSI_BUSY), 10, 100000);
+		clk_disable_unprepare(dsi->digital_clk);
+		clk_disable_unprepare(dsi->engine_clk);
 		if (ret)
 			goto err_refcount;
 		dsi->data_rate = 300000000;

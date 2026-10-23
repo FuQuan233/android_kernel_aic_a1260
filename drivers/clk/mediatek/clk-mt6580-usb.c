@@ -179,7 +179,7 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	if (of_device_is_compatible(dev->of_node, "mediatek,mt6580-mfgcfg"))
 		return mtk_clk_simple_probe(pdev);
 	if (top)
-		count = 11;
+		count = 12;
 
 	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
@@ -190,6 +190,10 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	data->num = count;
 
 	if (top) {
+		/* SMI clock must remain enabled while the DISP domain is on. */
+		data->hws[CLK_MT6580_TOP_SMI] = devm_clk_hw_register_gate(dev,
+			"mt6580_smi", NULL, 0, base + 0x20, 9,
+			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 		data->hws[CLK_MT6580_TOP_THERM] = devm_clk_hw_register_gate(dev,
 			"mt6580_therm", NULL, 0, base + 0x24, 1,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);

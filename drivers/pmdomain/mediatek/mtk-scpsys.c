@@ -15,6 +15,7 @@
 
 #include <dt-bindings/power/mt2701-power.h>
 #include <dt-bindings/power/mt2712-power.h>
+#include <dt-bindings/power/mt6580-power.h>
 #include <dt-bindings/power/mt6797-power.h>
 #include <dt-bindings/power/mt7622-power.h>
 #include <dt-bindings/power/mt7623a-power.h>
@@ -25,6 +26,7 @@
 
 #define MTK_SCPD_ACTIVE_WAKEUP		BIT(0)
 #define MTK_SCPD_FWAIT_SRAM		BIT(1)
+#define MTK_SCPD_ALWAYS_ON		BIT(2)
 #define MTK_SCPD_CAPS(_scpd, _x)	((_scpd)->data->caps & (_x))
 
 #define SPM_VDE_PWR_CON			0x0210
@@ -89,6 +91,7 @@ enum clk_id {
 	CLK_HIFSEL,
 	CLK_JPGDEC,
 	CLK_AUDIO,
+	CLK_SMI,
 	CLK_MAX,
 };
 
@@ -103,6 +106,7 @@ static const char * const clk_names[] = {
 	"hif_sel",
 	"jpgdec",
 	"audio",
+	"smi",
 	NULL,
 };
 
@@ -512,6 +516,8 @@ static struct scp *init_scp(struct platform_device *pdev,
 		genpd->power_on = scpsys_power_on;
 		if (MTK_SCPD_CAPS(scpd, MTK_SCPD_ACTIVE_WAKEUP))
 			genpd->flags |= GENPD_FLAG_ACTIVE_WAKEUP;
+		if (MTK_SCPD_CAPS(scpd, MTK_SCPD_ALWAYS_ON))
+			genpd->flags |= GENPD_FLAG_ALWAYS_ON;
 	}
 
 	return scp;
@@ -1013,9 +1019,9 @@ static const struct scp_subdomain scp_subdomain_mt8173[] = {
 	{MT8173_POWER_DOMAIN_MFG_2D, MT8173_POWER_DOMAIN_MFG},
 };
 
-/* MT6580 vendor MFG sequence: four SRAM banks and AXI protection bit 5. */
+/* MT6580 BSP MTCMOS sequences. Domain IDs are independent of other SoCs. */
 static const struct scp_domain_data scp_domain_data_mt6580[] = {
-	{
+	[MT6580_POWER_DOMAIN_MFG] = {
 		.name = "mfg",
 		.sta_mask = PWR_STATUS_MFG,
 		.ctl_offs = SPM_MFG_PWR_CON,
@@ -1024,6 +1030,27 @@ static const struct scp_domain_data scp_domain_data_mt6580[] = {
 		.bus_prot_mask = BIT(5),
 		.clk_id = { CLK_MM, CLK_MFG },
 		.caps = MTK_SCPD_ACTIVE_WAKEUP,
+	},
+	[MT6580_POWER_DOMAIN_DISP] = {
+		.name = "disp",
+		.sta_mask = PWR_STATUS_DISP,
+		.ctl_offs = SPM_DIS_PWR_CON,
+		.sram_pdn_bits = GENMASK(11, 8),
+		.sram_pdn_ack_bits = BIT(12),
+		.bus_prot_mask = BIT(1),
+		.clk_id = { CLK_SMI },
+		/* SMI/LARB context restore is not implemented yet. Keep this
+		 * domain explicitly on instead of globally disabling genpd PM.
+		 */
+		.caps = MTK_SCPD_ALWAYS_ON,
+	},
+	[MT6580_POWER_DOMAIN_ISP] = {
+		.name = "isp",
+		.sta_mask = PWR_STATUS_ISP,
+		.ctl_offs = SPM_ISP_PWR_CON,
+		.sram_pdn_bits = GENMASK(11, 8),
+		.sram_pdn_ack_bits = GENMASK(13, 12),
+		.clk_id = { CLK_NONE },
 	},
 };
 

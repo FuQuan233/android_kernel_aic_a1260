@@ -72,7 +72,8 @@ Implemented
   reset and suspend delays. Regulator, reset and backlight handling use
   DRM/GPIO/regulator APIs. The optional DRM DTS now instantiates it with
   MT6580 DSI/PHY, MMSYS routing and a dedicated MMSYS reset GPIO output.
-  The PMIC supply and display power domain still retain firmware setup.
+  The panel supply still retains firmware setup. DISP is explicitly kept
+  powered until SMI/LARB context restoration is implemented.
   The local experimental compatible string is
   ``wingtech,wt6580-we-n-panel``. A panel node under the DSI host needs ``reg``,
   ``power-supply`` and an active-low ``reset-gpios``; ``backlight`` is
@@ -935,3 +936,45 @@ of sleep. The RTC wakes through PMIC parent Linux IRQ47, thermal sampling resume
 reads 43 C immediately after resume. Replug restores ADB and reacquires
 the MUSB activity lock. The temporary maintenance lock is released at
 the end; the normal schedutil policy and 1300 MHz cap remain active.
+
+Clock ownership, MTCMOS and PMIC power-off
+----------------------------------------
+
+The Android product no longer passes ``clk_ignore_unused`` or
+``pd_ignore_unused``. The diagnostic UP profile keeps its existing settings.
+MT6580 DISP uses TOPCKGEN +0x20 bit 9 (SMI_MM_SW), SRAM power-down bits
+11:8 with acknowledgement bit 12, and AXI protection bit 1. ISP uses
+SPM +0x238, SRAM bits 11:8 and acknowledgement bits 13:12, with no bus
+protection in the BSP sequence. MFG keeps its existing index 0; DISP and
+ISP are indices 1 and 2. Unused ISP is eligible for automatic power-off.
+
+DISP has an explicit ALWAYS_ON policy: its SMI/LARB register restore is
+not implemented. This permits generic clock/domain cleanup without losing
+firmware bus context. MFG still has the Utgard bind-lifetime reference.
+These changes do not implement GPU runtime power gating, a complete PLL
+clock tree, modem/connectivity power domains, or SPM deep sleep.
+
+The MT6580 DSI handover explicitly enables engine/digital clocks before
+stopping inherited video and polling registers. The earlier code depended
+on firmware keeping both clocks enabled and timed out after late unused
+clock cleanup. The normal PHY and display programming follows afterward.
+
+MT6350 RTC now registers a final SYS_OFF_MODE_POWER_OFF handler. It repeats
+the BSP PROT unlock (0x586a, 0x9136), disables RTC 32 kHz export only when
+PDN1 bits 12:8 have no users, then writes BBPU=0x4309 and WRTGR. Other RTC
+variants are unchanged. This path retains alarm power-on support and does
+not unconditionally reboot into a charger mode. Actual charger-attached
+power-off behavior still depends on the PMIC and boot firmware.
+
+The MT6580 WACS2 regmap uses a spinlock and bounded atomic MMIO polling,
+so the final power-off callback can operate after interrupts and secondary
+CPUs have stopped. It does not take the RTC mutex or call a sleeping helper.
+
+Hardware validation with build #29: Android boot_completed=1; the command
+line contains neither global ignore flag. Late init logs clock and domain
+cleanup, genpd reports ISP off and DISP/MFG on, and ISP control reads
+0x3f12 with bit 5 clear in both SPM status registers. Two screen-off/on
+cycles restore DSI video at 300 MHz with zero RDMA underflows or abnormal
+interrupts. Build #28 exposed the missing DSI clock acquisition described
+above; #29 corrects it. Battery-only PMIC power-off awaits the physical
+unplug/shutdown/power-key test; do not infer success from USB disconnect.

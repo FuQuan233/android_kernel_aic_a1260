@@ -31,7 +31,7 @@ static int mt6580_pwrap_xfer(struct mt6580_pwrap *wrp, unsigned int reg,
 		return -ENODEV;
 	if (FIELD_GET(WACS_FSM, status) == WACS_VALID)
 		writel(1, wrp->base + WACS2_VLDCLR);
-	ret = readl_poll_timeout(wrp->base + WACS2_RDATA, status,
+	ret = readl_poll_timeout_atomic(wrp->base + WACS2_RDATA, status,
 				FIELD_GET(WACS_FSM, status) == WACS_IDLE, 10, 10000);
 	if (ret)
 		return ret;
@@ -39,9 +39,9 @@ static int mt6580_pwrap_xfer(struct mt6580_pwrap *wrp, unsigned int reg,
 	writel((write ? BIT(31) : 0) | ((reg >> 1) << 16) |
 	       (write ? *value : 0), wrp->base + WACS2_CMD);
 	if (write)
-		return readl_poll_timeout(wrp->base + WACS2_RDATA, status,
+		return readl_poll_timeout_atomic(wrp->base + WACS2_RDATA, status,
 				FIELD_GET(WACS_FSM, status) == WACS_IDLE, 10, 10000);
-	ret = readl_poll_timeout(wrp->base + WACS2_RDATA, status,
+	ret = readl_poll_timeout_atomic(wrp->base + WACS2_RDATA, status,
 				FIELD_GET(WACS_FSM, status) == WACS_VALID, 10, 10000);
 	if (ret)
 		return ret;
@@ -61,6 +61,8 @@ static int mt6580_pwrap_write(void *context, unsigned int reg, unsigned int valu
 }
 
 static const struct regmap_config mt6580_pwrap_regmap = {
+	/* Final PMIC power-off runs with interrupts disabled. */
+	.fast_io = true,
 	.reg_bits = 16,
 	.val_bits = 16,
 	.reg_stride = 2,

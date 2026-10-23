@@ -66,6 +66,7 @@
 struct mtk_rtc_data {
 	u32                     wrtgr;
 	bool                    unlock;
+	bool                    poweroff;
 	u8                      year_offset;
 };
 

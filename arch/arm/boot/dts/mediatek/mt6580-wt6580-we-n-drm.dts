@@ -55,8 +55,9 @@
 		#power-domain-cells = <1>;
 		infracfg = <&infracfg>;
 		clocks = <&topckgen CLK_MT6580_TOP_MPLL_D5>,
-			 <&topckgen CLK_MT6580_TOP_MFG>;
-		clock-names = "mm", "mfg";
+			 <&topckgen CLK_MT6580_TOP_MFG>,
+			 <&topckgen CLK_MT6580_TOP_SMI>;
+		clock-names = "mm", "mfg", "smi";
 	};
 
 	mfgcfg: clock-controller@13000000 {
@@ -89,6 +90,7 @@
 		#clock-cells = <1>;
 		gpio-controller;
 		#gpio-cells = <2>;
+		power-domains = <&scpsys MT6580_POWER_DOMAIN_DISP>;
 	};
 
 	rdma0: rdma@14009000 {
