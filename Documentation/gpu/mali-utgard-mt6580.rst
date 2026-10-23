@@ -130,9 +130,39 @@ No new Oops, runtime-PM or power-domain failure was found in the boot log.
 Full system suspend/resume with the new GPU callbacks and long-duration
 stress remain unvalidated. DISP itself is still explicitly always-on.
 
-The image is ``out/a1260-runtime-pm/boot-gpu-d5-retained.img``; the same
-boot/kernel pair now supplies the canonical product output. Evidence is in
+The #31 fallback image is ``out/a1260-runtime-pm/boot-gpu-d5-retained.img``.
+Evidence is in
 ``out/a1260-runtime-pm/d5-retained-validation.txt``.
+
+Build #32 replaces the critical D5 guard with firmware-selected parent
+aliases for SMI, USB bus, MFG, MSDC0 and display PWM, derived from the BSP
+``mt_clkmgr.c`` tables. MPLL/UPLL retain their firmware rates and muxes;
+this is not a PLL retuning implementation. D5 uses SET_MPLL_FREDIV_EN at
+TOPCKGEN +0x60 and CLR_MPLL_FREDIV_EN at +0x90, rather than modifying the
+status register at +0x30. Its D10/D20/D40 descendants propagate references.
+Other divider gates remain firmware-managed. Unported MSDC1/NFI consumers
+receive explicit critical references only if their boot mux selects a D5
+descendant; neither hold is needed with this board's observed selections.
+
+The board boots with mux registers 0x27613c46/0x01291008. CCF reports
+SMI=MPLL/5 (300.3 MHz), USB bus=UPLL/16 (78 MHz), MFG=MPLL/3 (500.5 MHz),
+MSDC0=UPLL/6 (208 MHz), PWM=26 MHz and USB48M=UPLL/26 (48 MHz).
+These rates follow the BSP PLL constants and observed mux values, not an
+independent frequency measurement. With GPU suspended, D5 has enable count
+1 from SMI and no critical flag. Android reaches boot_completed, the EGL
+probe draws and reads back RGBA 0,255,0,255 with GL error 0, and MFG then
+returns to off with control 0xff12 and bit 4 clear in both SPM status words.
+Two screen-off/on cycles preserve ADB and leave RDMA underflows/abnormal
+counts at zero. Thermal readings, input registration and a small eMMC read
+also succeed; no new Oops or power-domain failure appears in this run.
+
+The verified #32 boot/kernel pair supplies the canonical Android product
+output and is retained as ``out/a1260-runtime-pm/boot-clock-parents.img``
+and ``kernel-clock-parents``. Evidence is in
+``out/a1260-runtime-pm/clock-parents-validation.txt``. I2C/APDMA still use
+the existing fixed source; AUXADC and display engine parents, other divider
+gates, PLL control and DISP context restoration remain incomplete. Full
+system suspend/resume with the new GPU callbacks remains unvalidated.
 
 Fixed-power validation
 ----------------------

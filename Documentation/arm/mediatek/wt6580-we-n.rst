@@ -951,8 +951,12 @@ ISP are indices 1 and 2. Unused ISP is eligible for automatic power-off.
 DISP has an explicit ALWAYS_ON policy: its SMI/LARB register restore is
 not implemented. This permits generic clock/domain cleanup without losing
 firmware bus context. Build #31 adds Utgard runtime MFG gating, with real
-render/resuspend and two display off/on cycles verified. A temporary critical
-MPLL_D5 reference protects the unmodeled shared SMI parent; see
+render/resuspend and two display off/on cycles verified. Build #32 replaces
+the temporary critical MPLL_D5 reference with the firmware-selected SMI,
+USB, MFG, MSDC0 and display PWM parent relationships. The D5 descendants
+D10/D20/D40 propagate shared references, and D5 uses the hardware SET/CLR
+aliases. SMI holds D5 while DISP remains on; GPU power-off no longer removes
+the last reference. PLL rates and mux selections remain firmware-managed; see
 Documentation/gpu/mali-utgard-mt6580.rst for evidence and limitations.
 The complete PLL clock tree, modem/connectivity domains and SPM deep sleep
 remain unfinished.

@@ -146,24 +146,224 @@ static const struct mtk_clk_desc mt6580_mfg_desc = {
 	.need_runtime_pm = true,
 };
 
-/* Preserve firmware muxes; no DVFS or voltage changes during bring-up. */
-static unsigned long mt6580_mfg_rate(void __iomem *base)
-{
-	u32 mux = (readl(base + 4) >> 8) & 0x3f;
+/* Firmware PLL rates are retained; this driver does not retune MPLL/UPLL.
+ * Only D5's divider gate is managed here. Other divider gates remain in the
+ * firmware state, but their parent relationships must propagate D5 references.
+ */
+struct mt6580_d5_clk {
+	struct clk_hw hw;
+	void __iomem *base;
+};
 
-	switch (mux & 0x38) {
-	case 0x08:
-		return 416000000;
-	case 0x10:
-		return 500500000;
-	case 0x20:
-		switch (mux & 7) {
-		case 1: return 300300000;
-		case 2: return 214500000;
-		case 4: return 107250000;
-		}
-		break;
+static int mt6580_d5_enable(struct clk_hw *hw)
+{
+	struct mt6580_d5_clk *d5 = container_of(hw, struct mt6580_d5_clk, hw);
+
+	writel(BIT(2), d5->base + 0x60); /* SET_MPLL_FREDIV_EN */
+	return 0;
+}
+
+static void mt6580_d5_disable(struct clk_hw *hw)
+{
+	struct mt6580_d5_clk *d5 = container_of(hw, struct mt6580_d5_clk, hw);
+
+	writel(BIT(2), d5->base + 0x90); /* CLR_MPLL_FREDIV_EN */
+}
+
+static int mt6580_d5_is_enabled(struct clk_hw *hw)
+{
+	struct mt6580_d5_clk *d5 = container_of(hw, struct mt6580_d5_clk, hw);
+
+	return !!(readl(d5->base + 0x30) & BIT(2));
+}
+
+static const struct clk_ops mt6580_d5_ops = {
+	.enable = mt6580_d5_enable,
+	.disable = mt6580_d5_disable,
+	.is_enabled = mt6580_d5_is_enabled,
+};
+
+static struct clk_hw *mt6580_register_d5(struct device *dev, void __iomem *base)
+{
+	const char *parent = "mt6580_mpll_d5_src";
+	struct clk_init_data init = {
+		.name = "mt6580_mpll_d5",
+		.ops = &mt6580_d5_ops,
+		.parent_names = &parent,
+		.num_parents = 1,
+	};
+	struct mt6580_d5_clk *d5;
+	int ret;
+
+	d5 = devm_kzalloc(dev, sizeof(*d5), GFP_KERNEL);
+	if (!d5)
+		return ERR_PTR(-ENOMEM);
+	d5->base = base;
+	d5->hw.init = &init;
+	ret = devm_clk_hw_register(dev, &d5->hw);
+	return ret ? ERR_PTR(ret) : &d5->hw;
+}
+
+static const struct {
+	const char *name;
+	const char *parent;
+	unsigned int div;
+} mt6580_fw_factors[] = {
+	{ "mt6580_mpll_d2", "mt6580_mpll", 2 },
+	{ "mt6580_mpll_d3", "mt6580_mpll", 3 },
+	{ "mt6580_mpll_d5_src", "mt6580_mpll", 5 },
+	{ "mt6580_mpll_d7", "mt6580_mpll", 7 },
+	{ "mt6580_mpll_d11", "mt6580_mpll", 11 },
+	{ "mt6580_mpll_d4", "mt6580_mpll_d2", 2 },
+	{ "mt6580_mpll_d6", "mt6580_mpll_d3", 2 },
+	{ "mt6580_mpll_d10", "mt6580_mpll_d5", 2 },
+	{ "mt6580_mpll_d14", "mt6580_mpll_d7", 2 },
+	{ "mt6580_mpll_d8", "mt6580_mpll_d4", 2 },
+	{ "mt6580_mpll_d12", "mt6580_mpll_d6", 2 },
+	{ "mt6580_mpll_d20", "mt6580_mpll_d10", 2 },
+	{ "mt6580_mpll_d28", "mt6580_mpll_d14", 2 },
+	{ "mt6580_mpll_d16", "mt6580_mpll_d8", 2 },
+	{ "mt6580_mpll_d24", "mt6580_mpll_d12", 2 },
+	{ "mt6580_mpll_d40", "mt6580_mpll_d20", 2 },
+	{ "mt6580_upll_d3", "mt6580_upll", 3 },
+	{ "mt6580_upll_d6", "mt6580_upll_d3", 2 },
+	{ "mt6580_upll_d7", "mt6580_upll", 7 },
+	{ "mt6580_upll_d12", "mt6580_upll_d6", 2 },
+	{ "mt6580_upll_d16", "mt6580_upll", 16 },
+};
+
+static const char * const mt6580_msdc_parents[] = {
+	"mt6580_mpll_d12", "mt6580_mpll_d10", "mt6580_mpll_d8",
+	"mt6580_upll_d7", "mt6580_mpll_d7", "mt6580_mpll_d8",
+	"dummy26m", "mt6580_upll_d6",
+};
+
+/* Snapshot the boot muxes: there is deliberately no set_parent operation.
+ * Keep unknown encodings from silently becoming unrelated fixed-rate roots.
+ */
+static const char *mt6580_smi_parent(u32 sel)
+{
+	if (!(sel & 8))
+		return "dummy26m";
+	switch (sel) {
+	case 9: return "mt6580_mpll_d5";
+	case 10: return "mt6580_mpll_d7";
+	case 12: return "mt6580_mpll_d14";
+	default: return NULL;
 	}
+}
+
+static const char *mt6580_usb_parent(u32 sel)
+{
+	switch (sel) {
+	case 1: return "dummy26m";
+	case 2: return "mt6580_upll_d16";
+	case 4: return "mt6580_mpll_d20";
+	default: return NULL;
+	}
+}
+
+static const char *mt6580_mfg_parent(u32 sel0, u32 sel1)
+{
+	switch (sel1 & 0x38) {
+	case 0x08:
+		/* The alternate input is selected by the non-glitch-free mux. */
+		if ((sel0 & 5) == 4)
+			return "dummy26m";
+		return (sel0 & 7) == 2 ? "mt6580_upll_d3" : NULL;
+	case 0x10: return "mt6580_mpll_d3";
+	case 0x20:
+		switch (sel1 & 7) {
+		case 1: return "mt6580_mpll_d5";
+		case 2: return "mt6580_mpll_d7";
+		case 4: return "mt6580_mpll_d14";
+		}
+		fallthrough;
+	default: return NULL;
+	}
+}
+
+static int mt6580_register_parent_alias(struct device *dev, const char *name,
+				       const char *parent, unsigned long flags)
+{
+	struct clk_hw *hw;
+
+	if (!parent)
+		return dev_err_probe(dev, -EINVAL, "Unknown firmware parent for %s\n", name);
+	hw = devm_clk_hw_register_fixed_factor(dev, name, parent, flags, 1, 1);
+	return PTR_ERR_OR_ZERO(hw);
+}
+
+static int mt6580_register_top_sources(struct device *dev, void __iomem *base,
+				      struct clk_hw_onecell_data *data)
+{
+	struct clk_hw *hw;
+	u32 sel0 = readl(base), sel1 = readl(base + 4);
+	const char *smi = mt6580_smi_parent((sel1 >> 16) & 0xf);
+	const char *usb = mt6580_usb_parent((sel1 >> 20) & 7);
+	const char *mfg = mt6580_mfg_parent(sel0 >> 8, (sel1 >> 8) & 0x3f);
+	const char *nfi_d5 = NULL;
+	unsigned int i;
+	int ret;
+
+	hw = devm_clk_hw_register_fixed_rate(dev, "mt6580_mpll", "dummy26m", 0,
+					    1501500000);
+	if (IS_ERR(hw))
+		return PTR_ERR(hw);
+	hw = devm_clk_hw_register_fixed_rate(dev, "mt6580_upll", "dummy26m", 0,
+					    1248000000);
+	if (IS_ERR(hw))
+		return PTR_ERR(hw);
+	for (i = 0; i < ARRAY_SIZE(mt6580_fw_factors); i++) {
+		hw = devm_clk_hw_register_fixed_factor(dev, mt6580_fw_factors[i].name,
+			mt6580_fw_factors[i].parent, 0, 1, mt6580_fw_factors[i].div);
+		if (IS_ERR(hw))
+			return PTR_ERR(hw);
+	}
+	data->hws[CLK_MT6580_TOP_MPLL_D5] = mt6580_register_d5(dev, base);
+	if (IS_ERR(data->hws[CLK_MT6580_TOP_MPLL_D5]))
+		return PTR_ERR(data->hws[CLK_MT6580_TOP_MPLL_D5]);
+
+	ret = mt6580_register_parent_alias(dev, "mt6580_smi_src", smi, 0);
+	if (ret)
+		return ret;
+	ret = mt6580_register_parent_alias(dev, "mt6580_usb_bus_src", usb, 0);
+	if (ret)
+		return ret;
+	ret = mt6580_register_parent_alias(dev, "mt6580_mfg_src", mfg, 0);
+	if (ret)
+		return ret;
+	ret = mt6580_register_parent_alias(dev, "mt6580_msdc0_src",
+					  mt6580_msdc_parents[(sel0 >> 11) & 7], 0);
+	if (ret)
+		return ret;
+	ret = mt6580_register_parent_alias(dev, "mt6580_disp_pwm_src",
+					  sel0 & BIT(18) ? "mt6580_upll_d12" : "dummy26m", 0);
+	if (ret)
+		return ret;
+
+	/* Unported firmware consumers must not lose D5 when DISP is later
+	 * allowed to power off. Retain only their selected D5 branches, not
+	 * a blanket critical D5. Drop these holds when their drivers own PM.
+	 */
+	if (((sel0 >> 20) & 7) == 1) {
+		ret = mt6580_register_parent_alias(dev, "mt6580_fw_msdc1",
+						  "mt6580_mpll_d10", CLK_IS_CRITICAL);
+		if (ret)
+			return ret;
+	}
+	if ((sel1 & 0x7f) == 0x12)
+		nfi_d5 = "mt6580_mpll_d10";
+	else if ((sel1 & 0x7f) == 0x24)
+		nfi_d5 = "mt6580_mpll_d40";
+	if (nfi_d5) {
+		ret = mt6580_register_parent_alias(dev, "mt6580_fw_nfi",
+						  nfi_d5, CLK_IS_CRITICAL);
+		if (ret)
+			return ret;
+	}
+	dev_info(dev, "Firmware parents: SMI=%s USB=%s MFG=%s MSDC0=%s; mux=%#x/%#x\n",
+		 smi, usb, mfg, mt6580_msdc_parents[(sel0 >> 11) & 7], sel0, sel1);
 	return 0;
 }
 
@@ -176,6 +376,7 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	bool top = of_device_is_compatible(dev->of_node, "mediatek,mt6580-topckgen");
 	unsigned int count = 3;
 	unsigned int i;
+	int ret;
 
 	if (of_device_is_compatible(dev->of_node, "mediatek,mt6580-mfgcfg"))
 		return mtk_clk_simple_probe(pdev);
@@ -191,36 +392,28 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	data->num = count;
 
 	if (top) {
+		ret = mt6580_register_top_sources(dev, base, data);
+		if (ret)
+			return ret;
+
 		/* SMI clock must remain enabled while the DISP domain is on. */
 		data->hws[CLK_MT6580_TOP_SMI] = devm_clk_hw_register_gate(dev,
-			"mt6580_smi", NULL, 0, base + 0x20, 9,
+			"mt6580_smi", "mt6580_smi_src", 0, base + 0x20, 9,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 		data->hws[CLK_MT6580_TOP_THERM] = devm_clk_hw_register_gate(dev,
-			"mt6580_therm", NULL, 0, base + 0x24, 1,
+			"mt6580_therm", "dummy26m", 0, base + 0x24, 1,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 		data->hws[CLK_MT6580_TOP_AUXADC] = devm_clk_hw_register_gate(dev,
 			"mt6580_auxadc", NULL, 0, base + 0x24, 30,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
-		/* Keep LK's mux selection; rates from the MT6580 clock manager. */
-		static const unsigned long msdc_rates[] = {
-			125130000, 150150000, 187690000, 178280000,
-			214500000, 187690000, 26000000, 208000000,
-		};
-		u32 mux = (readl(base) >> 11) & 7;
-
-		source = devm_clk_hw_register_fixed_rate(dev, "mt6580_msdc0_src",
-						       NULL, 0, msdc_rates[mux]);
-		if (IS_ERR(source))
-			return PTR_ERR(source);
 		data->hws[CLK_MT6580_TOP_MSDC0] = devm_clk_hw_register_gate(dev,
 			"mt6580_msdc0", "mt6580_msdc0_src", 0, base + 0x20, 17,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
-		dev_info(dev, "MSDC0 firmware mux %u, source %lu Hz\n",
-			 mux, msdc_rates[mux]);
+
 
 		/* CLK_GATING_CTRL1[13]: 1 gates the USB bus clock. */
 		data->hws[CLK_MT6580_TOP_USB] = devm_clk_hw_register_gate(dev,
-			"mt6580_usb_bus", NULL, 0, base + 0x24, 13,
+			"mt6580_usb_bus", "mt6580_usb_bus_src", 0, base + 0x24, 13,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 
 		/* Vendor I2C source is 125 MHz, divided by ten in the controller. */
@@ -240,54 +433,22 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 		data->hws[CLK_MT6580_TOP_APDMA] = devm_clk_hw_register_gate(dev,
 			"mt6580_apdma", "mt6580_i2c_src", 0, base + 0x24, 2,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
-		/* CLK_MUX_SEL0[18]: 26 MHz or UPLL/12; preserve the LK mux. */
-		source = devm_clk_hw_register_fixed_rate(dev, "mt6580_disp_pwm_src",
-			NULL, 0, readl(base) & BIT(18) ? 104000000 : 26000000);
-		if (IS_ERR(source))
-			return PTR_ERR(source);
 		data->hws[CLK_MT6580_TOP_DISP_PWM] = devm_clk_hw_register_gate(dev,
 			"mt6580_disp_pwm", "mt6580_disp_pwm_src", 0, base + 0x20, 0,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 
-		/*
-		 * MFG power-on needs MPLL_D5 before the top bus gate, but D5 is
-		 * shared: SMI can select it directly and USB can select D20 via
-		 * D10. MSDC and NFI also have D5-derived mux choices in the BSP.
-		 * Those firmware-selected parents are not all represented yet.
-		 * Keep this source on so MFG runtime suspend cannot cut another
-		 * bus's clock. This does not keep BG3D or the MFG domain powered.
-		 * TODO: remove CLK_IS_CRITICAL once all live D5 consumers have
-		 * real parent references, including the D10/D20/D40 branches.
-		 */
-		source = devm_clk_hw_register_fixed_rate(dev, "mt6580_mpll_d5_src",
-						       NULL, 0, 300300000);
-		if (IS_ERR(source))
-			return PTR_ERR(source);
-		data->hws[CLK_MT6580_TOP_MPLL_D5] = devm_clk_hw_register_gate(dev,
-			"mt6580_mpll_d5", "mt6580_mpll_d5_src",
-			CLK_IS_CRITICAL, base + 0x30, 2,
-			0, &mt6580_usb_clk_lock);
-		dev_info(dev,
-			 "Shared D5 retained: SMI mux %#x, USB mux %#x, MPLL dividers %#x\n",
-			 (readl(base + 4) >> 16) & 0xf,
-			 (readl(base + 4) >> 20) & 7, readl(base + 0x30));
-		source = devm_clk_hw_register_fixed_rate(dev, "mt6580_mfg_src",
-						       NULL, 0, mt6580_mfg_rate(base));
-		if (IS_ERR(source))
-			return PTR_ERR(source);
 		data->hws[CLK_MT6580_TOP_MFG] = devm_clk_hw_register_gate(dev,
 			"mt6580_mfg_bus", "mt6580_mfg_src", 0, base + 0x20, 2,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
-		dev_info(dev, "MFG firmware mux %#x, source %lu Hz\n",
-			 (readl(base + 4) >> 8) & 0x3f, mt6580_mfg_rate(base));
+
 	} else {
 		data->hws[CLK_MT6580_APMIXED_CPU] = mt6580_register_cpu_clk(pdev, base);
 		/* USB retains the firmware's UNIVPLL rate and enable state. */
 		if (!(readl(base + 0x140) & BIT(0)))
 			return dev_err_probe(dev, -EIO,
 					     "UNIVPLL is off; firmware clock setup required\n");
-		source = devm_clk_hw_register_fixed_rate(dev, "mt6580_usb_48m_src",
-						       NULL, 0, 48000000);
+		source = devm_clk_hw_register_fixed_factor(dev, "mt6580_usb_48m_src",
+						         "mt6580_upll", 0, 1, 26);
 		if (IS_ERR(source))
 			return PTR_ERR(source);
 		/* Vendor UNIV48M_EN_BIT[29] and USB48M_EN_BIT[28]. */
