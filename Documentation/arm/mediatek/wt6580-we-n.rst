@@ -1242,3 +1242,41 @@ restored RDMA with zero underflows or abnormal events. Temporary wake locks
 and the RTC alarm were cleared; plugged-in stay-on remains 0. Evidence is
 ``out/a1260-runtime-pm/pwrap-clocks-47-{initial,suspend,final}.txt``.
 This does not establish DDR self-refresh or full PLL power-down support.
+
+PLL divider gate visibility and ownership
+----------------------------------------
+
+Build #48 reads the actual FREDIV_EN bits for the 16 MAINPLL and 12 UNIVPLL
+divider gates. Previously their fixed-factor declarations reported hardware
+status for 27 of these branches could not reflect a cleared gate bit;
+MPLL_D5 already had hardware gate control. Rates and parent chains are unchanged.
+The enable indication describes the local gate bit, not a measured running
+clock when an upstream gate or PLL is off.
+
+The driver manages MPLL_D5 and now UPLL_D16/UPLL_D20 using the hardware SET/CLR
+registers, followed by a read to flush the write. UPLL_D16 feeds the USB bus
+and one PMIC SPI mux input; UPLL_D20 feeds another PMIC SPI input. Their
+consumers have clock references, including the PWRAP references added in
+#47. The other 25 divider gates expose read-only hardware status and retain
+firmware ownership. Their unported consumers, such as UART/audio/camera/DDR
+paths, must be modeled before those gates can be switched automatically.
+MAINPLL/UNIVPLL tuning and power remain under firmware control.
+
+On hardware UPLL_FREDIV_EN changes from 0xffffffff to 0xfffbffff: unused
+UPLL_D20 bit 18 is cleared, while UPLL_D16 bit 24 remains set for configured
+USB. PMIC SPI remains on the 26 MHz crystal, with both wrapper clock
+references held and register reads/charging/thermal sampling working.
+Android boot and a real Mali GLES draw/readback passed. An off/on cycle after
+boot powered DISP/MFG off, cleared MPLL_D5 bit 2, and restored RDMA with zero
+underflows or abnormal events. A USB-none/RTC check recorded two successful
+s2idle cycles, zero failures and PMIC IRQ wakes, then automatically restored
+configured ADB. PWRAP references and divider states survived. Temporary wake
+locks and the RTC alarm were cleared, and plugged-in stay-on remains 0.
+Captures are ``out/a1260-runtime-pm/divider-gates-48-`` followed by
+``initial.txt``, ``validation.txt``, ``suspend.txt`` and ``final.txt``.
+
+The display clock audit still finds only gate controls for DSI_ENGINE and
+DSI_DIGITAL, with no source recorded in the BSP clock manager. RDMA0 is
+explicitly AO there. Preserve these semantics until parent identities can
+be established; the absence of a parent frequency in clk_summary is not
+evidence that its gate or the DISP runtime power sequence is missing.

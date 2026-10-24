@@ -209,97 +209,129 @@ static const struct mtk_clk_desc mt6580_mfg_desc = {
 	.need_runtime_pm = true,
 };
 
-/* Firmware PLL rates are retained; this driver does not retune MPLL/UPLL.
- * Only D5's divider gate is managed here. Other divider gates remain in the
- * firmware state, but their parent relationships must propagate D5 references.
+/* Each PLL divider has its own active-high FREDIV_EN bit. Keep unowned
+ * branches read-only until all of their firmware consumers are modeled.
  */
-struct mt6580_d5_clk {
-	struct clk_hw hw;
-	void __iomem *base;
+struct mt6580_div_desc {
+	const char *name;
+	const char *parent;
+	u8 div;
+	u8 sta;
+	u8 shift;
+	bool managed;
 };
 
-static int mt6580_d5_enable(struct clk_hw *hw)
-{
-	struct mt6580_d5_clk *d5 = container_of(hw, struct mt6580_d5_clk, hw);
+struct mt6580_div_clk {
+	struct clk_hw hw;
+	void __iomem *reg;
+	const struct mt6580_div_desc *desc;
+};
 
-	writel(BIT(2), d5->base + 0x60); /* SET_MPLL_FREDIV_EN */
+static int mt6580_div_enable(struct clk_hw *hw)
+{
+	struct mt6580_div_clk *div = container_of(hw, struct mt6580_div_clk, hw);
+
+	writel(BIT(div->desc->shift), div->reg + 0x30); /* SET_FREDIV_EN */
+	readl(div->reg);
 	return 0;
 }
 
-static void mt6580_d5_disable(struct clk_hw *hw)
+static void mt6580_div_disable(struct clk_hw *hw)
 {
-	struct mt6580_d5_clk *d5 = container_of(hw, struct mt6580_d5_clk, hw);
+	struct mt6580_div_clk *div = container_of(hw, struct mt6580_div_clk, hw);
 
-	writel(BIT(2), d5->base + 0x90); /* CLR_MPLL_FREDIV_EN */
+	writel(BIT(div->desc->shift), div->reg + 0x60); /* CLR_FREDIV_EN */
+	readl(div->reg);
 }
 
-static int mt6580_d5_is_enabled(struct clk_hw *hw)
+static int mt6580_div_is_enabled(struct clk_hw *hw)
 {
-	struct mt6580_d5_clk *d5 = container_of(hw, struct mt6580_d5_clk, hw);
+	struct mt6580_div_clk *div = container_of(hw, struct mt6580_div_clk, hw);
 
-	return !!(readl(d5->base + 0x30) & BIT(2));
+	return !!(readl(div->reg) & BIT(div->desc->shift));
 }
 
-static const struct clk_ops mt6580_d5_ops = {
-	.enable = mt6580_d5_enable,
-	.disable = mt6580_d5_disable,
-	.is_enabled = mt6580_d5_is_enabled,
+static unsigned long mt6580_div_recalc_rate(struct clk_hw *hw,
+					 unsigned long parent_rate)
+{
+	struct mt6580_div_clk *div = container_of(hw, struct mt6580_div_clk, hw);
+
+	return parent_rate / div->desc->div;
+}
+
+static const struct clk_ops mt6580_div_ops = {
+	.enable = mt6580_div_enable,
+	.disable = mt6580_div_disable,
+	.is_enabled = mt6580_div_is_enabled,
+	.recalc_rate = mt6580_div_recalc_rate,
 };
 
-static struct clk_hw *mt6580_register_d5(struct device *dev, void __iomem *base)
+static const struct clk_ops mt6580_div_ro_ops = {
+	.is_enabled = mt6580_div_is_enabled,
+	.recalc_rate = mt6580_div_recalc_rate,
+};
+
+static struct clk_hw *mt6580_register_div(struct device *dev, void __iomem *base,
+					const struct mt6580_div_desc *desc)
 {
-	const char *parent = "mt6580_mpll_d5_src";
 	struct clk_init_data init = {
-		.name = "mt6580_mpll_d5",
-		.ops = &mt6580_d5_ops,
-		.parent_names = &parent,
+		.name = desc->name,
+		.ops = desc->managed ? &mt6580_div_ops : &mt6580_div_ro_ops,
+		.parent_names = &desc->parent,
 		.num_parents = 1,
+		.flags = CLK_GET_RATE_NOCACHE,
 	};
-	struct mt6580_d5_clk *d5;
+	struct mt6580_div_clk *div;
 	int ret;
 
-	d5 = devm_kzalloc(dev, sizeof(*d5), GFP_KERNEL);
-	if (!d5)
+	div = devm_kzalloc(dev, sizeof(*div), GFP_KERNEL);
+	if (!div)
 		return ERR_PTR(-ENOMEM);
-	d5->base = base;
-	d5->hw.init = &init;
-	ret = devm_clk_hw_register(dev, &d5->hw);
-	return ret ? ERR_PTR(ret) : &d5->hw;
+	div->reg = base + desc->sta;
+	div->desc = desc;
+	div->hw.init = &init;
+	ret = devm_clk_hw_register(dev, &div->hw);
+	return ret ? ERR_PTR(ret) : &div->hw;
 }
 
-static const struct {
-	const char *name;
-	const char *parent;
-	unsigned int div;
-} mt6580_fw_factors[] = {
-	{ "mt6580_mpll_d2", "mt6580_mpll", 2 },
-	{ "mt6580_mpll_d3", "mt6580_mpll", 3 },
+static const struct mt6580_div_desc mt6580_d5 = {
+	"mt6580_mpll_d5", "mt6580_mpll_d5_src", 1, 0x30, 2, true,
+};
+
+/* UPLL_D16 feeds the USB bus and one PMIC SPI mux input. UPLL_D20 feeds
+ * only another PMIC SPI input. Both consumers now have clock references.
+ * Other divider gates retain firmware ownership, including the upstream
+ * branches shared with unported UART/audio/camera/DDR consumers.
+ */
+static const struct mt6580_div_desc mt6580_fw_divs[] = {
+	{ "mt6580_mpll_d2", "mt6580_mpll", 2, 0x30, 0, false },
+	{ "mt6580_mpll_d3", "mt6580_mpll", 3, 0x30, 1, false },
 	{ "mt6580_mpll_d5_src", "mt6580_mpll", 5 },
-	{ "mt6580_mpll_d7", "mt6580_mpll", 7 },
-	{ "mt6580_mpll_d11", "mt6580_mpll", 11 },
-	{ "mt6580_mpll_d4", "mt6580_mpll_d2", 2 },
-	{ "mt6580_mpll_d6", "mt6580_mpll_d3", 2 },
-	{ "mt6580_mpll_d10", "mt6580_mpll_d5", 2 },
-	{ "mt6580_mpll_d14", "mt6580_mpll_d7", 2 },
-	{ "mt6580_mpll_d8", "mt6580_mpll_d4", 2 },
-	{ "mt6580_mpll_d12", "mt6580_mpll_d6", 2 },
-	{ "mt6580_mpll_d20", "mt6580_mpll_d10", 2 },
-	{ "mt6580_mpll_d28", "mt6580_mpll_d14", 2 },
-	{ "mt6580_mpll_d16", "mt6580_mpll_d8", 2 },
-	{ "mt6580_mpll_d24", "mt6580_mpll_d12", 2 },
-	{ "mt6580_mpll_d40", "mt6580_mpll_d20", 2 },
-	{ "mt6580_upll_d2", "mt6580_upll", 2 },
-	{ "mt6580_upll_d3", "mt6580_upll", 3 },
-	{ "mt6580_upll_d4", "mt6580_upll_d2", 2 },
-	{ "mt6580_upll_d5", "mt6580_upll", 5 },
-	{ "mt6580_upll_d6", "mt6580_upll_d3", 2 },
-	{ "mt6580_upll_d7", "mt6580_upll", 7 },
-	{ "mt6580_upll_d8", "mt6580_upll_d4", 2 },
-	{ "mt6580_upll_d10", "mt6580_upll_d5", 2 },
-	{ "mt6580_upll_d12", "mt6580_upll_d6", 2 },
-	{ "mt6580_upll_d16", "mt6580_upll_d8", 2 },
-	{ "mt6580_upll_d20", "mt6580_upll_d10", 2 },
-	{ "mt6580_upll_d24", "mt6580_upll_d12", 2 },
+	{ "mt6580_mpll_d7", "mt6580_mpll", 7, 0x30, 3, false },
+	{ "mt6580_mpll_d11", "mt6580_mpll", 11, 0x30, 4, false },
+	{ "mt6580_mpll_d4", "mt6580_mpll_d2", 2, 0x30, 8, false },
+	{ "mt6580_mpll_d6", "mt6580_mpll_d3", 2, 0x30, 9, false },
+	{ "mt6580_mpll_d10", "mt6580_mpll_d5", 2, 0x30, 10, false },
+	{ "mt6580_mpll_d14", "mt6580_mpll_d7", 2, 0x30, 11, false },
+	{ "mt6580_mpll_d8", "mt6580_mpll_d4", 2, 0x30, 16, false },
+	{ "mt6580_mpll_d12", "mt6580_mpll_d6", 2, 0x30, 17, false },
+	{ "mt6580_mpll_d20", "mt6580_mpll_d10", 2, 0x30, 18, false },
+	{ "mt6580_mpll_d28", "mt6580_mpll_d14", 2, 0x30, 19, false },
+	{ "mt6580_mpll_d16", "mt6580_mpll_d8", 2, 0x30, 23, false },
+	{ "mt6580_mpll_d24", "mt6580_mpll_d12", 2, 0x30, 24, false },
+	{ "mt6580_mpll_d40", "mt6580_mpll_d20", 2, 0x30, 25, false },
+	{ "mt6580_upll_d2", "mt6580_upll", 2, 0x34, 0, false },
+	{ "mt6580_upll_d3", "mt6580_upll", 3, 0x34, 1, false },
+	{ "mt6580_upll_d4", "mt6580_upll_d2", 2, 0x34, 8, false },
+	{ "mt6580_upll_d5", "mt6580_upll", 5, 0x34, 2, false },
+	{ "mt6580_upll_d6", "mt6580_upll_d3", 2, 0x34, 9, false },
+	{ "mt6580_upll_d7", "mt6580_upll", 7, 0x34, 3, false },
+	{ "mt6580_upll_d8", "mt6580_upll_d4", 2, 0x34, 16, false },
+	{ "mt6580_upll_d10", "mt6580_upll_d5", 2, 0x34, 10, false },
+	{ "mt6580_upll_d12", "mt6580_upll_d6", 2, 0x34, 17, false },
+	{ "mt6580_upll_d16", "mt6580_upll_d8", 2, 0x34, 24, true },
+	{ "mt6580_upll_d20", "mt6580_upll_d10", 2, 0x34, 18, true },
+	{ "mt6580_upll_d24", "mt6580_upll_d12", 2, 0x34, 25, false },
 };
 
 static const char * const mt6580_pmic_spi_parents[] = {
@@ -392,13 +424,18 @@ static int mt6580_register_top_sources(struct device *dev, void __iomem *base,
 	unsigned int i;
 	int ret;
 
-	for (i = 0; i < ARRAY_SIZE(mt6580_fw_factors); i++) {
-		hw = devm_clk_hw_register_fixed_factor(dev, mt6580_fw_factors[i].name,
-			mt6580_fw_factors[i].parent, 0, 1, mt6580_fw_factors[i].div);
+	for (i = 0; i < ARRAY_SIZE(mt6580_fw_divs); i++) {
+		const struct mt6580_div_desc *desc = &mt6580_fw_divs[i];
+
+		if (desc->sta)
+			hw = mt6580_register_div(dev, base, desc);
+		else
+			hw = devm_clk_hw_register_fixed_factor(dev, desc->name,
+							      desc->parent, 0, 1, desc->div);
 		if (IS_ERR(hw))
 			return PTR_ERR(hw);
 	}
-	data->hws[CLK_MT6580_TOP_MPLL_D5] = mt6580_register_d5(dev, base);
+	data->hws[CLK_MT6580_TOP_MPLL_D5] = mt6580_register_div(dev, base, &mt6580_d5);
 	if (IS_ERR(data->hws[CLK_MT6580_TOP_MPLL_D5]))
 		return PTR_ERR(data->hws[CLK_MT6580_TOP_MPLL_D5]);
 
