@@ -1184,3 +1184,32 @@ underflows/abnormal interrupts, charging detection and calibrated thermal
 sampling recovered. No temporary maintenance wake lock survived the boot.
 This validates the observed battery-only shutdown/power-key startup cycle;
 charger-attached shutdown and off-state current measurement remain untested.
+
+Firmware PLL readback
+---------------------
+
+Build #46 replaces the fixed MAINPLL/UNIVPLL frequency declarations with
+read-only APMIXEDSYS clocks. MAINPLL uses CON1[20:0] as a 7.14 PCW;
+UNIVPLL uses CON1[6:0] as the integer feedback divider. CON1[26:24]
+selects the post-divider. Enable state is read from CON0 bit 0. No PLL
+tuning, enable, isolation or power register is written by these root clocks.
+TOPCKGEN explicitly depends on both roots before publishing its consumers,
+preventing an early consumer from seeing a zero-rate orphan.
+
+Hardware reads at 0x10018124/0x10018144 were 0x800e7000/0x01000060:
+with the 26 MHz crystal these produce 1501.5 MHz/1248 MHz, matching the
+previous firmware settings. Android boot completed; USB bus/PHY, MSDC0,
+GPU and SMI report 78/48, 208, 500.5 and 300.3 MHz respectively. A real
+Mali GLES draw/readback passed. Screen-off powered DISP/MFG down and
+released MPLL_D5; screen-on restored scanout with zero RDMA underflows
+or abnormal events. Input devices, PMIC charging and thermal reads also
+remained available. Captures are
+``out/a1260-runtime-pm/pll-readback-46-{initial,validation}.txt``.
+
+This is root readback, not full PLL power ownership. Most divider branches
+still retain firmware gate state. In particular, the PMIC SPI mux can share
+UPLL_D16 with USB and must acquire a real clock reference before that
+divider may be gated. CPU frequency changes also temporarily use MAINPLL.
+DSI engine/digital parent identity and the BSP's always-on RDMA clock
+semantics need further evidence; an arbitrary parent or hardware gate must
+not be invented for them.

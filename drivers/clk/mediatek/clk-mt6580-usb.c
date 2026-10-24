@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* CPU, peripheral and GPU clocks from the MT6580 vendor clock manager. */
+#include <linux/clk.h>
 #include <linux/clk-provider.h>
 #include <linux/delay.h>
 #include <linux/io.h>
@@ -129,6 +130,68 @@ static struct clk_hw *mt6580_register_cpu_clk(struct platform_device *pdev,
 	cpu->hw.init = &init;
 	ret = devm_clk_hw_register(dev, &cpu->hw);
 	return ret ? ERR_PTR(ret) : &cpu->hw;
+}
+
+/*
+ * Expose the firmware-programmed PLLs without taking over tuning or power.
+ * MAINPLL has a 7.14 PCW; UNIVPLL has an integer feedback divider. Both
+ * have the post-divider in CON1[26:24], as in the BSP PLL register layout.
+ */
+struct mt6580_pll_clk {
+	struct clk_hw hw;
+	void __iomem *con;
+	bool univ;
+};
+
+static unsigned long mt6580_pll_recalc_rate(struct clk_hw *hw,
+					 unsigned long parent_rate)
+{
+	struct mt6580_pll_clk *pll = container_of(hw, struct mt6580_pll_clk, hw);
+	u32 con1 = readl(pll->con + 4);
+	u64 rate;
+
+	if (pll->univ)
+		rate = (u64)parent_rate * (con1 & GENMASK(6, 0));
+	else
+		rate = ((u64)parent_rate * (con1 & GENMASK(20, 0))) >> 14;
+	return rate >> ((con1 >> 24) & 7);
+}
+
+static int mt6580_pll_is_enabled(struct clk_hw *hw)
+{
+	struct mt6580_pll_clk *pll = container_of(hw, struct mt6580_pll_clk, hw);
+
+	return !!(readl(pll->con) & BIT(0));
+}
+
+static const struct clk_ops mt6580_pll_ops = {
+	.recalc_rate = mt6580_pll_recalc_rate,
+	.is_enabled = mt6580_pll_is_enabled,
+};
+
+static struct clk_hw *mt6580_register_pll(struct device *dev, void __iomem *con,
+					const char *name, bool univ)
+{
+	const char *parent = "dummy26m";
+	struct clk_init_data init = {
+		.name = name, .ops = &mt6580_pll_ops,
+		.parent_names = &parent, .num_parents = 1,
+		.flags = CLK_GET_RATE_NOCACHE,
+	};
+	struct mt6580_pll_clk *pll;
+	int ret;
+
+	if (!(readl(con) & BIT(0)))
+		return ERR_PTR(dev_err_probe(dev, -EIO,
+					    "%s is off; firmware PLL setup required\n", name));
+	pll = devm_kzalloc(dev, sizeof(*pll), GFP_KERNEL);
+	if (!pll)
+		return ERR_PTR(-ENOMEM);
+	pll->con = con;
+	pll->univ = univ;
+	pll->hw.init = &init;
+	ret = devm_clk_hw_register(dev, &pll->hw);
+	return ret ? ERR_PTR(ret) : &pll->hw;
 }
 
 static const struct mtk_gate_regs mt6580_mfg_regs = {
@@ -318,14 +381,6 @@ static int mt6580_register_top_sources(struct device *dev, void __iomem *base,
 	unsigned int i;
 	int ret;
 
-	hw = devm_clk_hw_register_fixed_rate(dev, "mt6580_mpll", "dummy26m", 0,
-					    1501500000);
-	if (IS_ERR(hw))
-		return PTR_ERR(hw);
-	hw = devm_clk_hw_register_fixed_rate(dev, "mt6580_upll", "dummy26m", 0,
-					    1248000000);
-	if (IS_ERR(hw))
-		return PTR_ERR(hw);
 	for (i = 0; i < ARRAY_SIZE(mt6580_fw_factors); i++) {
 		hw = devm_clk_hw_register_fixed_factor(dev, mt6580_fw_factors[i].name,
 			mt6580_fw_factors[i].parent, 0, 1, mt6580_fw_factors[i].div);
@@ -394,7 +449,7 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	struct clk_hw *source;
 	void __iomem *base;
 	bool top = of_device_is_compatible(dev->of_node, "mediatek,mt6580-topckgen");
-	unsigned int count = 3;
+	unsigned int count = 5;
 	unsigned int i;
 	int ret;
 
@@ -412,6 +467,17 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	data->num = count;
 
 	if (top) {
+		struct clk *parent;
+
+		/* Consumers may use gates as soon as this provider is published.
+		 * Wait for both real roots, rather than exposing zero-rate orphans.
+		 */
+		parent = devm_clk_get(dev, "mainpll");
+		if (IS_ERR(parent))
+			return dev_err_probe(dev, PTR_ERR(parent), "MAINPLL unavailable\n");
+		parent = devm_clk_get(dev, "univpll");
+		if (IS_ERR(parent))
+			return dev_err_probe(dev, PTR_ERR(parent), "UNIVPLL unavailable\n");
 		ret = mt6580_register_top_sources(dev, base, data);
 		if (ret)
 			return ret;
@@ -457,11 +523,15 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 
 	} else {
+		data->hws[CLK_MT6580_APMIXED_MAINPLL] =
+			mt6580_register_pll(dev, base + 0x120, "mt6580_mpll", false);
+		if (IS_ERR(data->hws[CLK_MT6580_APMIXED_MAINPLL]))
+			return PTR_ERR(data->hws[CLK_MT6580_APMIXED_MAINPLL]);
+		data->hws[CLK_MT6580_APMIXED_UNIVPLL] =
+			mt6580_register_pll(dev, base + 0x140, "mt6580_upll", true);
+		if (IS_ERR(data->hws[CLK_MT6580_APMIXED_UNIVPLL]))
+			return PTR_ERR(data->hws[CLK_MT6580_APMIXED_UNIVPLL]);
 		data->hws[CLK_MT6580_APMIXED_CPU] = mt6580_register_cpu_clk(pdev, base);
-		/* USB retains the firmware's UNIVPLL rate and enable state. */
-		if (!(readl(base + 0x140) & BIT(0)))
-			return dev_err_probe(dev, -EIO,
-					     "UNIVPLL is off; firmware clock setup required\n");
 		source = devm_clk_hw_register_fixed_factor(dev, "mt6580_usb_48m_src",
 						         "mt6580_upll", 0, 1, 26);
 		if (IS_ERR(source))
