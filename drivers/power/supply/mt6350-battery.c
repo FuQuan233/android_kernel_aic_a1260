@@ -2,6 +2,7 @@
 /* MT6350 AUXADC battery monitoring, using the MT6580 BSP conversion factors. */
 #include <linux/delay.h>
 #include <linux/iopoll.h>
+#include <linux/ktime.h>
 #include <linux/math64.h>
 #include <linux/mfd/mt6350/registers.h>
 #include <linux/mfd/mt6397/core.h>
@@ -12,6 +13,8 @@
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
 #include <linux/workqueue.h>
+
+#include "mt6350-battery-model.h"
 
 struct mt6350_battery {
 	struct device *dev;
@@ -26,6 +29,15 @@ struct mt6350_battery {
 	int present;
 	int error;
 	bool ready;
+	struct mt6350_battery_model model;
+	s64 last_sample_ms;
+	int online;
+	int capacity;
+	int seed_uv;
+	bool seed_from_hw;
+	int full_ms;
+	int empty_ms;
+	bool model_ready;
 };
 
 /* Same 10 kohm NTC, 16.9 kohm pull-up / 27 kohm pull-down as the BSP. */
@@ -89,11 +101,15 @@ static int mt6350_battery_adc(struct mt6350_battery *bat, int channel,
 static int mt6350_battery_sample(struct mt6350_battery *bat)
 {
 	unsigned int status;
-	int voltage, thermistor, temp, ret;
+	int voltage, thermistor, temp, ret, i, sum = 0;
 
-	ret = mt6350_battery_adc(bat, 7, MT6350_AUXADC_ADC0, 4, &voltage);
-	if (ret)
-		return ret;
+	for (i = 0; i < 5; i++) {
+		ret = mt6350_battery_adc(bat, 7, MT6350_AUXADC_ADC0, 4, &voltage);
+		if (ret)
+			return ret;
+		sum += voltage;
+	}
+	voltage = sum / 5;
 	if (voltage < 2000000 || voltage > 5000000)
 		return -ERANGE;
 	ret = mt6350_battery_adc(bat, 5, MT6350_AUXADC_ADC3, 1, &thermistor);
@@ -111,6 +127,96 @@ static int mt6350_battery_sample(struct mt6350_battery *bat)
 	return 0;
 }
 
+static int mt6350_battery_update_model(struct mt6350_battery *bat)
+{
+	union power_supply_propval online, status, limit;
+	s64 now = ktime_to_ms(ktime_get());
+	s64 elapsed = now - bat->last_sample_ms;
+	unsigned int raw;
+	int dt = 0, uv, ret;
+
+	ret = power_supply_get_property(bat->charger, POWER_SUPPLY_PROP_ONLINE, &online);
+	if (ret)
+		return ret;
+	ret = power_supply_get_property(bat->charger, POWER_SUPPLY_PROP_STATUS, &status);
+	if (ret)
+		return ret;
+	ret = power_supply_get_property(bat->charger,
+			POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT, &limit);
+	if (ret)
+		return ret;
+	limit.intval = clamp(limit.intval, 0, bat->info->constant_charge_current_max_ua);
+	if (status.intval != POWER_SUPPLY_STATUS_CHARGING)
+		limit.intval = 0;
+
+	if (!bat->present) {
+		bat->model_ready = false;
+		bat->last_sample_ms = 0;
+		bat->full_ms = bat->empty_ms = 0;
+		bat->capacity = 0;
+		return 0;
+	}
+	if (!bat->model_ready) {
+		bat->seed_uv = bat->voltage_uv;
+		bat->seed_from_hw = false;
+		/* External charger board: BSP's WAKEUP_SWCHR (ADC9), captured
+		 * before the live charging/load voltage, plus its 8 mV trim.
+		 * Only seed once. This is not a continuously refreshed OCV.
+		 */
+		ret = regmap_read(bat->regmap, MT6350_AUXADC_ADC9, &raw);
+		if (!ret && (raw & BIT(15))) {
+			uv = div_u64((u64)(raw & GENMASK(14, 0)) * 7200000, 32768) + 8000;
+			if (uv >= bat->info->voltage_min_design_uv &&
+			    uv <= bat->info->voltage_max_design_uv &&
+			    abs(uv - bat->voltage_uv) <= 300000) {
+				bat->seed_uv = uv;
+				bat->seed_from_hw = true;
+			}
+		}
+		mt6350_model_init(&bat->model, bat->info, bat->seed_uv, bat->temp);
+		bat->model_ready = true;
+		dev_info(bat->dev, "SW gauge seed=%duV (%s), voltage=%duV\n",
+			 bat->seed_uv, bat->seed_from_hw ? "startup OCV" : "terminal fallback",
+			 bat->voltage_uv);
+	} else if (bat->last_sample_ms && elapsed > 0 && elapsed <= 30000 &&
+		   bat->online == online.intval) {
+		/* Never integrate a post-plug voltage over the preceding interval,
+		 * nor extrapolate an active current through unobserved long gaps.
+		 */
+		dt = elapsed;
+	}
+	bat->last_sample_ms = now;
+	bat->online = online.intval;
+	mt6350_model_step(&bat->model, bat->info, bat->voltage_uv, bat->temp,
+			 dt, online.intval, limit.intval);
+	if (!dt)
+		bat->full_ms = bat->empty_ms = 0;
+
+	/* Anchor only after sustained full/low-voltage observations. A status
+	 * transition alone must not jump to 100%, or hide a critically low cell.
+	 */
+	if (online.intval && status.intval == POWER_SUPPLY_STATUS_FULL &&
+	    bat->voltage_uv >= bat->info->constant_charge_voltage_max_uv - 100000)
+		bat->full_ms = min(bat->full_ms + dt, 60000);
+	else
+		bat->full_ms = 0;
+	if (!online.intval && bat->voltage_uv <= bat->info->voltage_min_design_uv)
+		bat->empty_ms = min(bat->empty_ms + dt, 30000);
+	else
+		bat->empty_ms = 0;
+	if (bat->full_ms == 60000) {
+		bat->model.charge_uas = bat->model.full_uas;
+		bat->model.remainder = 0;
+	} else if (bat->empty_ms == 30000) {
+		bat->model.charge_uas = 0;
+		bat->model.remainder = 0;
+	}
+	bat->capacity = DIV_ROUND_CLOSEST(mt6350_model_ppm(&bat->model), 10000);
+	if (bat->full_ms != 60000)
+		bat->capacity = min(bat->capacity, 99);
+	return 0;
+}
+
 static void mt6350_battery_work(struct work_struct *work)
 {
 	struct mt6350_battery *bat = container_of(to_delayed_work(work),
@@ -118,11 +224,15 @@ static void mt6350_battery_work(struct work_struct *work)
 
 	mutex_lock(&bat->lock);
 	bat->error = mt6350_battery_sample(bat);
+	if (!bat->error)
+		bat->error = mt6350_battery_update_model(bat);
+	if (bat->error)
+		bat->last_sample_ms = 0;
 	if (bat->ready)
 		queue_delayed_work(system_freezable_wq, &bat->work, msecs_to_jiffies(10000));
 	mutex_unlock(&bat->lock);
 	if (bat->error)
-		dev_err_ratelimited(bat->dev, "Battery ADC sample failed: %d\n", bat->error);
+		dev_err_ratelimited(bat->dev, "Battery sample failed: %d\n", bat->error);
 	power_supply_changed(bat->psy);
 }
 
@@ -131,7 +241,6 @@ static int mt6350_battery_get_property(struct power_supply *psy,
 				     union power_supply_propval *val)
 {
 	struct mt6350_battery *bat = power_supply_get_drvdata(psy);
-	union power_supply_propval status;
 	int ret = 0;
 
 	mutex_lock(&bat->lock);
@@ -154,14 +263,7 @@ static int mt6350_battery_get_property(struct power_supply *psy,
 		val->intval = bat->temp;
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
-		val->intval = power_supply_batinfo_ocv2cap(bat->info,
-						bat->voltage_uv, bat->temp / 10);
-		ret = power_supply_get_property(bat->charger, POWER_SUPPLY_PROP_STATUS,
-					       &status);
-		if (!ret && status.intval == POWER_SUPPLY_STATUS_FULL)
-			val->intval = 100;
-		else
-			val->intval = clamp(val->intval, 0, 99);
+		val->intval = bat->capacity;
 		break;
 	case POWER_SUPPLY_PROP_TECHNOLOGY:
 		val->intval = bat->info->technology;
@@ -224,6 +326,49 @@ static void mt6350_battery_stop(void *data)
 	cancel_delayed_work_sync(&bat->work);
 }
 
+static ssize_t gauge_state_show(struct device *dev, struct device_attribute *attr,
+			       char *buf)
+{
+	struct mt6350_battery *bat = dev_get_drvdata(dev);
+	int len;
+
+	mutex_lock(&bat->lock);
+	len = sysfs_emit(buf,
+		"initialized=%u seed_uv=%d seed_hw=%u voltage_uv=%d model_ocv_uv=%d "
+		"resistance_mohm=%d estimated_discharge_ua=%d soc_ppm=%d capacity=%d "
+		"online=%d full_ms=%d empty_ms=%d error=%d\n",
+		bat->model_ready, bat->seed_uv, bat->seed_from_hw, bat->voltage_uv,
+		bat->model.ocv_uv, bat->model.resistance_mohm, bat->model.current_ua,
+		bat->model_ready ? mt6350_model_ppm(&bat->model) : 0, bat->capacity,
+		bat->online, bat->full_ms, bat->empty_ms, bat->error);
+	mutex_unlock(&bat->lock);
+	return len;
+}
+static DEVICE_ATTR_RO(gauge_state);
+static struct attribute *mt6350_battery_attrs[] = {
+	&dev_attr_gauge_state.attr,
+	NULL,
+};
+static const struct attribute_group mt6350_battery_group = {
+	.attrs = mt6350_battery_attrs,
+};
+
+static int mt6350_battery_resume(struct device *dev)
+{
+	struct mt6350_battery *bat = dev_get_drvdata(dev);
+
+	mutex_lock(&bat->lock);
+	/* No measured sleep current: do not integrate the awake load over sleep. */
+	bat->last_sample_ms = 0;
+	bat->full_ms = bat->empty_ms = 0;
+	if (bat->ready)
+		mod_delayed_work(system_freezable_wq, &bat->work, 0);
+	mutex_unlock(&bat->lock);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(mt6350_battery_pm_ops, NULL, mt6350_battery_resume);
+
 static int mt6350_battery_probe(struct platform_device *pdev)
 {
 	struct mt6397_chip *chip = dev_get_drvdata(pdev->dev.parent);
@@ -236,6 +381,7 @@ static int mt6350_battery_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	bat->dev = &pdev->dev;
 	bat->regmap = chip->regmap;
+	platform_set_drvdata(pdev, bat);
 	bat->error = -EAGAIN;
 	mutex_init(&bat->lock);
 	INIT_DELAYED_WORK(&bat->work, mt6350_battery_work);
@@ -271,15 +417,22 @@ static int mt6350_battery_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(bat->dev, mt6350_battery_free_info, bat);
 	if (ret)
 		return ret;
-	if (!bat->info->ocv_table[0] || bat->info->charge_full_design_uah <= 0)
+	if (!bat->info->ocv_table[0] || bat->info->charge_full_design_uah <= 0 ||
+	    bat->info->charge_full_design_uah > INT_MAX / 2 ||
+	    bat->info->constant_charge_current_max_ua <= 0 ||
+	    bat->info->constant_charge_voltage_max_uv <= 0 ||
+	    bat->info->voltage_min_design_uv <= 0)
 		return -EINVAL;
+	ret = devm_device_add_group(bat->dev, &mt6350_battery_group);
+	if (ret)
+		return ret;
 	/* Register cancellation last, before dependent resources are released. */
 	ret = devm_add_action_or_reset(bat->dev, mt6350_battery_stop, bat);
 	if (ret)
 		return ret;
 	bat->ready = true;
 	queue_delayed_work(system_freezable_wq, &bat->work, 0);
-	dev_info(bat->dev, "AUXADC battery monitor; voltage-based capacity estimate\n");
+	dev_info(bat->dev, "AUXADC battery monitor; OCV/resistance software gauge\n");
 	return 0;
 }
 
@@ -294,6 +447,7 @@ static struct platform_driver mt6350_battery_driver = {
 	.driver = {
 		.name = "mt6350-battery",
 		.of_match_table = mt6350_battery_match,
+		.pm = pm_sleep_ptr(&mt6350_battery_pm_ops),
 	},
 };
 module_platform_driver(mt6350_battery_driver);

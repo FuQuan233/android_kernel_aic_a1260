@@ -718,12 +718,48 @@ failed conversions are reported as errors rather than fabricated values.
 Presence uses the enabled BATON detector's undetected bit at ``0x000e[12]``.
 
 The device tree carries the reference BSP's 0/25/50 C battery curves and
-1397 mAh design capacity. Capacity is an estimate from measured voltage and
-the nearest temperature curve, with the charger's real full status taking
-precedence. This is not the old software fuel-gauge integration or a hardware
-coulomb counter: charge counter/current readings and load compensation are
-not provided, and the percentage can jump when USB is inserted or removed.
-The battery characterization still needs calibration against the actual cell.
+1397 mAh design capacity. The initial direct voltage-to-percentage lookup
+produced 13% at 3715 mV and 50% at 3817 mV just ten seconds later when USB
+was reinserted. Charging voltage was being mistaken for stored charge.
+
+Capacity now uses the reference BSP's OAM second-observer approach: inverse
+OCV at the retained fractional SOC, temperature/voltage-dependent internal
+resistance, estimated current from (OCV - terminal voltage) / resistance,
+and integration into charge. OCV and the 0/25/50 C resistance profiles are
+interpolated continuously with temperature. Five BATSNS conversions are
+averaged per sample. Boot initialization prefers the valid SWCHR startup
+OCV in ADC9 (0x0726), with the BSP's 8 mV adjustment and voltage sanity
+checks; an unavailable/implausible snapshot falls back to terminal voltage.
+This startup value is used once, not re-read as a live OCV after each plug.
+
+An external-power transition preserves SOC and does not apply its new
+voltage to the preceding integration interval. Estimated charging current
+is bounded by the configured charge limit; disconnected voltage rebound
+cannot create charge. Connected net discharge remains possible. Full
+anchoring requires 60 seconds of Full status above 4.1 V, and empty anchoring
+requires 30 seconds below the board's minimum voltage while disconnected.
+After suspend or a long sampling gap the integration timestamp is reset;
+active current is not extrapolated through an unobserved sleep interval.
+
+This is a software estimate, not measured current or a hardware coulomb
+counter. ``gauge_state`` on the PMIC battery platform device exposes the
+seed, model OCV, resistance and explicitly estimated current for diagnosis;
+standard CURRENT_NOW/CHARGE_COUNTER are not fabricated. Installed-cell
+capacity/resistance/OCV characterization, aging, retained SOC across reboot
+and sleep-current accounting remain uncalibrated. The reference profiles
+and startup-voltage fallback do not establish absolute SOC accuracy.
+
+Build #41 reached Android boot_completed. In the physical USB test, the
+last connected sample was 3853388 uV / 16% (SOC 164042 ppm). Disconnect
+preserved SOC; over about 38 seconds the terminal voltage reached 3719882 uV
+and SOC reached 163960 ppm, still 16%. Reinsertion preserved that state;
+later charging reached 17% through integration. The charger returned to
+Charging with a 500000 uA input limit; no gauge sampling error was observed.
+The temporary wake lock was released and plugged-in stay-on restored to 0.
+Replay also checked the original 3715/3817 mV transition, integration units,
+discharge direction, rebound, temperature continuity and saturation.
+Evidence: ``out/a1260-runtime-pm/battery-gauge-41-summary.txt``,
+``battery-plug-41.log`` and ``battery-model-replay-result.txt`` in that directory.
 
 The first hardware boot reports about 4.12 V and 27.3 C, presence true and
 charging complete. Android's standard Health service discovers both supplies
