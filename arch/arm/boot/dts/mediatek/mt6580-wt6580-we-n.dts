@@ -899,9 +899,11 @@
 
 &uart0 {
 	reg = <0 0x11005000 0 0x400>;
+	clocks = <&topckgen CLK_MT6580_TOP_UART0>;
 	status = "okay";
 };
 
 &uart1 {
 	reg = <0 0x11006000 0 0x400>;
+	clocks = <&topckgen CLK_MT6580_TOP_UART1>;
 };

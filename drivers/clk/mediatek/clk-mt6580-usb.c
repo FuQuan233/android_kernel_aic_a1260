@@ -6,6 +6,7 @@
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include "clk-gate.h"
 #include "clk-mtk.h"
@@ -300,6 +301,8 @@ static const struct mt6580_div_desc mt6580_d5 = {
 
 /* UPLL_D16 feeds the USB bus and one PMIC SPI mux input. UPLL_D20 feeds
  * only another PMIC SPI input. Both consumers now have clock references.
+ * UPLL_D24 feeds the UART muxes; their gates also retain the console and
+ * enabled firmware UARTs not owned by a Linux driver.
  * Other divider gates retain firmware ownership, including the upstream
  * branches shared with unported UART/audio/camera/DDR consumers.
  */
@@ -331,7 +334,7 @@ static const struct mt6580_div_desc mt6580_fw_divs[] = {
 	{ "mt6580_upll_d12", "mt6580_upll_d6", 2, 0x34, 17, false },
 	{ "mt6580_upll_d16", "mt6580_upll_d8", 2, 0x34, 24, true },
 	{ "mt6580_upll_d20", "mt6580_upll_d10", 2, 0x34, 18, true },
-	{ "mt6580_upll_d24", "mt6580_upll_d12", 2, 0x34, 25, false },
+	{ "mt6580_upll_d24", "mt6580_upll_d12", 2, 0x34, 25, true },
 };
 
 static const char * const mt6580_pmic_spi_parents[] = {
@@ -467,6 +470,14 @@ static int mt6580_register_top_sources(struct device *dev, void __iomem *base,
 					  mt6580_pmic_spi_parents[(sel0 >> 24) & 3], 0);
 	if (ret)
 		return ret;
+	ret = mt6580_register_parent_alias(dev, "mt6580_uart0_src",
+					  sel0 & BIT(0) ? "mt6580_upll_d24" : "dummy26m", 0);
+	if (ret)
+		return ret;
+	ret = mt6580_register_parent_alias(dev, "mt6580_uart1_src",
+					  sel0 & BIT(19) ? "mt6580_upll_d24" : "dummy26m", 0);
+	if (ret)
+		return ret;
 
 	/* Unported firmware consumers must not lose D5 when DISP is later
 	 * allowed to power off. Retain only their selected D5 branches, not
@@ -494,6 +505,28 @@ static int mt6580_register_top_sources(struct device *dev, void __iomem *base,
 	return 0;
 }
 
+static unsigned long mt6580_uart_clk_flags(void __iomem *base, unsigned int id)
+{
+	struct device_node *np;
+	struct resource res;
+	unsigned long flags = 0;
+
+	/* The console may write with interrupts off and cannot runtime-resume
+	 * a clock. Preserve the selected stdout UART, including panic output.
+	 */
+	if (IS_ENABLED(CONFIG_SERIAL_8250_CONSOLE) && of_stdout &&
+	    !of_address_to_resource(of_stdout, 0, &res) &&
+	    res.start == 0x11005000 + id * 0x1000)
+		return CLK_IS_CRITICAL;
+
+	/* Retain an enabled firmware UART without an active Linux consumer. */
+	np = of_find_node_by_path(id ? "serial1" : "serial0");
+	if (!of_device_is_available(np) && !(readl(base + 0x24) & BIT(10 + id)))
+		flags = CLK_IS_CRITICAL;
+	of_node_put(np);
+	return flags;
+}
+
 static int mt6580_usb_clk_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -508,7 +541,7 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	if (of_device_is_compatible(dev->of_node, "mediatek,mt6580-mfgcfg"))
 		return mtk_clk_simple_probe(pdev);
 	if (top)
-		count = 14;
+		count = 16;
 
 	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
@@ -579,6 +612,12 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 		data->hws[CLK_MT6580_TOP_PMIC_26M] = devm_clk_hw_register_gate(dev,
 			"mt6580_pmic_26m", "dummy26m", 0, base + 0x24, 29,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
+		data->hws[CLK_MT6580_TOP_UART0] = devm_clk_hw_register_gate(dev,
+			"mt6580_uart0", "mt6580_uart0_src", mt6580_uart_clk_flags(base, 0),
+			base + 0x24, 10, CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
+		data->hws[CLK_MT6580_TOP_UART1] = devm_clk_hw_register_gate(dev,
+			"mt6580_uart1", "mt6580_uart1_src", mt6580_uart_clk_flags(base, 1),
+			base + 0x24, 11, CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 
 	} else {
 		data->hws[CLK_MT6580_APMIXED_MAINPLL] =

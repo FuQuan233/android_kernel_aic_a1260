@@ -1305,3 +1305,37 @@ failure or a successful media write. The completed check used the existing
 ARM musl toolchain to build the small page-aligned I/O helper in the capture
 directory. This is still legacy 17.333 MHz operation, not high-speed tuning
 or complete eMMC qualification.
+
+UART gate and source ownership
+------------------------------
+
+Build #50 connects UART0/1 to TOPCKGEN 0x24 bits 10/11. The baud source
+follows the retained firmware mux at 0x00 bit 0/19 respectively: 26 MHz
+or UPLL_D24 (52 MHz). The DTS keeps the driver's existing single-clock
+interface. UART1 remains disabled on this board.
+
+The UART selected by stdout-path has a critical clock reference while
+8250 console support is enabled: console writes can run with interrupts
+disabled and must not depend on runtime PM. An enabled firmware UART
+without an available Linux DT consumer is also retained explicitly.
+These are clock references, not system wake locks. UPLL_D24 can now be
+gated when neither UART source needs it. Its upstream divider gates retain
+firmware ownership. Before deep SPM/PCM work, any additional autonomous
+clock users must be included in that subsystem's clock dependencies.
+
+Hardware validation: Android boot completed, both UART source muxes read
+26 MHz, UART0 has its critical reference and UART1's gate is off. Unused
+UPLL_D24 bit 25 is now clear (UPLL_FREDIV_EN=0xfdfbffff). A successful
+s2idle/PMIC IRQ wake restored configured ADB and retained the console
+reference. The first suspend attempt returned EBUSY from alarmtimer before
+the successful retry, matching its near-deadline alarm guard; this capture
+therefore records one success and one abort, not zero failures.
+
+After resume, another 4 MiB page-aligned O_DIRECT write/fsync and four direct
+reads matched the original RAM data; each read started from a suspended,
+gated MSDC0. RDMA frame counts advanced after screen-on with zero underflows
+or abnormal events. Temporary files, the maintenance wake reference and RTC
+alarm were cleared; plugged-in stay-on remains 0. Captures are
+``out/a1260-runtime-pm/uart-clocks-50-`` followed by ``initial.txt``,
+``suspend.txt``, ``suspend-stats.txt`` and ``final.txt``. Physical UART1,
+alternate 52 MHz selection and panic transmission were not exercised.
