@@ -25,6 +25,7 @@
 #define MT6580_MUSB_SWRST		0x0074
 #define MT6580_DISUSBRESET	BIT(0)
 #define MT6580_SWRST		BIT(1)
+#define MT6580_GADGET_HANDOFF_MS	5000
 
 /* MediaTek controller toggle enable and status reg */
 #define MUSB_RXTOG		0x80
@@ -55,6 +56,7 @@ struct mtk_glue {
 	enum usb_role role;
 	struct usb_role_switch *role_sw;
 	bool mt6580;
+	struct wakeup_source *enumeration_ws;
 };
 
 static int mtk_musb_clks_get(struct mtk_glue *glue)
@@ -170,12 +172,16 @@ static irqreturn_t generic_interrupt(int irq, void *__hci)
 	 * Follow the core's RESUME -> SUSPEND/DISCONNECT -> RESET ordering.
 	 */
 	if (glue->mt6580 && !is_host_active(musb)) {
-		if (musb->int_usb & MUSB_INTR_RESUME)
+		if (musb->int_usb & MUSB_INTR_RESUME) {
 			pm_stay_awake(musb->controller);
+			__pm_relax(glue->enumeration_ws);
+		}
 		if (musb->int_usb & (MUSB_INTR_SUSPEND | MUSB_INTR_DISCONNECT))
 			pm_relax(musb->controller);
-		if (musb->int_usb & MUSB_INTR_RESET)
+		if (musb->int_usb & MUSB_INTR_RESET) {
 			pm_stay_awake(musb->controller);
+			__pm_relax(glue->enumeration_ws);
+		}
 	}
 
 	if ((musb->int_usb & MUSB_INTR_RESET) && !is_host_active(musb)) {
@@ -358,13 +364,33 @@ static u16 mtk_musb_set_toggle(struct musb_qh *qh, int is_out, struct urb *urb)
 	return 0;
 }
 
+static void mtk_musb_enable(struct musb *musb)
+{
+	struct mtk_glue *glue = dev_get_drvdata(musb->controller->parent);
+
+	/* Keep the enumeration window awake until RESET takes the normal
+	 * active-link wake reference. With no host the timeout permits sleep.
+	 */
+	if (glue->enumeration_ws && musb->gadget_driver && !is_host_active(musb))
+		__pm_wakeup_event(glue->enumeration_ws, MT6580_GADGET_HANDOFF_MS);
+}
+
 static void mtk_musb_disable(struct musb *musb)
 {
 	struct mtk_glue *glue = dev_get_drvdata(musb->controller->parent);
 
-	/* Also release when the gadget is stopped or unbound by userspace. */
-	if (glue->mt6580)
-		pm_relax(musb->controller);
+	if (!glue->mt6580)
+		return;
+	/* gadget_stop sets UNDEFINED before musb_stop, while gadget_driver
+	 * is still attached. FunctionFS teardown can immediately be followed
+	 * by a new adbd. Releasing the last wake reference here lets Android
+	 * freeze the replacement daemon before it can publish descriptors.
+	 * This bounded handoff is not used by system suspend or host mode.
+	 */
+	if (!is_host_active(musb) && musb->gadget_driver &&
+	    musb_get_state(musb) == OTG_STATE_UNDEFINED)
+		__pm_wakeup_event(glue->enumeration_ws, MT6580_GADGET_HANDOFF_MS);
+	pm_relax(musb->controller);
 }
 
 static int mtk_musb_exit(struct musb *musb)
@@ -372,8 +398,10 @@ static int mtk_musb_exit(struct musb *musb)
 	struct device *dev = musb->controller;
 	struct mtk_glue *glue = dev_get_drvdata(dev->parent);
 
-	if (glue->mt6580)
+	if (glue->mt6580) {
+		__pm_relax(glue->enumeration_ws);
 		pm_relax(dev);
+	}
 	mtk_otg_switch_exit(glue);
 	phy_power_off(glue->phy);
 	phy_exit(glue->phy);
@@ -387,6 +415,7 @@ static int mtk_musb_exit(struct musb *musb)
 static const struct musb_platform_ops mtk_musb_ops = {
 	.quirks = MUSB_DMA_INVENTRA,
 	.init = mtk_musb_init,
+	.enable = mtk_musb_enable,
 	.disable = mtk_musb_disable,
 	.get_toggle = mtk_musb_get_toggle,
 	.set_toggle = mtk_musb_set_toggle,
@@ -467,6 +496,11 @@ static const struct platform_device_info mtk_dev_info = {
 	.id = PLATFORM_DEVID_AUTO,
 	.dma_mask = DMA_BIT_MASK(32),
 };
+
+static void mtk_musb_unregister_enumeration_ws(void *data)
+{
+	wakeup_source_unregister(data);
+}
 
 static int mtk_musb_probe(struct platform_device *pdev)
 {
@@ -552,6 +586,22 @@ static int mtk_musb_probe(struct platform_device *pdev)
 	ret = clk_bulk_prepare_enable(MTK_MUSB_CLKS_NUM, glue->clks);
 	if (ret)
 		goto err_enable_clk;
+
+	if (IS_ENABLED(CONFIG_PM_SLEEP) && glue->mt6580 &&
+	    pdata->mode == USB_DR_MODE_PERIPHERAL) {
+		/* Separate the timeout from the active-link source: starting a
+		 * bounded handoff must not shorten an existing RESET/RESUME hold.
+		 */
+		glue->enumeration_ws = wakeup_source_register(dev, "mt6580-usb-enumeration");
+		if (!glue->enumeration_ws) {
+			ret = -ENOMEM;
+			goto err_device_register;
+		}
+		ret = devm_add_action_or_reset(dev, mtk_musb_unregister_enumeration_ws,
+					       glue->enumeration_ws);
+		if (ret)
+			goto err_device_register;
+	}
 
 	pinfo = mtk_dev_info;
 	pinfo.parent = dev;

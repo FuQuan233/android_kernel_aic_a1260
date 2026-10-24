@@ -1118,6 +1118,40 @@ boot/kernel now use this build. This supersedes the #37 visible-wake failure;
 USB re-enumeration across system sleep is still unresolved. Evidence is
 ``out/a1260-runtime-pm/pwm-direct-39-validation.txt``.
 
+USB gadget handoff during screen-off
+-----------------------------------
+
+Build #42 reproduced failed re-enumeration after restarting adbd while the
+screen was off. The retained local log shows six successful system suspend
+cycles, zero suspend failures and PMIC wake IRQs. Replacement adbd/FunctionFS
+initialization was repeatedly frozen after the old gadget released its link
+wake reference; an init action took 59933 ms of wall time. The final UDC state
+was not attached, FADDR zero. Keeping a temporary userspace wake reference for
+five seconds around the same restart allowed re-enumeration, without a kernel
+reboot or a PHY register change. This distinguishes the observed gadget setup
+race from a demonstrated PHY restore failure.
+
+Build #45 adds an MT6580 peripheral-only enumeration wake source. Gadget
+startup and software UDC stop arm a maximum five-second handoff. RESET/RESUME
+take the normal active-link reference before releasing this timed source.
+SUSPEND/DISCONNECT continue to release the active-link hold; the enumeration
+source expires independently. Its separate lifetime avoids turning an existing
+indefinite active-link reference into a five-second timeout. It is not a global
+charger wake lock and does not force the screen on.
+
+Hardware validation: native screen-off adbd restart recovered to configured
+with no additional system suspend and about 660 ms of handoff activity.
+With the standard USB configuration deliberately held at none, the handoff
+expired after 5014 ms, one actual s2idle/RTC wake completed with zero failures,
+and restoring adb re-enumerated successfully. A direct UDC write was insufficient
+for that negative test because FunctionFS automatically re-bound the gadget;
+only the standard none/adb configuration test establishes timeout behavior.
+Temporary userspace locks were released and plugged-in stay-on remained 0.
+Evidence is in ``out/a1260-runtime-pm/usb-sleep-repro-42.log``,
+``usb-sleep-handoff-42.log``, ``usb-sleep-native-45-validation.txt`` and
+``usb-idle-timeout-45-validation.txt``. Bulk transfers, host-directed bus
+suspend/remote wake and deeper PHY analog power-down remain separate work.
+
 These are display/GPU runtime power-cycle checks, not validation of complete
 system suspend with the new callbacks, DDR self-refresh or panel supply-rail
 power-off. The latter still uses the firmware-powered fixed regulator.
