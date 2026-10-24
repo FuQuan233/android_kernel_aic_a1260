@@ -1213,3 +1213,32 @@ divider may be gated. CPU frequency changes also temporarily use MAINPLL.
 DSI engine/digital parent identity and the BSP's always-on RDMA clock
 semantics need further evidence; an arbitrary parent or hardware gate must
 not be invented for them.
+
+PWRAP clock references
+---------------------
+
+Build #47 registers the AP PMIC SPI gate (TOPCKGEN 0x24 bit 20) and the
+PMIC 26 MHz gate (bit 29). The SPI parent follows the existing mux at
+0x00[25:24]: UPLL_D20, USB48M, UPLL_D16 or the 26 MHz crystal. This board
+reads selector 3, using 26 MHz, consistent with the BSP wrapper's setup.
+The full UPLL divide-by-two chains are described so alternate firmware
+selections also propagate their references through the correct branches.
+Their hardware divider gates still retain firmware ownership.
+
+PWRAP acquires and enables the DT clocks before the first WACS2 read and
+keeps them for its lifetime. This protects atomic RTC/power-off register
+access and normal PMIC interrupt/regulator users without changing the
+firmware mux, wrapper sampling, DCM or reset state. Older bring-up DTs
+without clock properties retain firmware ownership. These references
+must stay in place when divider gating is introduced later.
+
+Hardware validation: Android boot completed; both clocks report 26 MHz
+with one enable reference, and WACS2 register reads, battery status and
+thermal sampling work. Holding USB configuration at none allowed one
+successful s2idle cycle with zero failures, followed by a PMIC IRQ wake
+with the RTC alarm armed. DISP/MFG were off, both PWRAP references remained
+held after resume, and restoring adb re-enumerated automatically. Screen-on
+restored RDMA with zero underflows or abnormal events. Temporary wake locks
+and the RTC alarm were cleared; plugged-in stay-on remains 0. Evidence is
+``out/a1260-runtime-pm/pwrap-clocks-47-{initial,suspend,final}.txt``.
+This does not establish DDR self-refresh or full PLL power-down support.

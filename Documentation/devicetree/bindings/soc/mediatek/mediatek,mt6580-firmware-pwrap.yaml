@@ -12,12 +12,22 @@ maintainers:
 description: |
   Provides serialized MT6350 register access over the WACS2 channel configured
   by firmware. This bring-up driver does not initialize or reset PWRAP.
+  When clocks are supplied, they remain enabled for PMIC IRQ, regulator and
+  final power-off register access throughout the wrapper's lifetime.
 
 properties:
   compatible:
     const: mediatek,mt6580-firmware-pwrap
   reg:
     maxItems: 1
+  clocks:
+    items:
+      - description: AP PMIC SPI clock using the firmware-selected source
+      - description: PMIC 26 MHz clock
+  clock-names:
+    items:
+      - const: spi
+      - const: 26m
   reboot-mode:
     type: object
     additionalProperties: false
@@ -34,5 +44,9 @@ properties:
 required:
   - compatible
   - reg
+
+dependencies:
+  clocks: [clock-names]
+  clock-names: [clocks]
 
 additionalProperties: false

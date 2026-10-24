@@ -288,11 +288,22 @@ static const struct {
 	{ "mt6580_mpll_d16", "mt6580_mpll_d8", 2 },
 	{ "mt6580_mpll_d24", "mt6580_mpll_d12", 2 },
 	{ "mt6580_mpll_d40", "mt6580_mpll_d20", 2 },
+	{ "mt6580_upll_d2", "mt6580_upll", 2 },
 	{ "mt6580_upll_d3", "mt6580_upll", 3 },
+	{ "mt6580_upll_d4", "mt6580_upll_d2", 2 },
+	{ "mt6580_upll_d5", "mt6580_upll", 5 },
 	{ "mt6580_upll_d6", "mt6580_upll_d3", 2 },
 	{ "mt6580_upll_d7", "mt6580_upll", 7 },
+	{ "mt6580_upll_d8", "mt6580_upll_d4", 2 },
+	{ "mt6580_upll_d10", "mt6580_upll_d5", 2 },
 	{ "mt6580_upll_d12", "mt6580_upll_d6", 2 },
-	{ "mt6580_upll_d16", "mt6580_upll", 16 },
+	{ "mt6580_upll_d16", "mt6580_upll_d8", 2 },
+	{ "mt6580_upll_d20", "mt6580_upll_d10", 2 },
+	{ "mt6580_upll_d24", "mt6580_upll_d12", 2 },
+};
+
+static const char * const mt6580_pmic_spi_parents[] = {
+	"mt6580_upll_d20", "mt6580_usb48m", "mt6580_upll_d16", "dummy26m",
 };
 
 static const char * const mt6580_msdc_parents[] = {
@@ -415,6 +426,10 @@ static int mt6580_register_top_sources(struct device *dev, void __iomem *base,
 					  sel0 & BIT(18) ? "mt6580_upll_d12" : "dummy26m", 0);
 	if (ret)
 		return ret;
+	ret = mt6580_register_parent_alias(dev, "mt6580_pmic_spi_src",
+					  mt6580_pmic_spi_parents[(sel0 >> 24) & 3], 0);
+	if (ret)
+		return ret;
 
 	/* Unported firmware consumers must not lose D5 when DISP is later
 	 * allowed to power off. Retain only their selected D5 branches, not
@@ -456,7 +471,7 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	if (of_device_is_compatible(dev->of_node, "mediatek,mt6580-mfgcfg"))
 		return mtk_clk_simple_probe(pdev);
 	if (top)
-		count = 12;
+		count = 14;
 
 	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
@@ -520,6 +535,12 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 
 		data->hws[CLK_MT6580_TOP_MFG] = devm_clk_hw_register_gate(dev,
 			"mt6580_mfg_bus", "mt6580_mfg_src", 0, base + 0x20, 2,
+			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
+		data->hws[CLK_MT6580_TOP_PMIC_SPI] = devm_clk_hw_register_gate(dev,
+			"mt6580_pmic_spi", "mt6580_pmic_spi_src", 0, base + 0x24, 20,
+			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
+		data->hws[CLK_MT6580_TOP_PMIC_26M] = devm_clk_hw_register_gate(dev,
+			"mt6580_pmic_26m", "dummy26m", 0, base + 0x24, 29,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 
 	} else {

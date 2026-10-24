@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* MT6580 WACS2 access, retaining the bootloader's MT6350 wrapper setup. */
 #include <linux/bitfield.h>
+#include <linux/clk.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of_platform.h>
@@ -73,8 +74,10 @@ static const struct regmap_config mt6580_pwrap_regmap = {
 
 static int mt6580_pwrap_probe(struct platform_device *pdev)
 {
+	struct clk_bulk_data *clks;
 	struct mt6580_pwrap *wrp;
 	struct regmap *regmap;
+	int ret;
 
 	wrp = devm_kzalloc(&pdev->dev, sizeof(*wrp), GFP_KERNEL);
 	if (!wrp)
@@ -82,6 +85,12 @@ static int mt6580_pwrap_probe(struct platform_device *pdev)
 	wrp->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(wrp->base))
 		return PTR_ERR(wrp->base);
+	/* Keep clocks for PMIC IRQ, regulator and final atomic power-off users.
+	 * Older bring-up DTs have no clocks and retain firmware gate ownership.
+	 */
+	ret = devm_clk_bulk_get_all_enabled(&pdev->dev, &clks);
+	if (ret < 0)
+		return dev_err_probe(&pdev->dev, ret, "PWRAP clocks unavailable\n");
 	if (!(readl(wrp->base + WACS2_RDATA) & WACS_INIT_DONE))
 		return dev_err_probe(&pdev->dev, -ENODEV, "firmware PWRAP is not initialized\n");
 	regmap = devm_regmap_init(&pdev->dev, NULL, wrp, &mt6580_pwrap_regmap);
