@@ -122,7 +122,7 @@ static int mt6580_usb_phy_probe(struct platform_device *pdev)
 		return PTR_ERR(phy);
 	phy_set_drvdata(phy, priv);
 	provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
-	dev_info(dev, "Device-only PHY; retaining firmware VUSB regulator setup\n");
+	dev_info(dev, "Device-only PHY; PHY core manages the VUSB supply\n");
 	return PTR_ERR_OR_ZERO(provider);
 }
 

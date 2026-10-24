@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* MT6350 CPU supply and VGP1 touchscreen supply. */
+/* MT6350 CPU and board LDO supplies. */
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -9,6 +9,11 @@
 
 #define MT6350_VGP1_CON0	0x050a
 #define MT6350_VGP1_CON1	0x0530
+#define MT6350_VIO28_CON0	0x0500
+#define MT6350_VUSB_CON0	0x0502
+#define MT6350_VEMC_CON0	0x0508
+#define MT6350_VEMC_CON1	0x052e
+#define MT6350_VIO18_CON0	0x0556
 #define MT6350_VPROC_CTRL	0x0216
 #define MT6350_VPROC_EN	0x021a
 #define MT6350_VPROC_VOSEL	0x021e
@@ -88,13 +93,66 @@ static const struct regulator_desc mt6350_vgp1_desc = {
 	.enable_time = 264,
 };
 
+/* These LDOs request enable through RG[14], but QI[15] reports whether
+ * the rail is actually on. Preserve the unrelated LP/calibration fields.
+ */
+static int mt6350_ldo_is_enabled(struct regulator_dev *rdev)
+{
+	unsigned int val;
+	int ret = regmap_read(rdev->regmap, rdev->desc->enable_reg, &val);
+
+	return ret ? ret : !!(val & BIT(15));
+}
+
+static const struct regulator_ops mt6350_fixed_ldo_ops = {
+	.list_voltage = regulator_list_voltage_linear,
+	.enable = regulator_enable_regmap,
+	.disable = regulator_disable_regmap,
+	.is_enabled = mt6350_ldo_is_enabled,
+};
+
+static const unsigned int mt6350_vemc_voltages[] = { 3000000, 3300000 };
+
+static const struct regulator_ops mt6350_vemc_ops = {
+	.list_voltage = regulator_list_voltage_table,
+	.map_voltage = regulator_map_voltage_iterate,
+	.get_voltage_sel = regulator_get_voltage_sel_regmap,
+	.set_voltage_sel = regulator_set_voltage_sel_regmap,
+	.enable = regulator_enable_regmap,
+	.disable = regulator_disable_regmap,
+	.is_enabled = mt6350_ldo_is_enabled,
+};
+
+#define MT6350_FIXED_LDO(_name, _id, _reg, _uv) { \
+	.name = #_name, .of_match = "ldo_" #_name, .id = _id, \
+	.type = REGULATOR_VOLTAGE, .owner = THIS_MODULE, \
+	.ops = &mt6350_fixed_ldo_ops, .n_voltages = 1, .min_uV = _uv, \
+	.enable_reg = _reg, .enable_mask = BIT(14), .enable_time = 264, \
+}
+
+static const struct regulator_desc mt6350_board_ldos[] = {
+	MT6350_FIXED_LDO(vusb, 2, MT6350_VUSB_CON0, 3300000),
+	MT6350_FIXED_LDO(vio18, 3, MT6350_VIO18_CON0, 1800000),
+	MT6350_FIXED_LDO(vio28, 4, MT6350_VIO28_CON0, 2800000),
+	{
+		.name = "vemc", .of_match = "ldo_vemc", .id = 5,
+		.type = REGULATOR_VOLTAGE, .owner = THIS_MODULE,
+		.ops = &mt6350_vemc_ops,
+		.n_voltages = ARRAY_SIZE(mt6350_vemc_voltages),
+		.volt_table = mt6350_vemc_voltages,
+		.vsel_reg = MT6350_VEMC_CON1, .vsel_mask = BIT(7),
+		.enable_reg = MT6350_VEMC_CON0, .enable_mask = BIT(14),
+		.enable_time = 264,
+	},
+};
+
 static int mt6350_regulator_probe(struct platform_device *pdev)
 {
 	struct regulator_config config = { .dev = &pdev->dev };
 	struct regulator_dev *rdev;
 	struct regulator_desc *vproc;
 	unsigned int ctrl;
-	int ret;
+	int ret, i;
 
 	config.regmap = dev_get_regmap(pdev->dev.parent, NULL);
 	if (!config.regmap)
@@ -113,7 +171,16 @@ static int mt6350_regulator_probe(struct platform_device *pdev)
 	if (ctrl & BIT(1))
 		vproc->vsel_reg = MT6350_VPROC_VOSEL_ON;
 	rdev = devm_regulator_register(&pdev->dev, vproc, &config);
-	return PTR_ERR_OR_ZERO(rdev);
+	if (IS_ERR(rdev))
+		return PTR_ERR(rdev);
+
+	for (i = 0; i < ARRAY_SIZE(mt6350_board_ldos); i++) {
+		rdev = devm_regulator_register(&pdev->dev, &mt6350_board_ldos[i], &config);
+		if (IS_ERR(rdev))
+			return dev_err_probe(&pdev->dev, PTR_ERR(rdev),
+					     "Failed to register %s\n", mt6350_board_ldos[i].name);
+	}
+	return 0;
 }
 
 static const struct of_device_id mt6350_regulator_match[] = {
@@ -130,5 +197,5 @@ static struct platform_driver mt6350_regulator_driver = {
 	},
 };
 module_platform_driver(mt6350_regulator_driver);
-MODULE_DESCRIPTION("MT6350 VPROC and VGP1 regulators");
+MODULE_DESCRIPTION("MT6350 VPROC and board LDO regulators");
 MODULE_LICENSE("GPL");

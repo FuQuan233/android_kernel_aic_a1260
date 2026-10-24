@@ -246,11 +246,12 @@ of transfer speed, with heartbeats scheduled every 60 seconds. Protocol
 tests cover draining 500 small records without per-record sleeps as well
 as yielding on backpressure. Actual USB throughput still requires hardware measurement.
 
-The USB drivers retain firmware PLL frequency and PMIC VUSB supply setup.
+The USB drivers retain firmware PLL frequency. Build #42 adds the real
+MT6350 VUSB regulator as the PHY core's ``phy-supply`` dependency.
 The clock driver reports an error if UNIVPLL is off rather than inventing
-PLL parameters. The PHY does not yet manage the PMIC regulator. If LK
-leaves either resource off, those dependencies must be ported before USB
-can enumerate. The new USB PHY/clock compatible strings and clock IDs
+PLL parameters. VUSB is enabled before the PHY power-on callback and released
+after power-off by the generic PHY core. PLL initialization remains a firmware
+dependency. The new USB PHY/clock compatible strings and clock IDs
 are local to this initial port and need formal bindings before upstream
 submission.
 
@@ -421,11 +422,13 @@ non-SDIO cards regardless of the captured default edge properties.
 
 TOPCKGEN exposes MSDC0's gate (CLK_GATING_CTRL0[17]) and retains the
 firmware source selector (CLK_MUX_SEL0[13:11]). Source rates come from
-the MT6580 vendor clock table. PLL retuning, a full pinctrl driver and
-PMIC regulator control are pending. ``mediatek,firmware-pins`` explicitly
+the MT6580 vendor clock table. PLL retuning and complete pad control are
+pending. ``mediatek,firmware-pins`` explicitly
 opts into retaining LK's pad setup, restricted to non-removable legacy
-eMMC at no more than 26 MHz. A fixed always-on VEMC supply models the
-vendor driver's 3.0 V setting; it does not program the PMIC. No DDR,
+eMMC at no more than 26 MHz. Build #42 replaces the old fixed 3.0 V VEMC
+placeholder with the MT6350 regulator, preserving the actual firmware selector
+of 3.3 V (0x052e[7]=1). It remains always-on until card power-cycle handling
+is validated. No DDR,
 HS200, HS400, signal voltage switching or hardware command queue is
 advertised. This is a bootloader-dependent bring-up configuration.
 
@@ -660,6 +663,25 @@ table. Firmware-initialized WACS2 access is shared through one regmap between
 VGP1 and the existing RTC reboot marker, rather than assigning the MMIO block
 to two independent drivers. PWRAP initialization, other MT6350 regulators and
 suspend/resume remain unfinished. Battery and PMIC keys are described below.
+
+Build #42 also exposes VUSB (3.3 V), VEMC (3.0/3.3 V), VIO18 (1.8 V) and
+VIO28 (2.8 V). Their RG enable request is bit 14, while ``is_enabled`` reads
+QI actual state at bit 15. VEMC selection is bit 7 of 0x052e. Boot and
+screen-off registers match the pre-change values: 0x0500/0502/0508/0556
+are 0xc000 and 0x052e is 0x03c9. VEMC is constrained to its existing 3.3 V;
+MMC now correctly reports the 3.3--3.4 V OCR window, retaining 8-bit legacy
+operation at an actual 17.333 MHz. Android boot_completed, a 4 MiB fsync/read
+check and display-domain off/on checks passed; RDMA underflow/abnormal were 0.
+
+Shared VIO18/VIO28 remain always-on because their consumers are not all
+identified. The real normal-boot image's LCM_DRIVER has null init_power,
+suspend_power and resume_power slots; its saved REA init evidence
+``ev_b9409755d90e6cbeca8eb5d888009027ad278929be11da903136a719ab6b8e52``
+only establishes reset/DSI initialization, not the physical supply wiring.
+The panel placeholder and touch I/O dummy therefore remain explicit unresolved
+dependencies; no speculative shared-rail switch-off is added. Evidence is in
+``out/a1260-runtime-pm/pmic-rails-42-validation.txt``,
+``pmic-rails-42-io.txt`` and ``pmic-panel-power-pointers.json``.
 
 The Lineage device kernel fragment enables these drivers and evdev. No Android
 system/vendor change is required for standard direct multitouch input events.
