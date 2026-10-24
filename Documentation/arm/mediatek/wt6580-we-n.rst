@@ -1247,9 +1247,9 @@ PLL divider gate visibility and ownership
 ----------------------------------------
 
 Build #48 reads the actual FREDIV_EN bits for the 16 MAINPLL and 12 UNIVPLL
-divider gates. Previously their fixed-factor declarations reported hardware
-status for 27 of these branches could not reflect a cleared gate bit;
-MPLL_D5 already had hardware gate control. Rates and parent chains are unchanged.
+divider gates. The previous fixed-factor declarations for 27 of these branches
+could not reflect a cleared gate bit; MPLL_D5 already had hardware gate control.
+Rates and parent chains are unchanged.
 The enable indication describes the local gate bit, not a measured running
 clock when an upstream gate or PLL is off.
 
@@ -1280,3 +1280,28 @@ DSI_DIGITAL, with no source recorded in the BSP clock manager. RDMA0 is
 explicitly AO there. Preserve these semantics until parent identities can
 be established; the absence of a parent frequency in clk_summary is not
 evidence that its gate or the DISP runtime power sequence is missing.
+
+MSDC0 peripheral gate correction
+--------------------------------
+
+Build #49 corrects the MSDC0 gate from TOPCKGEN 0x20 bit 17 to 0x24 bit 17,
+as specified by MSDC0_SW_CG in the BSP's CG_CTRL1 group. Previously the MMC
+driver's runtime references did not control the real peripheral gate, which
+remained in firmware state. The source, card clock, pads and voltage settings
+are unchanged.
+
+Hardware validation wrote and fsynced 4 MiB of random data from a RAM file
+using page-aligned O_DIRECT buffers. Four subsequent O_DIRECT reads matched
+the SHA256 of the original RAM data. Each read began with the controller
+runtime-suspended, clock enable count zero and 0x10000024=0x98839a3c (bit 17
+set), so each operation exercised real ungating and register restoration.
+The active state reads 0x98819a3c (bit 17 clear). Android boot completed,
+and the temporary files and maintenance wake reference were removed.
+Evidence is ``out/a1260-runtime-pm/msdc-gate-49-io.txt``.
+
+The initial Toybox dd O_DIRECT attempt returned EINVAL because its buffer
+uses unaligned malloc; that attempt does not establish an MMC transfer
+failure or a successful media write. The completed check used the existing
+ARM musl toolchain to build the small page-aligned I/O helper in the capture
+directory. This is still legacy 17.333 MHz operation, not high-speed tuning
+or complete eMMC qualification.

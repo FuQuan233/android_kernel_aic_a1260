@@ -545,7 +545,7 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 			"mt6580_auxadc", "dummy26m", 0, base + 0x24, 30,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 		data->hws[CLK_MT6580_TOP_MSDC0] = devm_clk_hw_register_gate(dev,
-			"mt6580_msdc0", "mt6580_msdc0_src", 0, base + 0x20, 17,
+			"mt6580_msdc0", "mt6580_msdc0_src", 0, base + 0x24, 17,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 
 		/* CLK_GATING_CTRL1[13]: 1 gates the USB bus clock. */
