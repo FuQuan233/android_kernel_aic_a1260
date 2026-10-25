@@ -506,6 +506,8 @@ struct msdc_host {
 	unsigned char timing;
 	bool vqmmc_enabled;
 	bool firmware_pins;
+	u32 legacy_iocon;
+	bool legacy_data_falling;
 	u32 latch_ck;
 	u32 hs400_ds_delay;
 	u32 hs400_ds_dly3;
@@ -1922,7 +1924,9 @@ static void msdc_init_hw(struct msdc_host *host)
 	if (host->dev_comp->legacy_sync_fifo) {
 		/* MT6580 vendor init: separate DAT delays and synchronous FIFO. */
 		writel(0x10008000, host->base + tune_reg);
-		writel(MSDC_IOCON_DDLSEL, host->base + MSDC_IOCON);
+		writel(MSDC_IOCON_DDLSEL | host->legacy_iocon, host->base + MSDC_IOCON);
+		sdr_set_field(host->base + MSDC_PATCH_BIT, MSDC_PATCH_BIT_RD_DAT_SEL,
+			      host->legacy_data_falling);
 		writel(0, host->base + 0xf8); /* DAT_RDDLY0: captured board delays */
 		writel(0, host->base + 0xfc); /* DAT_RDDLY1 */
 		writel(0xfffe00c9, host->base + MSDC_PATCH_BIT1);
@@ -2907,6 +2911,18 @@ static void msdc_of_property_parse(struct platform_device *pdev,
 				   struct msdc_host *host)
 {
 	struct mmc_host *mmc = mmc_from_priv(host);
+
+	/* MT6580 synchronous FIFO samples read data in PATCH_BIT0, unlike
+	 * the asynchronous path's IOCON.DSPL. Board defaults apply below HS200.
+	 */
+	if (host->dev_comp->legacy_sync_fifo) {
+		if (of_property_read_bool(pdev->dev.of_node, "mediatek,cmd-falling-edge"))
+			host->legacy_iocon |= MSDC_IOCON_RSPL;
+		if (of_property_read_bool(pdev->dev.of_node, "mediatek,crc-falling-edge"))
+			host->legacy_iocon |= MSDC_IOCON_W_DSPL;
+		host->legacy_data_falling = of_property_read_bool(pdev->dev.of_node,
+							 "mediatek,data-falling-edge");
+	}
 
 	of_property_read_u32(pdev->dev.of_node, "mediatek,latch-ck",
 			     &host->latch_ck);

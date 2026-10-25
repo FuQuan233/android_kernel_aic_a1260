@@ -197,6 +197,9 @@ int mtk_hw_set_value(struct mtk_pinctrl *hw, const struct mtk_pin_desc *desc,
 	struct mtk_pin_field pf;
 	int err;
 
+	if (field == PINCTRL_PIN_REG_MODE && hw->soc->pinmux_set)
+		return hw->soc->pinmux_set(hw, desc, value);
+
 	err = mtk_hw_pin_field_get(hw, desc, field, &pf);
 	if (err)
 		return err;

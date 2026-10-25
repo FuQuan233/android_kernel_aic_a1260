@@ -1377,3 +1377,85 @@ I/O files were cleared; plugged-in stay-on remains 0. Captures are
 ``out/a1260-runtime-pm/upll-tree-51-`` followed by ``initial.txt``,
 ``render.txt``, ``io.txt``, ``off.txt``, ``suspend.txt`` and ``on.txt``.
 Alternate firmware mux selections and full PLL power-down are untested.
+
+MPLL consumers and memory clock dependencies
+-------------------------------------------
+
+Build #52 extends SET/CLR ownership to the remaining 15 MPLL divider gates.
+The BSP's initialization explicitly exempts MPLL_D14 from unused-divider
+cleanup, so ``mt6580_fw_d14`` retains it and D7. Its undocumented downstream
+route is not assigned as a guessed DSI parent. The CPU's atomic ARMPLL
+handover uses PLL2_CK from MPLL_D2; ``mt6580_cpu_handover`` keeps that branch
+available throughout a rate transition. AXI retains D3/D6/D12; GPU and SMI
+keep their selected normal runtime references. Firmware NFI, audio and
+SCAM consumers retain their complete selected parent only while their leaf
+gates are open. The board's active NFI uses 26 MHz and audio uses MPLL_D12.
+
+The separate DDRPHY configuration mux is always referenced, on 26 MHz or
+MPLL_D16 according to SEL1 bit 15. The live EMI mux follows SEL0 bit 1 and
+is also critical. Neither its mux nor MEMPLL_D2 bit 31 is written. A new
+read-only DDRPHY/DRAMC mirror provider derives the EMI memory source from
+the BSP NCPO, divider, feedback and PLL mode fields, at one quarter of the
+DDR data rate. The actual 1PLL configuration yields 266499673 Hz, consistent
+with DDR-1066 and the independent frequency meter's approximately 266.6 MHz
+EMI1X result. DDRPHYCFG measures 26 MHz. Build #55 adds the explicit crystal
+phandle; it has the same rate calculation and no DDR register writes.
+
+Seven CPU frequencies from 604.5 through 1300 MHz, a real Mali GLES draw,
+and two screen off/on cycles passed on #52. DISP and MFG powered off while
+their unused MPLL_D5 stopped, then RDMA resumed without underflow or abnormal
+events. RTC wake completed one s2idle cycle with zero failures; a 16 MiB
+RAM file retained its SHA256 and ADB re-enumerated. Evidence is
+``out/a1260-runtime-pm/mpll-ddr-52-`` followed by ``initial.txt``,
+``validation.txt`` and ``suspend.txt``; frequency meter results are in
+``clock-meter-51.txt`` in the same directory.
+
+These references close unused-divider cleanup dependencies while retaining
+firmware policy for the live memory PLL and the undocumented D14 route.
+They do not implement DDR self-refresh, PCM sleep or dynamic memory rates.
+The DSI engine/digital gate parents remain undocumented; their hardware
+gates, SMI domain dependency and MIPI PHY references are already controlled.
+
+MSDC0 pads and 52 MHz high speed
+------------------------------
+
+Build #55 removes the board's firmware-pins bypass. Pinctrl now owns
+GPIO41..50's MSDC0 function, the additional IOCFG_B SELGP selector, the
+Schmitt/input buffers, 3-bit drive fields, PUPD/R0/R1 pulls and shared
+TDSEL/RDSEL fields. GPIO51 uses an input with pull-up on the GPIO path, keeping reset
+deasserted; SELGP and the GPIO mux follow the BSP pad selection. It is not driven low or pulsed. The pinmux callback
+also applies to GPIO/EINT requests through the common register setter;
+other MediaTek SoCs retain their existing path. Drive code 2 is represented
+as 6 mA, with command/data/reset pull-up, clock pull-down, TDSEL=10 and
+RDSEL=0. No I/O voltage switch or HS200/HS400 capability is enabled.
+
+The first 52 MHz build #54 negotiated high speed and read the system, but
+writes timed out at CMD12, aborting ext4 journals. It is not a qualified
+image. The original board register_setting specifies falling-edge command,
+read-data and write-CRC sampling. The initial legacy FIFO bring-up had
+omitted these settings. The board now declares them explicitly; read-data
+sampling uses PATCH_BIT0.RD_DAT_SEL for the synchronous FIFO, not IOCON.DSPL.
+The driver saves the resulting IOCON=0x10a and PB0=0x403c000f across runtime
+and system PM. The repaired boot was written from RAM with the running
+card clock lowered; normal init fsck checked cache/userdata before mounting.
+No partition was formatted. Logs for the failed attempt are retained as
+``emmc-hs-54-dmesg.txt`` in the capture directory.
+
+The final #55 boot completed with 8-bit MMC high speed at an actual 52 MHz,
+up from legacy 17.333 MHz. A 32 MiB O_DIRECT write/fsync and eight full direct
+reads matched SHA256; the last four rounds began with the real MSDC0 gate
+and UPLL_D3/D6 all off. Timings include hashing and background Android I/O,
+so they are not a controlled storage throughput benchmark. MMC command/data
+CRC, timeouts and the remaining err_stats counters were all zero.
+
+A further s2idle/RTC cycle succeeded with zero aborts, retained the 16 MiB
+RAM hash, restored ADB and kept the 52 MHz sampling configuration. After
+resume a new 4 MiB direct write/fsync and readback matched, all MMC error
+counters remained zero, and RDMA frame counts advanced without underflow
+or abnormal events. PMIC power key, remote and touch input devices remained
+registered. Temporary I/O files, wake references and the RTC alarm were
+cleared; plugged-in stay-on remains 0. Standard product boot/kernel now use
+the exact tested #55 image. Captures are ``emmc-hs-55-`` followed by
+``initial.txt``, ``pads.txt``, ``io.txt``, ``render.txt``, ``suspend.txt`` and
+``resume.txt`` under ``out/a1260-runtime-pm/``. The high-speed work does not
+establish HS200/HS400 operation or identify the fixed I/O rail wiring.

@@ -358,7 +358,113 @@ static const struct mtk_pin_field_calc mt6580_pin_pu_range[] = {
 static const struct mtk_pin_field_calc mt6580_pin_pd_range[] = {
 };
 
+/* Dedicated MSDC0 pads: PUPD=1 selects pull-down; R1/R0 select resistance. */
+static const struct mtk_pin_field_calc mt6580_pin_pupd_range[] = {
+	MT6580_FIELD(41, 2, 0x018, 8),
+	MT6580_FIELD(42, 2, 0x018, 10),
+	MT6580_FIELD(43, 2, 0x018, 7),
+	MT6580_FIELD(44, 2, 0x018, 6),
+	MT6580_FIELD(45, 2, 0x018, 5),
+	MT6580_FIELD(46, 2, 0x018, 4),
+	MT6580_FIELD(47, 2, 0x018, 3),
+	MT6580_FIELD(48, 2, 0x018, 2),
+	MT6580_FIELD(49, 2, 0x018, 1),
+	MT6580_FIELD(50, 2, 0x018, 0),
+	MT6580_FIELD(51, 2, 0x018, 9),
+};
+
+static const struct mtk_pin_field_calc mt6580_pin_r0_range[] = {
+	MT6580_FIELD(41, 2, 0x024, 8),
+	MT6580_FIELD(42, 2, 0x024, 10),
+	MT6580_FIELD(43, 2, 0x024, 7),
+	MT6580_FIELD(44, 2, 0x024, 6),
+	MT6580_FIELD(45, 2, 0x024, 5),
+	MT6580_FIELD(46, 2, 0x024, 4),
+	MT6580_FIELD(47, 2, 0x024, 3),
+	MT6580_FIELD(48, 2, 0x024, 2),
+	MT6580_FIELD(49, 2, 0x024, 1),
+	MT6580_FIELD(50, 2, 0x024, 0),
+	MT6580_FIELD(51, 2, 0x024, 9),
+};
+
+static const struct mtk_pin_field_calc mt6580_pin_r1_range[] = {
+	MT6580_FIELD(41, 2, 0x030, 8),
+	MT6580_FIELD(42, 2, 0x030, 10),
+	MT6580_FIELD(43, 2, 0x030, 7),
+	MT6580_FIELD(44, 2, 0x030, 6),
+	MT6580_FIELD(45, 2, 0x030, 5),
+	MT6580_FIELD(46, 2, 0x030, 4),
+	MT6580_FIELD(47, 2, 0x030, 3),
+	MT6580_FIELD(48, 2, 0x030, 2),
+	MT6580_FIELD(49, 2, 0x030, 1),
+	MT6580_FIELD(50, 2, 0x030, 0),
+	MT6580_FIELD(51, 2, 0x030, 9),
+};
+
+static const struct mtk_pin_field_calc mt6580_pin_drv_range[] = {
+	PIN_FIELD_CALC(41, 41, 2, 0x078, 0, 12, 3, 32, 0),
+	PIN_FIELD_CALC(42, 42, 2, 0x078, 0, 18, 3, 32, 0),
+	PIN_FIELD_CALC(43, 43, 2, 0x078, 0, 9, 3, 32, 0),
+	PIN_FIELD_CALC(44, 44, 2, 0x078, 0, 6, 3, 32, 0),
+	PIN_FIELD_CALC(45, 45, 2, 0x078, 0, 3, 3, 32, 0),
+	PIN_FIELD_CALC(46, 46, 2, 0x078, 0, 0, 3, 32, 0),
+	PIN_FIELD_CALC(47, 47, 2, 0x06c, 0, 29, 3, 32, 0),
+	PIN_FIELD_CALC(48, 48, 2, 0x06c, 0, 26, 3, 32, 0),
+	PIN_FIELD_CALC(49, 49, 2, 0x06c, 0, 23, 3, 32, 0),
+	PIN_FIELD_CALC(50, 50, 2, 0x06c, 0, 20, 3, 32, 0),
+	PIN_FIELD_CALC(51, 51, 2, 0x078, 0, 15, 3, 32, 0),
+};
+
+static const struct mtk_pin_field_calc mt6580_pin_tdsel_range[] = {
+	PIN_FIELD_CALC(41, 41, 2, 0x090, 0, 4, 4, 32, 0),
+	PIN_FIELD_CALC(42, 42, 2, 0x090, 0, 4, 4, 32, 0),
+	PIN_FIELD_CALC(43, 43, 2, 0x090, 0, 4, 4, 32, 0),
+	PIN_FIELD_CALC(44, 44, 2, 0x090, 0, 4, 4, 32, 0),
+	PIN_FIELD_CALC(45, 45, 2, 0x090, 0, 4, 4, 32, 0),
+	PIN_FIELD_CALC(46, 46, 2, 0x090, 0, 4, 4, 32, 0),
+	PIN_FIELD_CALC(47, 47, 2, 0x090, 0, 4, 4, 32, 0),
+	PIN_FIELD_CALC(48, 48, 2, 0x090, 0, 4, 4, 32, 0),
+	PIN_FIELD_CALC(49, 49, 2, 0x090, 0, 4, 4, 32, 0),
+	PIN_FIELD_CALC(50, 50, 2, 0x090, 0, 4, 4, 32, 0),
+	PIN_FIELD_CALC(51, 51, 2, 0x090, 0, 4, 4, 32, 0),
+};
+
+static const struct mtk_pin_field_calc mt6580_pin_rdsel_range[] = {
+	PIN_FIELD_CALC(41, 41, 2, 0x084, 0, 2, 6, 32, 0),
+	PIN_FIELD_CALC(42, 42, 2, 0x084, 0, 2, 6, 32, 0),
+	PIN_FIELD_CALC(43, 43, 2, 0x084, 0, 2, 6, 32, 0),
+	PIN_FIELD_CALC(44, 44, 2, 0x084, 0, 2, 6, 32, 0),
+	PIN_FIELD_CALC(45, 45, 2, 0x084, 0, 2, 6, 32, 0),
+	PIN_FIELD_CALC(46, 46, 2, 0x084, 0, 2, 6, 32, 0),
+	PIN_FIELD_CALC(47, 47, 2, 0x084, 0, 2, 6, 32, 0),
+	PIN_FIELD_CALC(48, 48, 2, 0x084, 0, 2, 6, 32, 0),
+	PIN_FIELD_CALC(49, 49, 2, 0x084, 0, 2, 6, 32, 0),
+	PIN_FIELD_CALC(50, 50, 2, 0x084, 0, 2, 6, 32, 0),
+	PIN_FIELD_CALC(51, 51, 2, 0x084, 0, 2, 6, 32, 0),
+};
+
+static const struct mtk_pin_field_calc mt6580_pin_sr_range[] = {
+	PIN_FIELD_CALC(41, 41, 2, 0x048, 0, 18, 1, 32, 0),
+	PIN_FIELD_CALC(42, 42, 2, 0x048, 0, 20, 1, 32, 0),
+	PIN_FIELD_CALC(43, 43, 2, 0x048, 0, 17, 1, 32, 0),
+	PIN_FIELD_CALC(44, 44, 2, 0x048, 0, 16, 1, 32, 0),
+	PIN_FIELD_CALC(45, 45, 2, 0x048, 0, 15, 1, 32, 0),
+	PIN_FIELD_CALC(46, 46, 2, 0x048, 0, 14, 1, 32, 0),
+	PIN_FIELD_CALC(47, 47, 2, 0x048, 0, 13, 1, 32, 0),
+	PIN_FIELD_CALC(48, 48, 2, 0x048, 0, 12, 1, 32, 0),
+	PIN_FIELD_CALC(49, 49, 2, 0x048, 0, 11, 1, 32, 0),
+	PIN_FIELD_CALC(50, 50, 2, 0x048, 0, 10, 1, 32, 0),
+	PIN_FIELD_CALC(51, 51, 2, 0x048, 0, 19, 1, 32, 0),
+};
+
 static const struct mtk_pin_reg_calc mt6580_reg_cals[PINCTRL_PIN_REG_MAX] = {
+	[PINCTRL_PIN_REG_PUPD] = MTK_RANGE(mt6580_pin_pupd_range),
+	[PINCTRL_PIN_REG_R0] = MTK_RANGE(mt6580_pin_r0_range),
+	[PINCTRL_PIN_REG_R1] = MTK_RANGE(mt6580_pin_r1_range),
+	[PINCTRL_PIN_REG_DRV] = MTK_RANGE(mt6580_pin_drv_range),
+	[PINCTRL_PIN_REG_TDSEL] = MTK_RANGE(mt6580_pin_tdsel_range),
+	[PINCTRL_PIN_REG_RDSEL] = MTK_RANGE(mt6580_pin_rdsel_range),
+	[PINCTRL_PIN_REG_SR] = MTK_RANGE(mt6580_pin_sr_range),
 	[PINCTRL_PIN_REG_MODE] = MTK_RANGE(mt6580_pin_mode_range),
 	[PINCTRL_PIN_REG_DIR] = MTK_RANGE(mt6580_pin_dir_range),
 	[PINCTRL_PIN_REG_DI] = MTK_RANGE(mt6580_pin_di_range),
@@ -384,6 +490,25 @@ static const struct mtk_eint_hw mt6580_eint_hw = {
 	.db_time = debounce_time_mt2701,
 };
 
+static int mt6580_pinmux_set(struct mtk_pinctrl *hw,
+			     const struct mtk_pin_desc *desc, u32 mode)
+{
+	u32 pin = desc->number;
+	u32 shift = (pin % 8) * 4;
+
+	if (mode > 7)
+		return -EINVAL;
+	mtk_rmw(hw, 0, 0x54 + (pin / 8) * 0x10, 0xf << shift, mode << shift);
+	if (pin >= 41 && pin <= 51) {
+		/* IOCFG_B SELGP independently selects MSDC0 versus GPIO mux.
+		 * RSTB remains a deasserted GPIO, as in the board's BSP setup.
+		 */
+		writel(BIT(pin - 41), hw->base[2] + (mode == 1 ? 0xb0 : 0xac));
+		readl(hw->base[2] + 0xa8);
+	}
+	return 0;
+}
+
 static const struct mtk_pin_soc mt6580_data = {
 	.reg_cal = mt6580_reg_cals,
 	.pins = mtk_pins_mt6580,
@@ -393,6 +518,9 @@ static const struct mtk_pin_soc mt6580_data = {
 	.gpio_m = 0,
 	.base_names = mt6580_base_names,
 	.nbase_names = ARRAY_SIZE(mt6580_base_names),
+	.pinmux_set = mt6580_pinmux_set,
+	.drive_set = mtk_pinconf_drive_set_rev1,
+	.drive_get = mtk_pinconf_drive_get_rev1,
 	.bias_set_combo = mtk_pinconf_bias_set_combo,
 	.bias_get_combo = mtk_pinconf_bias_get_combo,
 };

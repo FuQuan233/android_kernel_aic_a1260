@@ -625,8 +625,8 @@
 		compatible = "mediatek,mt6580-topckgen";
 		reg = <0 0x10000000 0 0x1000>;
 		clocks = <&apmixedsys CLK_MT6580_APMIXED_MAINPLL>,
-			 <&apmixedsys CLK_MT6580_APMIXED_UNIVPLL>;
-		clock-names = "mainpll", "univpll";
+			 <&apmixedsys CLK_MT6580_APMIXED_UNIVPLL>, <&ddrclk>;
+		clock-names = "mainpll", "univpll", "memory";
 		#clock-cells = <1>;
 	};
 
@@ -634,6 +634,17 @@
 		compatible = "mediatek,mt6580-apmixedsys";
 		reg = <0 0x10018000 0 0x1000>, <0 0x10001000 0 0x1000>;
 		#clock-cells = <1>;
+	};
+
+	ddrclk: clock-controller@10208000 {
+		compatible = "mediatek,mt6580-ddrphy-clock";
+		reg = <0 0x10208000 0 0x1000>,
+		      <0 0x10207000 0 0x1000>,
+		      <0 0x10206000 0 0x1000>;
+		reg-names = "ddrphy", "dramc-ao", "dramc-nao";
+		clocks = <&uart_clk>;
+		clock-names = "xtal";
+		#clock-cells = <0>;
 	};
 
 	pio: pinctrl@10005000 {
@@ -657,6 +668,39 @@
 				pinmux = <(MTK_PIN_NO(13) | 1)>;
 				input-enable;
 				bias-disable;
+			};
+		};
+
+		emmc_pins: emmc-pins {
+			/* Match BSP drive code 2, input buffers, pulls and pad delays. */
+			cmd-data {
+				pinmux = <(MTK_PIN_NO(42) | 1)>, <(MTK_PIN_NO(43) | 1)>,
+					 <(MTK_PIN_NO(44) | 1)>, <(MTK_PIN_NO(45) | 1)>,
+					 <(MTK_PIN_NO(46) | 1)>, <(MTK_PIN_NO(47) | 1)>,
+					 <(MTK_PIN_NO(48) | 1)>, <(MTK_PIN_NO(49) | 1)>,
+					 <(MTK_PIN_NO(50) | 1)>;
+				input-enable;
+				input-schmitt-enable;
+				drive-strength = <6>;
+				bias-pull-up = <MTK_PUPD_SET_R1R0_01>;
+				mediatek,tdsel = <10>;
+				mediatek,rdsel = <0>;
+			};
+
+			clock {
+				pinmux = <(MTK_PIN_NO(41) | 1)>;
+				input-enable;
+				input-schmitt-enable;
+				drive-strength = <6>;
+				bias-pull-down = <MTK_PUPD_SET_R1R0_10>;
+			};
+
+			reset {
+				pinmux = <(MTK_PIN_NO(51) | 0)>;
+				input-enable;
+				input-schmitt-enable;
+				drive-strength = <6>;
+				bias-pull-up = <MTK_PUPD_SET_R1R0_01>;
 			};
 		};
 
@@ -818,13 +862,21 @@
 			 <&topckgen CLK_MT6580_TOP_MSDC0>;
 		clock-names = "source", "hclk";
 		bus-width = <8>;
-		max-frequency = <26000000>;
+		max-frequency = <52000000>;
+		cap-mmc-highspeed;
+		/* Original board register_setting has all three sample edges = 1. */
+		mediatek,cmd-falling-edge;
+		mediatek,data-falling-edge;
+		mediatek,crc-falling-edge;
 		non-removable;
 		no-sd;
 		no-sdio;
 		vmmc-supply = <&vemc>;
-		/* No voltage switching until pinctrl and PMIC are ported. */
-		mediatek,firmware-pins;
+		/* Fixed I/O rail: no 1.8 V negotiation or HS200/HS400 yet. */
+		no-1-8-v;
+		pinctrl-names = "default", "state_uhs";
+		pinctrl-0 = <&emmc_pins>;
+		pinctrl-1 = <&emmc_pins>;
 	};
 
 	usbphy: phy@11110800 {

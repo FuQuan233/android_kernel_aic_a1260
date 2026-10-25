@@ -299,27 +299,26 @@ static const struct mt6580_div_desc mt6580_d5 = {
 	"mt6580_mpll_d5", "mt6580_mpll_d5_src", 1, 0x30, 2, true,
 };
 
-/* All UPLL divider consumers are represented by Linux clocks or explicit
- * firmware holds below. MPLL branches still have unmodeled display/DDR
- * consumers and remain read-only, except for the already owned D5 gate.
+/* Divider users have Linux references or the explicit firmware holds below.
+ * Keep the PLLs and the separate MEMPLL_D2 bit under firmware ownership.
  */
 static const struct mt6580_div_desc mt6580_fw_divs[] = {
-	{ "mt6580_mpll_d2", "mt6580_mpll", 2, 0x30, 0, false },
-	{ "mt6580_mpll_d3", "mt6580_mpll", 3, 0x30, 1, false },
+	{ "mt6580_mpll_d2", "mt6580_mpll", 2, 0x30, 0, true },
+	{ "mt6580_mpll_d3", "mt6580_mpll", 3, 0x30, 1, true },
 	{ "mt6580_mpll_d5_src", "mt6580_mpll", 5 },
-	{ "mt6580_mpll_d7", "mt6580_mpll", 7, 0x30, 3, false },
-	{ "mt6580_mpll_d11", "mt6580_mpll", 11, 0x30, 4, false },
-	{ "mt6580_mpll_d4", "mt6580_mpll_d2", 2, 0x30, 8, false },
-	{ "mt6580_mpll_d6", "mt6580_mpll_d3", 2, 0x30, 9, false },
-	{ "mt6580_mpll_d10", "mt6580_mpll_d5", 2, 0x30, 10, false },
-	{ "mt6580_mpll_d14", "mt6580_mpll_d7", 2, 0x30, 11, false },
-	{ "mt6580_mpll_d8", "mt6580_mpll_d4", 2, 0x30, 16, false },
-	{ "mt6580_mpll_d12", "mt6580_mpll_d6", 2, 0x30, 17, false },
-	{ "mt6580_mpll_d20", "mt6580_mpll_d10", 2, 0x30, 18, false },
-	{ "mt6580_mpll_d28", "mt6580_mpll_d14", 2, 0x30, 19, false },
-	{ "mt6580_mpll_d16", "mt6580_mpll_d8", 2, 0x30, 23, false },
-	{ "mt6580_mpll_d24", "mt6580_mpll_d12", 2, 0x30, 24, false },
-	{ "mt6580_mpll_d40", "mt6580_mpll_d20", 2, 0x30, 25, false },
+	{ "mt6580_mpll_d7", "mt6580_mpll", 7, 0x30, 3, true },
+	{ "mt6580_mpll_d11", "mt6580_mpll", 11, 0x30, 4, true },
+	{ "mt6580_mpll_d4", "mt6580_mpll_d2", 2, 0x30, 8, true },
+	{ "mt6580_mpll_d6", "mt6580_mpll_d3", 2, 0x30, 9, true },
+	{ "mt6580_mpll_d10", "mt6580_mpll_d5", 2, 0x30, 10, true },
+	{ "mt6580_mpll_d14", "mt6580_mpll_d7", 2, 0x30, 11, true },
+	{ "mt6580_mpll_d8", "mt6580_mpll_d4", 2, 0x30, 16, true },
+	{ "mt6580_mpll_d12", "mt6580_mpll_d6", 2, 0x30, 17, true },
+	{ "mt6580_mpll_d20", "mt6580_mpll_d10", 2, 0x30, 18, true },
+	{ "mt6580_mpll_d28", "mt6580_mpll_d14", 2, 0x30, 19, true },
+	{ "mt6580_mpll_d16", "mt6580_mpll_d8", 2, 0x30, 23, true },
+	{ "mt6580_mpll_d24", "mt6580_mpll_d12", 2, 0x30, 24, true },
+	{ "mt6580_mpll_d40", "mt6580_mpll_d20", 2, 0x30, 25, true },
 	{ "mt6580_upll_d2", "mt6580_upll", 2, 0x34, 0, true },
 	{ "mt6580_upll_d3", "mt6580_upll", 3, 0x34, 1, true },
 	{ "mt6580_upll_d4", "mt6580_upll_d2", 2, 0x34, 8, true },
@@ -375,7 +374,7 @@ static const char *mt6580_axi_parent(u32 sel)
 	case 1: return "dummy26m";
 	case 2: return "mt6580_mpll_d11";
 	case 4: return "mt6580_mpll_d12";
-	/* MEMPLL (0xc) needs a DDR clock provider before it can be modeled. */
+	case 12: return "mt6580_emi_memory_src";
 	default: return NULL;
 	}
 }
@@ -421,6 +420,44 @@ static const char *mt6580_cam_parent(u32 sel)
 	}
 }
 
+static const char *mt6580_nfi_parent(u32 sel)
+{
+	if ((sel & 0x78) == 8)
+		return "dummy26m";
+	switch (sel) {
+	case 0x11: case 0x52: return "mt6580_mpll_d8";
+	case 0x12: return "mt6580_mpll_d10";
+	case 0x14: case 0x61: return "mt6580_mpll_d14";
+	case 0x21: return "mt6580_mpll_d16";
+	case 0x22: return "mt6580_mpll_d28";
+	case 0x24: return "mt6580_mpll_d40";
+	case 0x62: return "mt6580_mpll_d24";
+	case 0x51: return "mt6580_mpll_d7";
+	case 0x54: return "mt6580_mpll_d12";
+	default: return NULL;
+	}
+}
+
+static const char *mt6580_audio_parent(u32 sel)
+{
+	switch (sel) {
+	case 1: return "dummy26m";
+	case 2: return "mt6580_mpll_d24";
+	case 4: return "mt6580_mpll_d12";
+	default: return NULL;
+	}
+}
+
+static const char *mt6580_scam_parent(u32 sel)
+{
+	switch (sel) {
+	case 1: return "dummy26m";
+	case 2: return "mt6580_mpll_d14";
+	case 4: return "mt6580_mpll_d12";
+	default: return NULL;
+	}
+}
+
 /* These leaves have no Linux driver yet. Do not change their gate or mux;
  * retain the selected parent only when firmware left the leaf enabled.
  * Replace each hold with the consumer's clock reference when it is ported.
@@ -445,7 +482,6 @@ static int mt6580_register_top_sources(struct device *dev, void __iomem *base,
 	const char *usb = mt6580_usb_parent((sel1 >> 20) & 7);
 	const char *mfg = mt6580_mfg_parent(sel0 >> 8, (sel1 >> 8) & 0x3f);
 	const char *axi = mt6580_axi_parent((sel0 >> 4) & 0xf);
-	const char *nfi_d5 = NULL;
 	unsigned int i;
 	int ret;
 
@@ -514,17 +550,45 @@ static int mt6580_register_top_sources(struct device *dev, void __iomem *base,
 	if (ret)
 		return ret;
 
-	/* NFI still needs its MPLL D5 hold until its driver owns the clock. */
-	if ((sel1 & 0x7f) == 0x12)
-		nfi_d5 = "mt6580_mpll_d10";
-	else if ((sel1 & 0x7f) == 0x24)
-		nfi_d5 = "mt6580_mpll_d40";
-	if (nfi_d5) {
-		ret = mt6580_register_parent_alias(dev, "mt6580_fw_nfi",
-						  nfi_d5, CLK_IS_CRITICAL);
-		if (ret)
-			return ret;
-	}
+	ret = mt6580_hold_firmware_parent(dev, base + 0x24, 19, "mt6580_fw_nfi",
+					  mt6580_nfi_parent(sel1 & 0x7f));
+	if (ret)
+		return ret;
+	ret = mt6580_hold_firmware_parent(dev, base + 0x24, 25, "mt6580_fw_audio",
+					  mt6580_audio_parent((sel0 >> 27) & 7));
+	if (ret)
+		return ret;
+	ret = mt6580_hold_firmware_parent(dev, base + 0x20, 5, "mt6580_fw_scam",
+					  mt6580_scam_parent((sel1 >> 23) & 7));
+	if (ret)
+		return ret;
+
+	/* The BSP explicitly exempts D14 from unused-divider cleanup. Keep
+	 * that policy without inventing a DSI gate parent absent from the BSP.
+	 */
+	ret = mt6580_register_parent_alias(dev, "mt6580_fw_d14",
+					  "mt6580_mpll_d14", CLK_IS_CRITICAL);
+	if (ret)
+		return ret;
+	/* Atomic ARMPLL transitions temporarily use PLL2_CK from MPLL_D2. */
+	ret = mt6580_register_parent_alias(dev, "mt6580_cpu_handover",
+					  "mt6580_mpll_d2", CLK_IS_CRITICAL);
+	if (ret)
+		return ret;
+
+	/* DDRPHY configuration access and live EMI have no runtime gate owner.
+	 * Retain their boot muxes; do not modify memory PLLs or bit 31 in 0x30.
+	 */
+	data->hws[CLK_MT6580_TOP_DDRPHYCFG] = devm_clk_hw_register_fixed_factor(dev,
+		"mt6580_ddrphycfg", sel1 & BIT(15) ? "mt6580_mpll_d16" : "dummy26m",
+		CLK_IS_CRITICAL, 1, 1);
+	if (IS_ERR(data->hws[CLK_MT6580_TOP_DDRPHYCFG]))
+		return PTR_ERR(data->hws[CLK_MT6580_TOP_DDRPHYCFG]);
+	data->hws[CLK_MT6580_TOP_EMI] = devm_clk_hw_register_fixed_factor(dev,
+		"mt6580_emi", sel0 & BIT(1) ? "mt6580_emi_memory_src" : "dummy26m",
+		CLK_IS_CRITICAL, 1, 1);
+	if (IS_ERR(data->hws[CLK_MT6580_TOP_EMI]))
+		return PTR_ERR(data->hws[CLK_MT6580_TOP_EMI]);
 	dev_info(dev, "Firmware parents: SMI=%s USB=%s MFG=%s MSDC0=%s; mux=%#x/%#x\n",
 		 smi, usb, mfg, mt6580_msdc_parents[(sel0 >> 11) & 7], sel0, sel1);
 	dev_info(dev, "AXI parent=%s; I2C/APDMA follow AXI, AUXADC uses 26 MHz\n", axi);
@@ -567,7 +631,7 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	if (of_device_is_compatible(dev->of_node, "mediatek,mt6580-mfgcfg"))
 		return mtk_clk_simple_probe(pdev);
 	if (top)
-		count = 16;
+		count = 18;
 
 	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
@@ -589,6 +653,9 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 		parent = devm_clk_get(dev, "univpll");
 		if (IS_ERR(parent))
 			return dev_err_probe(dev, PTR_ERR(parent), "UNIVPLL unavailable\n");
+		parent = devm_clk_get(dev, "memory");
+		if (IS_ERR(parent))
+			return dev_err_probe(dev, PTR_ERR(parent), "Memory clock unavailable\n");
 		ret = mt6580_register_top_sources(dev, base, data);
 		if (ret)
 			return ret;
