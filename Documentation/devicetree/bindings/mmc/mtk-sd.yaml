@@ -158,6 +158,25 @@ properties:
     enum: [32, 64]
     default: 32
 
+  mediatek,cmd-falling-edge:
+    type: boolean
+    description:
+      Sample command responses on falling edges with the MT6580 synchronous
+      FIFO. If absent, use rising edges. This is a board timing setting.
+
+  mediatek,data-falling-edge:
+    type: boolean
+    description:
+      Sample read data on falling edges with the MT6580 synchronous FIFO.
+      This selects PATCH_BIT0.RD_DAT_SEL rather than the asynchronous IOCON
+      data edge selector. If absent, use rising edges.
+
+  mediatek,crc-falling-edge:
+    type: boolean
+    description:
+      Sample write CRC status on falling edges on MT6580. If absent, use
+      rising edges. This does not select the write data output edge.
+
   mediatek,firmware-pins:
     $ref: /schemas/types.yaml#/definitions/flag
     description:
@@ -197,7 +216,15 @@ allOf:
         mmc-hs400-1_2v: false
       required: [non-removable, max-frequency, no-sd, no-sdio]
     else:
-      required: [pinctrl-names, pinctrl-0, pinctrl-1, vqmmc-supply]
+      required: [pinctrl-names, pinctrl-0, pinctrl-1]
+      if:
+        not:
+          properties:
+            compatible:
+              const: mediatek,mt6580-mmc
+          required: [no-1-8-v]
+      then:
+        required: [vqmmc-supply]
 
   - if:
       properties:
