@@ -299,12 +299,9 @@ static const struct mt6580_div_desc mt6580_d5 = {
 	"mt6580_mpll_d5", "mt6580_mpll_d5_src", 1, 0x30, 2, true,
 };
 
-/* UPLL_D16 feeds the USB bus and one PMIC SPI mux input. UPLL_D20 feeds
- * only another PMIC SPI input. Both consumers now have clock references.
- * UPLL_D24 feeds the UART muxes; their gates also retain the console and
- * enabled firmware UARTs not owned by a Linux driver.
- * Other divider gates retain firmware ownership, including the upstream
- * branches shared with unported UART/audio/camera/DDR consumers.
+/* All UPLL divider consumers are represented by Linux clocks or explicit
+ * firmware holds below. MPLL branches still have unmodeled display/DDR
+ * consumers and remain read-only, except for the already owned D5 gate.
  */
 static const struct mt6580_div_desc mt6580_fw_divs[] = {
 	{ "mt6580_mpll_d2", "mt6580_mpll", 2, 0x30, 0, false },
@@ -323,15 +320,15 @@ static const struct mt6580_div_desc mt6580_fw_divs[] = {
 	{ "mt6580_mpll_d16", "mt6580_mpll_d8", 2, 0x30, 23, false },
 	{ "mt6580_mpll_d24", "mt6580_mpll_d12", 2, 0x30, 24, false },
 	{ "mt6580_mpll_d40", "mt6580_mpll_d20", 2, 0x30, 25, false },
-	{ "mt6580_upll_d2", "mt6580_upll", 2, 0x34, 0, false },
-	{ "mt6580_upll_d3", "mt6580_upll", 3, 0x34, 1, false },
-	{ "mt6580_upll_d4", "mt6580_upll_d2", 2, 0x34, 8, false },
-	{ "mt6580_upll_d5", "mt6580_upll", 5, 0x34, 2, false },
-	{ "mt6580_upll_d6", "mt6580_upll_d3", 2, 0x34, 9, false },
-	{ "mt6580_upll_d7", "mt6580_upll", 7, 0x34, 3, false },
-	{ "mt6580_upll_d8", "mt6580_upll_d4", 2, 0x34, 16, false },
-	{ "mt6580_upll_d10", "mt6580_upll_d5", 2, 0x34, 10, false },
-	{ "mt6580_upll_d12", "mt6580_upll_d6", 2, 0x34, 17, false },
+	{ "mt6580_upll_d2", "mt6580_upll", 2, 0x34, 0, true },
+	{ "mt6580_upll_d3", "mt6580_upll", 3, 0x34, 1, true },
+	{ "mt6580_upll_d4", "mt6580_upll_d2", 2, 0x34, 8, true },
+	{ "mt6580_upll_d5", "mt6580_upll", 5, 0x34, 2, true },
+	{ "mt6580_upll_d6", "mt6580_upll_d3", 2, 0x34, 9, true },
+	{ "mt6580_upll_d7", "mt6580_upll", 7, 0x34, 3, true },
+	{ "mt6580_upll_d8", "mt6580_upll_d4", 2, 0x34, 16, true },
+	{ "mt6580_upll_d10", "mt6580_upll_d5", 2, 0x34, 10, true },
+	{ "mt6580_upll_d12", "mt6580_upll_d6", 2, 0x34, 17, true },
 	{ "mt6580_upll_d16", "mt6580_upll_d8", 2, 0x34, 24, true },
 	{ "mt6580_upll_d20", "mt6580_upll_d10", 2, 0x34, 18, true },
 	{ "mt6580_upll_d24", "mt6580_upll_d12", 2, 0x34, 25, true },
@@ -414,6 +411,31 @@ static int mt6580_register_parent_alias(struct device *dev, const char *name,
 	return PTR_ERR_OR_ZERO(hw);
 }
 
+static const char *mt6580_cam_parent(u32 sel)
+{
+	switch (sel) {
+	case 1: return "dummy26m";
+	case 2: return "mt6580_usb48m";
+	case 4: return "mt6580_upll_d6";
+	default: return NULL;
+	}
+}
+
+/* These leaves have no Linux driver yet. Do not change their gate or mux;
+ * retain the selected parent only when firmware left the leaf enabled.
+ * Replace each hold with the consumer's clock reference when it is ported.
+ */
+static int mt6580_hold_firmware_parent(struct device *dev, void __iomem *reg,
+				       u8 bit, const char *name, const char *parent)
+{
+	if (readl(reg) & BIT(bit))
+		return 0;
+
+	dev_info(dev, "Retaining firmware clock %s: parent=%s\n",
+		 name, parent ?: "unknown");
+	return mt6580_register_parent_alias(dev, name, parent, CLK_IS_CRITICAL);
+}
+
 static int mt6580_register_top_sources(struct device *dev, void __iomem *base,
 				      struct clk_hw_onecell_data *data)
 {
@@ -479,16 +501,20 @@ static int mt6580_register_top_sources(struct device *dev, void __iomem *base,
 	if (ret)
 		return ret;
 
-	/* Unported firmware consumers must not lose D5 when DISP is later
-	 * allowed to power off. Retain only their selected D5 branches, not
-	 * a blanket critical D5. Drop these holds when their drivers own PM.
-	 */
-	if (((sel0 >> 20) & 7) == 1) {
-		ret = mt6580_register_parent_alias(dev, "mt6580_fw_msdc1",
-						  "mt6580_mpll_d10", CLK_IS_CRITICAL);
-		if (ret)
-			return ret;
-	}
+	ret = mt6580_hold_firmware_parent(dev, base + 0x24, 18, "mt6580_fw_msdc1",
+					  mt6580_msdc_parents[(sel0 >> 20) & 7]);
+	if (ret)
+		return ret;
+	ret = mt6580_hold_firmware_parent(dev, base + 0x24, 23, "mt6580_fw_spi",
+					  sel1 & BIT(14) ? "mt6580_upll_d12" : "dummy26m");
+	if (ret)
+		return ret;
+	ret = mt6580_hold_firmware_parent(dev, base + 0x20, 1, "mt6580_fw_cam",
+					  mt6580_cam_parent((sel0 >> 15) & 7));
+	if (ret)
+		return ret;
+
+	/* NFI still needs its MPLL D5 hold until its driver owns the clock. */
 	if ((sel1 & 0x7f) == 0x12)
 		nfi_d5 = "mt6580_mpll_d10";
 	else if ((sel1 & 0x7f) == 0x24)

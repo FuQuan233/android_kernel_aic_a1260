@@ -1339,3 +1339,41 @@ alarm were cleared; plugged-in stay-on remains 0. Captures are
 ``out/a1260-runtime-pm/uart-clocks-50-`` followed by ``initial.txt``,
 ``suspend.txt``, ``suspend-stats.txt`` and ``final.txt``. Physical UART1,
 alternate 52 MHz selection and panic transmission were not exercised.
+
+UPLL divider tree ownership
+--------------------------
+
+Build #51 gives all 12 UPLL divider gates SET/CLR operations, keeping their
+BSP parent chains. The configured USB bus retains D2 -> D4 -> D8 -> D16;
+MSDC0 retains D3 -> D6 only while its runtime clock is enabled. This also
+allows unused D5/D10, D7 and D12 branches to stop, in addition to the D20
+and D24 leaf gates already owned in earlier builds. The PLL itself remains
+read-only and its separate 48 MHz outputs retain their existing consumers.
+
+Before unused-clock cleanup, unported MSDC1, SPI and CAM leaves retain a
+critical reference to their selected firmware parent if their peripheral
+gate is open. The driver does not change those leaf gates or muxes. An
+unknown active CAM mux is rejected instead of guessing a parent; an off
+leaf needs no hold. On this board only MSDC1 needs a hold, on the 26 MHz
+crystal. Future consumer drivers must replace these firmware holds with
+normal runtime clock references. The remaining 15 MPLL divider gates stay
+read-only; display and DDR dependencies are still incomplete.
+
+Hardware validation completed Android boot and a real Mali GLES draw with
+pixel readback 0,255,0,255 and no GL error. UPLL_FREDIV_EN is 0xfdf9fbf3
+while eMMC has its source enabled and 0xfdf9f9f1 when D3/D6 are gated;
+D2/D4/D8/D16 remain referenced by USB. A 4 MiB page-aligned O_DIRECT
+write/fsync and four direct reads matched SHA256. Round 3 sampled MSDC0
+runtime-suspended, its peripheral gate closed and both D3/D6 references
+zero before a matching read. Other sequential samples overlap background
+Android I/O and must not be treated as atomic clock snapshots.
+
+With USB configured to none, RTC wake completed one s2idle cycle with zero
+aborts. PMIC IRQ resumed the system, ADB re-enumerated automatically and
+UPLL divider references retained their expected idle state. DISP/MFG were
+off during screen-off; after wake, RDMA frame counts advanced with zero
+underflows or abnormal events. Temporary wake references, RTC alarm and
+I/O files were cleared; plugged-in stay-on remains 0. Captures are
+``out/a1260-runtime-pm/upll-tree-51-`` followed by ``initial.txt``,
+``render.txt``, ``io.txt``, ``off.txt``, ``suspend.txt`` and ``on.txt``.
+Alternate firmware mux selections and full PLL power-down are untested.
