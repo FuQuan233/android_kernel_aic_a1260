@@ -2271,3 +2271,26 @@ kernel WARNING/Oops. Temporary controls and wake references were cleared.
 This verifies retention and callback ordering, not restoration after actual
 infra power loss. Evidence under out/a1260-runtime-pm is sysirq-98- plus
 check.txt, trace.txt, dmesg.txt, resume.txt and final.txt.
+
+Native UART context prerequisite
+--------------------------------
+
+Serial core and MTK set_termios rebuild standard 8250/FIFO/EFR/baud state.
+GUARD (0x3c), RX_SEL (0xb0) and RATE_FIX (0x34) are not rebuilt there, so
+MT6580 late suspend saves these native fields after RX/TX/console quiesce.
+Early resume checks/restores changed values before clearing the sleep
+request, while temporary clock references are still held. Failed readback
+keeps the clocks and records an error. Cached sleep_state exposes before,
+saved/restored values and paired context counts; the atomic infra readiness
+query requires a pending context snapshot with no prior context errors.
+
+Kernel #99 completed three DDRPHY/clock cold entries, s2idle and bound
+standby with success/fail 5/0. UART context saves/restores were 5/5,
+changed_fields/errors 0/0 and all native snapshots were 0x0f/0/0. The
+nonzero GUARD is retained; this test does not prove recovery after actual
+infra register loss. SYSIRQ remained 4/4 with no polarity loss/error.
+RAM and 52 MHz eMMC I/O, Mali pixel readback and zero-underflow display
+recovered without new kernel WARNING/Oops. Standard images are
+boot-uart-context.img and kernel-uart-context (#99). Controls/timers/
+tracing/wake references were cleared. Evidence under out/a1260-runtime-pm
+is uart-99- plus check.txt, trace.txt, dmesg.txt, resume.txt and final.txt.

@@ -39,6 +39,8 @@
 #define MT6580_UART_SLEEP_REQ	0xb4
 #define MT6580_UART_SLEEP_ACK	0xb8
 #define MT6580_UART_SLEEP_BIT	BIT(0)
+/* Extra MT6580 context not rebuilt by the serial core/set_termios path. */
+static const u16 mt6580_uart_context_regs[] = { 0x3c, 0xb0, 0x34 };
 #define MTK_UART_IER_XOFFI	0x20	/* Enable XOFF character interrupt */
 #define MTK_UART_IER_RTSI	0x40	/* Enable RTS Modem status interrupt */
 #define MTK_UART_IER_CTSI	0x80	/* Enable CTS Modem status interrupt */
@@ -88,6 +90,8 @@ struct mtk8250_data {
 	u32			sleep_ack, wake_ack;
 	unsigned int		sleep_requests, sleep_restores, sleep_skips;
 	int			sleep_error;
+	u32 context_saved[3], context_before[3], context_restored[3];
+	unsigned int context_saves, context_restores, context_lost, context_errors;
 };
 
 /* flow control mode */
@@ -655,7 +659,27 @@ static int mtk8250_restore_sleep(struct mtk8250_data *data,
 				struct uart_8250_port *up)
 {
 	void __iomem *base = up->port.membase;
-	int ret;
+	int i, ret;
+
+	/* Baud, FIFO, EFR and standard 8250 state are rebuilt by resume_port.
+	 * Restore the remaining native fields before the sleep/wake handshake.
+	 * Clocks are held and serial-core RX/TX/console are still suspended.
+	 */
+	for (i = 0; i < ARRAY_SIZE(mt6580_uart_context_regs); i++) {
+		void __iomem *reg = base + mt6580_uart_context_regs[i];
+
+		data->context_before[i] = readl(reg);
+		if (data->context_before[i] != data->context_saved[i]) {
+			data->context_lost++;
+			writel(data->context_saved[i], reg);
+		}
+		data->context_restored[i] = readl(reg);
+		if (data->context_restored[i] != data->context_saved[i]) {
+			data->context_errors++;
+			data->sleep_error = -EIO;
+			return -EIO;
+		}
+	}
 
 	writel(data->saved_sleep_req, base + MT6580_UART_SLEEP_REQ);
 	ret = readl_poll_timeout(base + MT6580_UART_SLEEP_ACK, data->wake_ack,
@@ -670,6 +694,7 @@ static int mtk8250_restore_sleep(struct mtk8250_data *data,
 	clk_disable_unprepare(data->bus_clk);
 	data->sleep_prepared = false;
 	data->sleep_restores++;
+	data->context_restores++;
 	return 0;
 }
 
@@ -679,7 +704,7 @@ static int __maybe_unused mtk8250_suspend_late(struct device *dev)
 	struct uart_8250_port *up = serial8250_get_port(data->line);
 	void __iomem *base = up->port.membase;
 	u32 val;
-	int ret;
+	int i, ret;
 
 	if (!data->sleep_supported)
 		return 0;
@@ -713,6 +738,9 @@ static int __maybe_unused mtk8250_suspend_late(struct device *dev)
 				val & UART_LSR_TEMT, 10, 10000);
 	if (ret)
 		goto clocks;
+	for (i = 0; i < ARRAY_SIZE(mt6580_uart_context_regs); i++)
+		data->context_saved[i] = readl(base + mt6580_uart_context_regs[i]);
+	data->context_saves++;
 	data->sleep_prepared = true;
 	writel(data->saved_sleep_en | MT6580_UART_SLEEP_BIT,
 	       base + MT6580_UART_SLEEP_EN);
@@ -750,10 +778,17 @@ static ssize_t sleep_state_show(struct device *dev, struct device_attribute *att
 
 	/* Cached snapshots only: never touch an unclocked UART from sysfs. */
 	return sysfs_emit(buf, "prepared=%u requests=%u restores=%u skips=%u error=%d\n"
-			 "saved_en=%08x saved_req=%08x sleep_ack=%08x wake_ack=%08x\n",
+			 "saved_en=%08x saved_req=%08x sleep_ack=%08x wake_ack=%08x\n"
+			 "context saves=%u restores=%u changed_fields=%u errors=%u\n"
+			 "context saved=%08x/%08x/%08x before=%08x/%08x/%08x restored=%08x/%08x/%08x\n",
 			 data->sleep_prepared, data->sleep_requests, data->sleep_restores,
 			 data->sleep_skips, data->sleep_error, data->saved_sleep_en,
-			 data->saved_sleep_req, data->sleep_ack, data->wake_ack);
+			 data->saved_sleep_req, data->sleep_ack, data->wake_ack,
+			 data->context_saves, data->context_restores,
+			 data->context_lost, data->context_errors,
+			 data->context_saved[0], data->context_saved[1], data->context_saved[2],
+			 data->context_before[0], data->context_before[1], data->context_before[2],
+			 data->context_restored[0], data->context_restored[1], data->context_restored[2]);
 }
 static DEVICE_ATTR_RO(sleep_state);
 
@@ -812,6 +847,18 @@ bool mt6580_uart_sleep_ready(struct device *dev)
 		(READ_ONCE(data->sleep_ack) & MT6580_UART_SLEEP_BIT);
 }
 EXPORT_SYMBOL_GPL(mt6580_uart_sleep_ready);
+
+bool mt6580_uart_infra_ready(struct device *dev)
+{
+	struct mtk8250_data *data;
+
+	if (!mt6580_uart_sleep_ready(dev))
+		return false;
+	data = dev_get_drvdata(dev);
+	return !READ_ONCE(data->context_errors) &&
+		READ_ONCE(data->context_saves) == READ_ONCE(data->context_restores) + 1;
+}
+EXPORT_SYMBOL_GPL(mt6580_uart_infra_ready);
 module_platform_driver(mtk8250_platform_driver);
 
 #ifdef CONFIG_SERIAL_8250_CONSOLE

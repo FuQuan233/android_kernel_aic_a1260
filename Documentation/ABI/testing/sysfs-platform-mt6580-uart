@@ -12,4 +12,11 @@ Description:
 		error records the last suspend handshake or wake restoration errno.
 		saved_en/saved_req are the original controls; sleep_ack/wake_ack
 		are the acknowledgment snapshots after request and restoration.
+		context saves/restores count native-field snapshots and completed
+		restores. changed_fields counts fields differing before restoration,
+		and errors counts failed readback checks. saved/before/restored show
+		GUARD (0x3c), RX_SEL (0xb0), RATE_FIX (0x34), respectively. These
+		fields are not rebuilt by serial core or MTK set_termios; changed
+		values are restored before completing the wake handshake. Standard
+		8250, FIFO, EFR and baud state remain owned by the serial core.
 		The handshake does not by itself turn off the UART or system clocks.

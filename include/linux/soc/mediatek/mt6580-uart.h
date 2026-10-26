@@ -8,5 +8,6 @@ struct device;
 
 /* Query after late suspend with the supplier bound; no MMIO or sleeping. */
 bool mt6580_uart_sleep_ready(struct device *dev);
+bool mt6580_uart_infra_ready(struct device *dev);
 
 #endif
