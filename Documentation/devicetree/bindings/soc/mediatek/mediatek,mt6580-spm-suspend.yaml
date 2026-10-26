@@ -24,6 +24,14 @@ properties:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: MT6580 PMIC wrapper providing the MT6350 suspend command slots
 
+  mediatek,uarts:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 1
+    maxItems: 2
+    items:
+      maxItems: 1
+    description: All enabled MT6580 UART controllers requiring sleep handshake
+
   interrupts:
     maxItems: 1
     description: SPM IRQ0, used for PCM return and timer wakeup
@@ -38,6 +46,7 @@ properties:
 required:
   - compatible
   - mediatek,pwrap
+  - mediatek,uarts
   - interrupts
   - clocks
   - clock-names
@@ -53,6 +62,7 @@ examples:
     suspend {
         compatible = "mediatek,mt6580-spm-suspend";
         mediatek,pwrap = <&pwrap>;
+        mediatek,uarts = <&uart0>;
         interrupts = <GIC_SPI 88 IRQ_TYPE_LEVEL_LOW>;
         clocks = <&topckgen CLK_MT6580_TOP_SPM>;
         clock-names = "spm";
