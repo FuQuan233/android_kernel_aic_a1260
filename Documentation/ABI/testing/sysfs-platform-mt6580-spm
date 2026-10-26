@@ -217,5 +217,7 @@ Description:
 		If a supplier/prerequisite rejects entry with -EBUSY before WFI,
 		and PCM rollback succeeds, automatic mem uses the retained-power
 		profile for that attempt. It never retries a real resume error.
-		The device uses mem_sleep_default=s2idle during qualification;
-		exposing deep alone does not establish it as the Android default.
+		A1260 initially used mem_sleep_default=s2idle during qualification.
+		After physical insertion wake across CPU0/infra/DDRPHY power-down
+		and clock stop passed, the device selects mem_sleep_default=deep.
+		MAINPLL and suspend-voltage policy remain retained.

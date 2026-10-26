@@ -2496,9 +2496,9 @@ A busy prerequisite is not a resume failure. If deep is rejected with
 -EBUSY before any WFI and PCM rollback succeeds, mem retries once with the
 retained profile, preserving the rejected source/R0/infra blocker masks.
 An actual entry/resume failure, failed rollback or another error is never
-hidden by fallback. The device explicitly selects mem_sleep_default=s2idle
-while qualifying this automatic entry; exposing deep does not by itself
-change the device's default.
+hidden by fallback. Initial qualification explicitly selected
+mem_sleep_default=s2idle; the device default is promoted only after the
+independent physical insertion check below.
 
 Kernel #108 passed two automatic deep entries with all qualification
 controls zero: effective CPU0 mode 2, flags 0x3b8, infra/DDR and clock
@@ -2515,9 +2515,79 @@ interval was 20.573195148 seconds; timekeeping sleep was 20.574833301
 seconds, RAM matched and USB returned with no driver error. The user
 reported accidentally pressing the power key while plugging in, so this
 cycle does not qualify independent insertion wake. A repeat without a
-cable cycle likewise does not count. A new physical insertion-only check
-is pending; the default remains s2idle until that result is confirmed.
+cable cycle likewise does not count. The subsequent insertion-only cycle
+completed with a new CPU0 cold return (4 total), flags 0x3b8, vbus_ready=1
+and matched 16 MiB RAM hashes. The stopped interval was 53.164046055
+seconds; timekeeping sleep was 53.165691978 seconds. PMIC IRQ47 woke the
+system, CHRDET events increased from two to four, and PHY/clock
+sleeps/resumes reached 6/6 with zero error. The user completed the
+no-power-key cable cycle and ADB recovered. This qualifies independent
+insertion wake across the automatic CPU0/infra/DDRPHY/clock-stop profile.
+Post-resume eMMC/GPU/display checks passed without a kernel WARNING/Oops.
 Evidence under out/a1260-runtime-pm is deep-108-check.txt,
 deep-108-trace.txt, deep-108-resume.txt, deep-108-summary.json,
 deep-108-plug-key.txt, deep-108-plug-key-trace.txt and
-deep-108-plug-no-cycle.txt.
+deep-108-plug-no-cycle.txt. The successful independent cycle is
+deep-108-plug.txt and deep-108-plug-trace.txt; its post-resume regression
+is deep-108-after-plug.txt. The device now selects mem_sleep_default=deep
+for subsequent builds; MAINPLL/suspend-voltage policy stays retained.
+
+A1260 default deep policy
+------------------------
+
+The device kernel fragment, boot command line and image packing arguments
+now select mem_sleep_default=deep. Kernel #110 booted with deep selected
+without a sysfs override. All standby qualification controls remained zero.
+Its default mem entry used effective CPU0 mode 2, flags 0x3b8, infra/DDRPHY
+power-down and F26M handoff; the subsequent connected bound-gadget entry
+correctly fell back to retained mode 0 with USB/R0 blockers 0x10/2. The
+16 MiB RAM hashes matched and BOOTTIME/REALTIME sleep deltas agreed.
+
+The first verification script incorrectly required watchdog mode 0x14;
+hardware had correctly preserved its disabled initial mode 0x5c, with
+success/fail 1/0 and no kernel error. The check was corrected to require
+watchdog EN clear and before/armed/after identical, accepting either saved
+selection. The complete check then passed, followed by direct 52 MHz eMMC
+I/O, Mali pixel readback, zero-underflow display and four-core recovery.
+With the temporary reconnect lock cleared, an ordinary screen-off check
+kept ADB responsive for 12 seconds. Android reported Asleep with its
+display and suspend blockers released; suspend success/fail stayed 3/0,
+so the active USB link correctly retained its normal wake reference.
+No test wake lock or RTC alarm remained.
+
+This does not change MAINPLL or suspend voltage/PASR/DPD policy, nor prove
+minimum whole-device sleep current or all host bus-resume paths.
+
+The latest standard images are boot-default-deep-fsck.img and
+kernel-default-deep-fsck (#110), including the ramdisk repair below.
+Evidence under out/a1260-runtime-pm is default-deep-110-first.txt (the
+script-only rejection), default-deep-110-check.txt, default-deep-110-clocks.json,
+default-deep-110-resume.txt, default-deep-110-connected.txt,
+default-deep-110-dmesg.txt and default-deep-110-final.txt.
+
+First-stage metadata filesystem check
+-------------------------------------
+
+The final storage audit found a historical error flag on metadata (p15).
+The same two ext4_journal_check_start records and timestamps were already
+present in #104/#108; current 52 MHz MMC error counters stayed zero. The
+fstab requested a first-stage check, but fs_mgr could not execute e2fsck
+before system was mounted. Cache and userdata checks ran later normally.
+
+The device now packages AOSP e2fsck_ramdisk, a static ARM executable, at
+system/bin/e2fsck in the first-stage ramdisk. The debug ramdisk tool also
+accepts --e2fsck for updating the current boot without rebuilding system
+or vendor; it preserves existing cpio entries and the initial root-ADB
+selection. The standard pack configuration uses ramdisk-root-adb-fsck.img.
+
+On the same #110 kernel, first-stage fs_mgr executed the checker on the
+unmounted metadata filesystem, forced a check and remounted successfully.
+The metadata superblock then had state=0x1, error_count=0 and zero first/
+last error timestamps. Android completed boot with deep selected; no
+partition was formatted and MMC error counters remained zero. The initial
+probe mount warning is retained in that boot's log before fsck runs;
+the final mount has no error warning. The first-stage log file directory
+was absent, but the check result was captured in kmsg and verified from
+the superblock. Evidence under out/a1260-runtime-pm is
+build-e2fsck-ramdisk.log, default-deep-fsck-110-dmesg.txt,
+metadata-after-fsck-summary.json and default-deep-fsck-110-final.txt.
