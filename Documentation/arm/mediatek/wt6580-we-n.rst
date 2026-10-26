@@ -2481,3 +2481,43 @@ Evidence is out/a1260-runtime-pm/vbus-phy-107-{infra,infra-trace,resume,
 physical,physical-trace,after-plug,final,dmesg}.txt. The physical cycle
 used ordinary s2idle, not automatic CPU0/infra deep power-down. That
 production suspend entry remains the next step.
+
+Standard automatic deep entry and pre-entry fallback
+----------------------------------------------------
+
+The PCM provider now exposes PM_SUSPEND_MEM through the standard deep
+selection. Automatic mem ignores the explicit standby qualification knobs:
+it requests CPU0/TOP/L2, infra and DDRPHY power-down plus R0/APSRC/F26M
+handoffs, using the external-wake counter and normal watchdog policy.
+Standby retains the existing staged controls. Diagnostics distinguish the
+requested suspend state from the effective CPU0 mode.
+
+A busy prerequisite is not a resume failure. If deep is rejected with
+-EBUSY before any WFI and PCM rollback succeeds, mem retries once with the
+retained profile, preserving the rejected source/R0/infra blocker masks.
+An actual entry/resume failure, failed rollback or another error is never
+hidden by fallback. The device explicitly selects mem_sleep_default=s2idle
+while qualifying this automatic entry; exposing deep does not by itself
+change the device's default.
+
+Kernel #108 passed two automatic deep entries with all qualification
+controls zero: effective CPU0 mode 2, flags 0x3b8, infra/DDR and clock
+handoffs restored, cold/erratum 2/2, aborts=0. Timekeeping added 5.262610497
+and 4.285585389 seconds; Android alarms woke both before the nine-second
+RTC backup. Ordinary s2idle also passed. A connected, bound gadget then
+caused source blocker 0x10 / R0 blocker 2; deep rolled back before WFI,
+entered retention with effective mode 0 and returned successfully. The
+16 MiB RAM hash, direct eMMC I/O, GPU/display and four cores passed.
+
+A physical unplug cycle also entered automatic deep with the gadget bound:
+CPU0 cold/erratum reached 3/3, flags 0x3b8 and vbus_ready=1. The stopped
+interval was 20.573195148 seconds; timekeeping sleep was 20.574833301
+seconds, RAM matched and USB returned with no driver error. The user
+reported accidentally pressing the power key while plugging in, so this
+cycle does not qualify independent insertion wake. A repeat without a
+cable cycle likewise does not count. A new physical insertion-only check
+is pending; the default remains s2idle until that result is confirmed.
+Evidence under out/a1260-runtime-pm is deep-108-check.txt,
+deep-108-trace.txt, deep-108-resume.txt, deep-108-summary.json,
+deep-108-plug-key.txt, deep-108-plug-key-trace.txt and
+deep-108-plug-no-cycle.txt.

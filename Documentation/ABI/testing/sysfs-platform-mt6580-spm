@@ -51,6 +51,14 @@ Description:
 		F26M is handed off. It is added before timekeeping resumes.
 		Generic timekeeping uses the composite clock instead of injecting
 		second-granularity RTC sleep time a second time.
+		entry state is the last platform suspend_state_t (standby=2,
+		mem=3); cpu0_mode is the effective entry mode, distinct from the
+		qualification cpu0 mode setting printed below. fallback records an
+		automatic deep request retried with retention after a pre-entry
+		-EBUSY and successful rollback; deep_requests/deep_fallbacks count
+		these requests/fallbacks. fallback source/r0/infra retain blocker
+		masks from that rejected attempt. Actual resume failures never
+		trigger a fallback and are reported normally.
 
 What:		/sys/devices/platform/10006000.power-controller/*suspend/cpu0_mode
 Date:		October 2026
@@ -196,3 +204,18 @@ Description:
 		auxadc contains STRUP_CON10 saved/resume/restored snapshots. After
 		PCM execution, only its START bit is restored before releasing the
 		slots; unrelated PMIC bits are retained.
+
+What:		/sys/power/mem_sleep (MT6580 deep)
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		The MT6580 PCM provider exposes the standard deep selection.
+		With deep selected, mem requests the verified CPU0/L2/infra/DDRPHY
+		power-down and APSRC/F26M handoff profile, using the external-wake
+		PCM counter and normal watchdog suspend policy. Standby sysfs
+		qualification controls/timer are ignored and left unchanged.
+		If a supplier/prerequisite rejects entry with -EBUSY before WFI,
+		and PCM rollback succeeds, automatic mem uses the retained-power
+		profile for that attempt. It never retries a real resume error.
+		The device uses mem_sleep_default=s2idle during qualification;
+		exposing deep alone does not establish it as the Android default.

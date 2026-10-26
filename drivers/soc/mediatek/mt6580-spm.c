@@ -103,6 +103,7 @@ static const u16 pcm_saved_regs[] = {
 };
 
 struct mt6580_pcm_wake {
+	u32 cpu0_mode;
 	u32 r11, r12, r13, raw, misc, timer, isr, event, pc, assert_pc, debug;
 	u32 power_before, power_after, power2_before, power2_after, dvfs;
 	u32 timer_con_start, timer_val_start, timer_con_wake, timer_val_wake;
@@ -151,6 +152,10 @@ struct mt6580_spm {
 	bool ddrphy_control;
 	bool infra_control;
 	bool sleep_clock_ready;
+	suspend_state_t last_state;
+	unsigned int deep_requests, deep_fallbacks;
+	u32 fallback_source, fallback_r0, fallback_infra;
+	bool deep_fallback;
 	struct mt6580_cpu0_context cpu0;
 	u32 irq_status;
 	int irq;
@@ -425,17 +430,28 @@ static int mt6580_pcm_sysclk_settle(struct mt6580_spm *spm)
 		1, 1000);
 }
 
-static int mt6580_pcm_run(struct mt6580_spm *spm)
+enum mt6580_pcm_profile {
+	MT6580_PCM_QUALIFY,
+	MT6580_PCM_DEEP,
+	MT6580_PCM_RETAIN,
+};
+
+static int mt6580_pcm_run(struct mt6580_spm *spm, enum mt6580_pcm_profile profile)
 {
-	u32 con1, ticks = READ_ONCE(spm->timer_ms) * 32768 / 1000;
-	unsigned int mode = READ_ONCE(spm->cpu0_mode);
+	bool qualify = profile == MT6580_PCM_QUALIFY;
+	bool deep = profile == MT6580_PCM_DEEP;
+	u32 con1, ticks = qualify ? READ_ONCE(spm->timer_ms) * 32768 / 1000 : 0;
+	unsigned int mode = qualify ? READ_ONCE(spm->cpu0_mode) : (deep ? 2 : 0);
 	int i, ret, capture;
 
-	spm->wake.r0_requested = READ_ONCE(spm->r0_control);
-	spm->wake.apsrc_requested = READ_ONCE(spm->apsrc_control);
-	spm->wake.f26m_requested = READ_ONCE(spm->f26m_control);
-	spm->wake.ddrphy_requested = READ_ONCE(spm->ddrphy_control);
-	spm->wake.infra_requested = READ_ONCE(spm->infra_control);
+	spm->wake.cpu0_mode = mode;
+	spm->wake.r0_requested = qualify ? READ_ONCE(spm->r0_control) : deep;
+	spm->wake.apsrc_requested = qualify ? READ_ONCE(spm->apsrc_control) : deep;
+	spm->wake.f26m_requested = qualify ? READ_ONCE(spm->f26m_control) : deep;
+	spm->wake.ddrphy_requested = qualify ? READ_ONCE(spm->ddrphy_control) : deep;
+	spm->wake.infra_requested = qualify ? READ_ONCE(spm->infra_control) : deep;
+	if (deep && !spm->sleep_clock_ready)
+		return -ENODEV;
 	spm->wake.dpy_before = readl(spm->base + SPM_DPY_PWR_CON);
 	spm->wake.ifr_before = readl(spm->base + SPM_IFR_PWR_CON);
 	spm->wake.ifrsram_before = readl(spm->base + SPM_IFR_SRAMROM_CON);
@@ -657,26 +673,52 @@ static void mt6580_spm_finish(void)
 static int mt6580_spm_enter(suspend_state_t state)
 {
 	struct mt6580_spm *spm = mt6580_spm;
+	enum mt6580_pcm_profile profile;
 	int i, ret, restore;
 
-	if (state != PM_SUSPEND_STANDBY || num_online_cpus() != 1 ||
+	if ((state != PM_SUSPEND_STANDBY && state != PM_SUSPEND_MEM) ||
+	    num_online_cpus() != 1 ||
 	    smp_processor_id())
 		return -EINVAL;
+	spm->last_state = state;
+	spm->deep_fallback = false;
+	spm->fallback_source = 0;
+	spm->fallback_r0 = 0;
+	spm->fallback_infra = 0;
+	profile = state == PM_SUSPEND_MEM ? MT6580_PCM_DEEP : MT6580_PCM_QUALIFY;
+	if (state == PM_SUSPEND_MEM)
+		spm->deep_requests++;
+retry:
 	ret = mt6580_pcm_idle(spm);
 	if (ret)
 		goto out;
 	memset(&spm->wake, 0, sizeof(spm->wake));
 	spm->wake.settle_before = readl(spm->base + SPM_CLK_SETTLE);
 	/* Genpd/device suspend and secondary CPU power-off have completed.
-	 * Retained flags keep infra/DDRPHY power on. Optional request/output
-	 * handoffs are validated before allowing PCM to control those signals.
+	 * Both automatic deep and explicit qualification validate handoffs
+	 * before allowing PCM to control power/clock signals.
 	 */
 	for (i = 0; i < ARRAY_SIZE(pcm_saved_regs); i++)
 		spm->saved[i] = readl(spm->base + pcm_saved_regs[i]);
 	ret = mt6580_pcm_load(spm);
 	if (!ret)
-		ret = mt6580_pcm_run(spm);
+		ret = mt6580_pcm_run(spm, profile);
 	restore = mt6580_pcm_restore(spm);
+	/* A busy supplier is a normal automatic-suspend condition. Only fall
+	 * back after a clean rollback and before any CPU/WFI entry. Explicit
+	 * qualification retains strict errors, and actual resume errors must
+	 * never be hidden by trying another suspend.
+	 */
+	if (profile == MT6580_PCM_DEEP && ret == -EBUSY && !restore &&
+	    !spm->wake.time_started) {
+		spm->deep_fallback = true;
+		spm->deep_fallbacks++;
+		spm->fallback_source = spm->wake.src_blockers;
+		spm->fallback_r0 = spm->wake.r0_blockers;
+		spm->fallback_infra = spm->wake.infra_blockers;
+		profile = MT6580_PCM_RETAIN;
+		goto retry;
+	}
 	if (!ret)
 		ret = restore;
 out:
@@ -686,7 +728,7 @@ out:
 
 static int mt6580_spm_valid(suspend_state_t state)
 {
-	return state == PM_SUSPEND_STANDBY;
+	return state == PM_SUSPEND_STANDBY || state == PM_SUSPEND_MEM;
 }
 
 static const struct platform_suspend_ops mt6580_spm_ops = {
@@ -701,6 +743,8 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 	struct mt6580_spm *spm = dev_get_drvdata(dev);
 
 	return sysfs_emit(buf, "mode=retained-run pcm_words=%zu dma=%pad\n"
+			 "entry state=%u cpu0_mode=%u fallback=%u deep_requests=%u deep_fallbacks=%u\n"
+			 "fallback source=%08x r0=%08x infra=%08x\n"
 			 "loads=%u last_error=%d loaded_fsm=%08x restored_fsm=%08x\n"
 			 "fsm=%08x con0=%08x con1=%08x pwr_io=%08x\n"
 			 "runs=%u irqs=%u irq=%d irq_status=%08x pending=%u forced_exit=%u timer_ms=%u\n"
@@ -724,6 +768,9 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 "cpu0 cold=%u aborts=%u errata=%u l2=%08x/%08x cache=%08x/%08x\n"
 			 "cpu0 watchdog=%08x/%08x/%08x length=%08x\n",
 			 ARRAY_SIZE(mt6580_suspend_pcm), &spm->pcm_dma,
+			 spm->last_state, spm->wake.cpu0_mode, spm->deep_fallback,
+			 spm->deep_requests, spm->deep_fallbacks,
+			 spm->fallback_source, spm->fallback_r0, spm->fallback_infra,
 			 spm->loads, spm->last_error, spm->loaded_fsm, spm->restored_fsm,
 			 readl(spm->base + PCM_FSM_STA), readl(spm->base + PCM_CON0),
 			 readl(spm->base + PCM_CON1), readl(spm->base + PCM_PWR_IO_EN),
@@ -1121,7 +1168,7 @@ static int mt6580_spm_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(dev, mt6580_spm_unregister, spm);
 	if (ret)
 		return ret;
-	dev_info(dev, "PCM %s: retained-power execution; default s2idle retained\n",
+	dev_info(dev, "PCM %s: deep suspend with guarded retention fallback\n",
 		 MT6580_PCM_VERSION);
 	return 0;
 }

@@ -65,7 +65,7 @@ config MTK_MT6580_PMIC_WRAP
 	  command-slot handoff without reinitializing PWRAP.
 
 config MTK_MT6580_SPM
-	bool "MT6580 retained-state SPM suspend support"
+	bool "MT6580 SPM system suspend support"
 	depends on ARM && MACH_MT6580 && SUSPEND
 	depends on MTK_SCPSYS && MTK_MT6580_PMIC_WRAP=y
 	depends on SERIAL_8250_MT6577=y
@@ -73,17 +73,16 @@ config MTK_MT6580_SPM
 	depends on COMMON_CLK_MT6580_USB=y
 	depends on CPU_PM && ARM_CPU_SUSPEND
 	help
-	  Execute the BSP PCM program with retained power during explicit
-	  standby, with SPM timer/external wakeup and MT6350 command slots.
-	  R7 provides timer/control sequencing; R0 defaults to disconnected and
-	  CPU0 normally uses retained power. Explicit qualification modes
-	  can exercise MMU-off resume or CPU0/TOP/L2 reset, including GIC,
-	  banked-register and L2 recovery. Infra and DDR stay retained, and
-	  Android keeps using s2idle. UART handshake and USB clock/PHY
-	  shutdown gate the software 26 MHz override. Optional R0 and APSRC
-	  handoff qualification retains DDRPHY/infra power. A further guarded
-	  F26M handoff can exercise system-clock stop with RTC compensation;
-	  the DDR supplier audits BSP prerequisites without changing timings.
+	  Execute the BSP PCM program for standby and automatic deep system
+	  suspend, with timer/external wakeup and MT6350 command slots. Deep
+	  sleep uses CPU0/TOP/L2, infra and DDRPHY power-down with guarded
+	  APSRC/F26M handoff and counter-based sleep accounting. A busy
+	  prerequisite falls back to retention before hardware sleep. Explicit
+	  standby also supports staged MMU-off and power-down qualification.
+	  GIC, banked registers and L2 state are restored. UART and USB clock/PHY
+	  shutdown gate the software 26 MHz override. The DDR supplier audits
+	  BSP prerequisites without changing memory timings. Suspend voltage
+	  and MAINPLL power policy remain retained.
 	  Firmware-initialized MT6350 PWRAP and CIRQ are required.
 
 config MTK_MT6580_MODEM_OFF
