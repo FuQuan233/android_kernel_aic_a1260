@@ -15,7 +15,7 @@ power/power-domain.yaml. It provides the power domains defined in
 - include/dt-bindings/power/mt2701-power.h
 - include/dt-bindings/power/mt2712-power.h
 - include/dt-bindings/power/mt7622-power.h
-- include/dt-bindings/power/mt6580-power.h (MFG, DISP, ISP)
+- include/dt-bindings/power/mt6580-power.h (MFG, DISP, ISP, MD1)
 
 Required properties:
 - compatible: Should be one of:

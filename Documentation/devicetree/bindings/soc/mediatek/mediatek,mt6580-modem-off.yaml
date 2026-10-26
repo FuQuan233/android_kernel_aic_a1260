@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/mediatek/mediatek,mt6580-modem-off.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: MediaTek MT6580 unused modem shutdown controller
+
+maintainers:
+  - FuQuan <i@fuquan.moe>
+
+description: |
+  Quiesces the MD and 2G TOPSM/ABB blocks on boards that never use modem
+  firmware, before releasing MD1 through SCPSYS bus isolation and power
+  gating. This node claims exclusive ownership of the modem and must not
+  coexist with an operational modem/CCCI firmware consumer. It does not
+  reclaim reserved modem memory or override SPM hardware request masks.
+
+properties:
+  compatible:
+    const: mediatek,mt6580-modem-off
+
+  reg:
+    items:
+      - description: MD TOPSM register block
+      - description: 2G TOPSM register block
+
+  reg-names:
+    items:
+      - const: md-topsm
+      - const: 2g-topsm
+
+  power-domains:
+    maxItems: 1
+    description: MD1 power domain provided by MT6580 SCPSYS
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - power-domains
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/power/mt6580-power.h>
+
+    modem-power-controller@20030000 {
+        compatible = "mediatek,mt6580-modem-off";
+        reg = <0x20030000 0x900>, <0x23010000 0x900>;
+        reg-names = "md-topsm", "2g-topsm";
+        power-domains = <&scpsys MT6580_POWER_DOMAIN_MD1>;
+    };

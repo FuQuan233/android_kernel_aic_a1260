@@ -1,0 +1,11 @@
+What:		/sys/devices/platform/20030000.modem-power-controller/state
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Read-only cached snapshot of the unused-modem TOPSM shutdown.
+		quiesced records completion of the internal MD/2G/ABB sequence;
+		entries counts completed runtime-resume quiesce operations.
+		md_req/gsm_req show internal request masks before/after shutdown.
+		Reading does not power the domain up or access its off registers.
+		quiesced does not prove that the enclosing MD1 domain powered off;
+		check genpd status and both SPM power-status mirrors separately.
