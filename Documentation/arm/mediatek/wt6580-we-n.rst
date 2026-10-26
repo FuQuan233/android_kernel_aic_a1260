@@ -2066,3 +2066,45 @@ has the reproducible tools/make_root_adb_ramdisk.py and a debug-variant-only
 system property for future full builds. This is a temporary bring-up
 setting to remove before production, independently of physical USB wake
 work. The original ramdisk and pack-base-before-root-adb.json are retained.
+
+RTC fallback for a stoppable system counter
+------------------------------------------
+
+The board now declares arm,no-tick-in-suspend for the 13 MHz architectural
+counter. Current retained-clock runs still advance that counter, but later
+system-clock stop must not rely on CLOCK_SOURCE_SUSPEND_NONSTOP. With no
+persistent-clock hook, generic timekeeping rebases the counter on resume
+and RTC core supplies the suspended interval from MT6350 RTC0. This is a
+conservative capability declaration; it does not itself stop any clock.
+The RTC has one-second resolution, so this trades the retained counter's
+subsecond suspend precision for a fallback valid when that counter stops.
+
+The #90 RTC-DT variant changed only DTB and completed three cold standby
+entries, default s2idle and a bound-gadget retained-CPU standby. A small
+ARM clock_gettime64 fixture sampled REALTIME/MONOTONIC/RAW/BOOTTIME around
+each entry. All four clock deltas were nonnegative. REALTIME-minus-MONO
+sleep additions agreed with BOOTTIME-minus-MONO within 4 microseconds;
+MONO and RAW deltas agreed within 2 microseconds. RTC read tracing shows
+successful RTC0 suspend/resume reads, including 1792921094 -> 1792921096
+for the first timed entry.
+
+The three cold entries measured 2.000371/2.000365/8.383300 seconds on the
+still-running physical counter. RTC sleep additions were
+1.302410/2.166814/8.880662 seconds: individual errors stayed below one
+second and their sum differed from those counter intervals by about
+-34.2 milliseconds. This short sequence does not establish 34 ms RTC
+precision; the fallback retains second-scale quantization. Default s2idle
+and bound-gadget standby added 8.214815/1.663528 seconds of suspended time.
+Two imminent Android alarm cancellations occurred before the external
+standby; retries completed. Suspend success/fail was 5/2, with no kernel
+WARNING/Oops or time reversal. Four CPUs, RAM, MD1-off state, USB references,
+52 MHz eMMC I/O, Mali pixel readback and zero-underflow RDMA recovered.
+
+Standard product boot/kernel now use boot-rtc-suspend-time.img and
+kernel-rtc-suspend-time (kernel version still #90). RTC/PCM timers, mode,
+tracing and reconnect wake reference were cleared. Evidence under
+``out/a1260-runtime-pm/`` is ``rtc-time-`` plus ``initial.txt``, ``check.txt``,
+``analysis.json``, ``trace.txt``, ``dmesg.txt``, ``resume.txt`` and ``final.txt``;
+the clock fixture and analyzer are clock-snapshot.c and
+analyze-suspend-clocks.py. Physical clock stop and finer always-on timing
+remain unqualified.

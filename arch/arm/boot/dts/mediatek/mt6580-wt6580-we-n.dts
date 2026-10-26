@@ -932,6 +932,13 @@
 	capacity-dmips-mhz = <1024>;
 };
 
+&arch_timer {
+	/* Do not assume the 13 MHz counter survives future system-clock stop.
+	 * The MT6350 RTC supplies suspend-time compensation through RTC core.
+	 */
+	arm,no-tick-in-suspend;
+};
+
 &timer {
 	reg = <0 0x10008000 0 0x80>;
 };
