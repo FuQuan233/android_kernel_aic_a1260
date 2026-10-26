@@ -38,6 +38,9 @@
 #define PCM_FSM_STA		0x3c4
 #define PCM_SW_INT_CLEAR	0x3e4
 #define SPM_CLK_CON		0x400
+#define SPM_CLK_SETTLE		0x100
+#define SPM_SYSCLK_SETTLE	99 /* BSP 32 kHz ticks, approximately 3 ms. */
+#define SPM_SYSSETTLE_SEL	BIT(4)
 #define SPM_POWER_ON_VAL0	0x010
 #define SPM_POWER_ON_VAL1	0x014
 #define SPM_AP_STANDBY		0x608
@@ -83,7 +86,7 @@
 static const u16 pcm_saved_regs[] = {
 	PCM_CON0, PCM_CON1, PCM_IM_PTR, PCM_IM_LEN,
 	0x340, 0x344, 0x348, 0x34c,
-	PCM_DATA_INI, PCM_MAS_PAUSE_MASK, PCM_TIMER_VAL, SPM_CLK_CON,
+	PCM_DATA_INI, PCM_MAS_PAUSE_MASK, PCM_TIMER_VAL, SPM_CLK_CON, SPM_CLK_SETTLE,
 	SPM_AP_STANDBY, SPM_WAKE_MASK, SPM_CPU_WAKE, SPM_ISR_MASK,
 	PCM_FLAGS, PCM_SRC_REQ, 0xb00, 0xb04, PCM_DEBUG_FLAG,
 	0xb60, 0xb64, 0xb68, 0xb6c,
@@ -99,8 +102,10 @@ struct mt6580_pcm_wake {
 	u32 pwr_io_expected, r0, r0_blockers;
 	u32 src_before, src_expected, src_blockers, r13_before, usb_ready;
 	u32 poweron0, poweron1, clk_con, standby, mmddr;
+	u32 settle_before, settle_md, settle_programmed, settle_applied;
+	u32 settle_wake, settle_restored;
 	bool irq_pending, forced_exit;
-	bool r0_requested;
+	bool r0_requested, settle_changed;
 };
 
 struct mt6580_spm {
@@ -204,13 +209,31 @@ static int mt6580_pcm_restore(struct mt6580_spm *spm)
 	/* Restore data/vector registers first and controls last. Never replay a
 	 * fetch/run/reset command from a sampled control register.
 	 */
-	for (i = 2; i < ARRAY_SIZE(pcm_saved_regs); i++)
+	for (i = 2; i < ARRAY_SIZE(pcm_saved_regs); i++) {
+		if (pcm_saved_regs[i] == SPM_CLK_SETTLE)
+			continue;
 		writel(spm->saved[i], spm->base + pcm_saved_regs[i]);
+	}
 	value = spm->saved[1] & 0xffff;
 	writel(PCM_KEY | value, spm->base + PCM_CON1);
 	value = spm->saved[0] & 0xffff & ~(BIT(0) | PCM_IM_KICK | PCM_SW_RESET);
 	writel(PCM_KEY | value, spm->base + PCM_CON0);
 	spm->restored_fsm = readl(spm->base + PCM_FSM_STA);
+	if (spm->wake.settle_changed) {
+		/* Readback includes the MD contribution, not just the SW field.
+		 * Use the BSP's unsigned difference for both setup and rollback.
+		 */
+		writel(spm->wake.settle_before - spm->wake.settle_md,
+		       spm->base + SPM_CLK_SETTLE);
+		ret = readl_poll_timeout_atomic(spm->base + SPM_CLK_SETTLE,
+			spm->wake.settle_restored,
+			spm->wake.settle_restored == spm->wake.settle_before,
+			1, 1000);
+		if (ret)
+			return ret;
+	} else {
+		spm->wake.settle_restored = readl(spm->base + SPM_CLK_SETTLE);
+	}
 	ret = mt6580_pcm_idle(spm);
 	return ret ? ret : irq_ret;
 }
@@ -220,6 +243,7 @@ static int mt6580_pcm_capture(struct mt6580_spm *spm)
 	struct mt6580_pcm_wake *wake = &spm->wake;
 
 	wake->r0 = readl(spm->base + PCM_REG0);
+	wake->settle_wake = readl(spm->base + SPM_CLK_SETTLE);
 	wake->r11 = readl(spm->base + PCM_REG11);
 	wake->r12 = readl(spm->base + PCM_REG12);
 	wake->r13 = readl(spm->base + PCM_REG13);
@@ -316,13 +340,34 @@ static int mt6580_pcm_idle_finish(unsigned long arg)
 	return 0;
 }
 
+static int mt6580_pcm_sysclk_settle(struct mt6580_spm *spm)
+{
+	struct mt6580_pcm_wake *wake = &spm->wake;
+
+	/* BSP MD-off sequence: readback adds the MD contribution to the SW
+	 * field. Unsigned subtraction intentionally compensates that addition;
+	 * writing the observed total directly would add the MD delay twice.
+	 * This qualification still holds F26M; it does not stop the oscillator.
+	 */
+	writel(readl(spm->base + SPM_CLK_CON) | SPM_SYSSETTLE_SEL,
+	       spm->base + SPM_CLK_CON);
+	writel(0, spm->base + SPM_CLK_SETTLE);
+	wake->settle_changed = true;
+	wake->settle_md = readl(spm->base + SPM_CLK_SETTLE);
+	wake->settle_programmed = SPM_SYSCLK_SETTLE - wake->settle_md;
+	wake->settle_applied = SPM_SYSCLK_SETTLE;
+	writel(wake->settle_programmed, spm->base + SPM_CLK_SETTLE);
+	return readl_poll_timeout_atomic(spm->base + SPM_CLK_SETTLE,
+		wake->settle_wake, wake->settle_wake == wake->settle_applied,
+		1, 1000);
+}
+
 static int mt6580_pcm_run(struct mt6580_spm *spm)
 {
 	u32 con1, ticks = READ_ONCE(spm->timer_ms) * 32768 / 1000;
 	unsigned int mode = READ_ONCE(spm->cpu0_mode);
 	int i, ret, capture;
 
-	memset(&spm->wake, 0, sizeof(spm->wake));
 	spm->wake.r0_requested = READ_ONCE(spm->r0_control);
 	spm->wake.pwr_io_expected = PCM_R7_OUTPUT;
 	if (mode && ticks > 20 * 32768)
@@ -363,6 +408,9 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 		 */
 		spm->wake.src_expected |= PCM_F26M_REQ;
 		writel(spm->wake.src_expected, spm->base + PCM_SRC_REQ);
+		ret = mt6580_pcm_sysclk_settle(spm);
+		if (ret)
+			return ret;
 		spm->wake.pwr_io_expected |= PCM_R0_OUTPUT;
 	}
 	if (mode == 2 && spm->wake.src_blockers)
@@ -408,7 +456,9 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 		     spm->wake.pwr_io != spm->wake.pwr_io_expected ||
 		     spm->wake.flags != spm->wake.flags_expected ||
 		     spm->wake.src_req != spm->wake.src_expected ||
-		     (spm->wake.r0_requested && spm->wake.r0 != spm->wake.poweron0)))
+		     (spm->wake.r0_requested &&
+		      (spm->wake.r0 != spm->wake.poweron0 ||
+		       spm->wake.settle_wake != spm->wake.settle_applied))))
 		ret = -EIO;
 	return ret;
 }
@@ -470,6 +520,8 @@ static int mt6580_spm_enter(suspend_state_t state)
 	ret = mt6580_pcm_idle(spm);
 	if (ret)
 		goto out;
+	memset(&spm->wake, 0, sizeof(spm->wake));
+	spm->wake.settle_before = readl(spm->base + SPM_CLK_SETTLE);
 	/* Genpd/device suspend and secondary CPU power-off have completed.
 	 * Retained flags/requests keep system power on; R0 qualification also
 	 * holds F26M while connecting the crystal control output.
@@ -515,6 +567,7 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 "source before=%08x applied=%08x blockers=%08x r13_before=%08x usb_ready=%08x\n"
 			 "source poweron=%08x/%08x clk_con=%08x standby=%08x mmddr=%08x\n"
 			 "r0 requested=%u value=%08x baseline=%08x blockers=%08x\n"
+			 "sysclk_settle before=%u md=%u programmed=%08x applied=%u wake=%u restored=%u\n"
 			 "cpu0 mode=%u resumes=%u result=%d vector=%08x/%08x/%08x\n"
 			 "cpu0 timer_ctrl=%08x/%08x counter=%llu/%llu\n"
 			 "cpu0 cold=%u aborts=%u errata=%u l2=%08x/%08x cache=%08x/%08x\n"
@@ -540,6 +593,9 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 spm->wake.clk_con, spm->wake.standby, spm->wake.mmddr,
 			 spm->wake.r0_requested, spm->wake.r0, spm->wake.poweron0,
 			 spm->wake.r0_blockers,
+			 spm->wake.settle_before, spm->wake.settle_md, spm->wake.settle_programmed,
+			 spm->wake.settle_applied, spm->wake.settle_wake,
+			 spm->wake.settle_restored,
 			 READ_ONCE(spm->cpu0_mode), spm->cpu0.resumes, spm->cpu0.result,
 			 spm->cpu0.boot_before, spm->cpu0.boot_resume, spm->cpu0.boot_after,
 			 spm->cpu0.timer_ctrl, spm->cpu0.timer_ctrl_after,

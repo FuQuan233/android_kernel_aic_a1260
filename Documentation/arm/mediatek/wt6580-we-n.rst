@@ -2130,3 +2130,27 @@ references were cleared. Standard product boot/kernel use boot-r0-control.img
 and kernel-r0-control. Evidence is out/a1260-runtime-pm/r0-91- plus check.txt,
 trace.txt, dmesg.txt, resume.txt and final.txt. SYSCLK settle and DDR clock
 sequencing still need preparation before removing the forced clock request.
+
+SYSCLK settle programming and restoration
+-----------------------------------------
+
+R0 qualification now prepares the MT6580 BSP SYSCLK settle selector and
+99-tick budget (about 3 ms). SPM_CLK_SETTLE readback includes the MD
+contribution: this MD-off board reports 128 after writing zero, and 227
+after writing 99. The BSP unsigned difference is required to program a
+readback total of 99; restoring a sampled total directly adds MD again.
+The driver applies the same difference on rollback and bounds readback
+polls to 1 ms. Default R0-off standby does not write the settle field.
+
+The initial #92 implementation treated the register as ordinary read/write
+and rejected MD=128 before connecting outputs; no CPU-off entry occurred.
+Its diagnostic is sysclk-92-rejected.txt. Runtime probes confirmed that
+writing 0xffffff80 restores a total of zero with MD=128. Corrected #93
+completed three cold entries with before=0, md=128, programmed=0xffffffe3,
+applied/wake=99 and restored=0. Default s2idle and bound-gadget standby
+also recovered. Success/fail was 5/1: one imminent Android alarm cancelled
+before entry and its retry succeeded. F26M and APSRC remain forced in R0
+qualification, so actual oscillator restart timing is not yet qualified.
+Evidence is out/a1260-runtime-pm/sysclk-93- plus check.txt, trace.txt,
+dmesg.txt, resume.txt and final.txt. Standard images use
+boot-sysclk-settle-fixed.img and kernel-sysclk-settle-fixed (#93).

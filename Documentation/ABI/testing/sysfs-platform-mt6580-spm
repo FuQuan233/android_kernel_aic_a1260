@@ -90,6 +90,13 @@ Description:
 		APSRC are explicitly forced on throughout this qualification;
 		it does not permit physical crystal stop or DDR power changes.
 		R0 must return to POWER_ON_VAL0 before disconnecting PCM output.
+		The BSP SYSCLK settle selector and 99-tick (about 3 ms) budget are
+		prepared only for this qualification. Readback includes the MD
+		contribution; unsigned differences compensate it for programming
+		and restoration. The original total and selector are restored on exit.
+		State adds sysclk_settle before/md/programmed/applied/wake/restored.
+		With F26M forced, this checks programming and restoration only;
+		physical oscillator restart timing remains unqualified.
 		State adds r0 requested/value/baseline/blockers. Blocker bits are
 		wrong CPU mode (0), ordinary source handoff failure (1), powered
 		non-CPU domain (2), or hardware source-clock request (3).
