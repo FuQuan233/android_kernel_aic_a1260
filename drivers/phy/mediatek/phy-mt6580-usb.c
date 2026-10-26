@@ -84,6 +84,20 @@ static int mt6580_usb_power_off(struct phy *phy)
 {
 	struct mt6580_usb_phy *priv = phy_get_drvdata(phy);
 
+	/* BSP savecurrent: settle forced UTMI signals before removing 48 MHz.
+	 * Clearing VBUS validity alone leaves the analog PHY running.
+	 */
+	mt6580_usb_update(priv, 0x6b, 0x04, 0);
+	mt6580_usb_update(priv, 0x6e, 0x01, 0);
+	mt6580_usb_update(priv, 0x21, 0x03, 0);
+	mt6580_usb_update(priv, 0x6a, 0, 0x04);
+	mt6580_usb_update(priv, 0x68, 0x30, 0xdc);
+	mt6580_usb_update(priv, 0x69, 0x3c, 0);
+	mt6580_usb_update(priv, 0x6a, 0, 0xba);
+	mt6580_usb_update(priv, 0x1a, 0x90, 0);
+	usleep_range(800, 1000);
+	mt6580_usb_update(priv, 0x68, 0x08, 0);
+	udelay(2);
 	mt6580_usb_update(priv, 0x6c, 0x2e, 0x10);
 	clk_disable_unprepare(priv->ref);
 	return 0;

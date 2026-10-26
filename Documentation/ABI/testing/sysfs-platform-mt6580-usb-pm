@@ -1,0 +1,18 @@
+What:		/sys/devices/platform/11100000.usb/pm_state
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Read-only cached MT6580 MUSB parent system-PM snapshot. gated means
+		PHY and parent clocks were suspended; masked means wrapper IRQs
+		remain disabled until child context restoration. sleeps/resumes
+		count clock-gating and successful clock/PHY recovery. skips counts
+		a retained bound gadget (including pre-enumeration);
+		error is the last PM callback errno. PHY gating currently requires
+		the gadget to be explicitly unbound, pending real VBUS wake support.
+		l1_mask is the saved wrapper IRQ mask; phy_off separately tracks a
+		PHY reference released during suspend, including failed recovery.
+		bound/speed cache the last late-suspend binding/speed snapshot;
+		speed can remain stale after unbind and is not used as a blocker.
+		Reading never accesses the USB core or wakes it. This does not
+		establish host remote wake,
+		physical 26 MHz stop, or minimum system standby current.

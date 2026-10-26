@@ -57,6 +57,10 @@ struct mtk_glue {
 	struct usb_role_switch *role_sw;
 	bool mt6580;
 	struct wakeup_source *enumeration_ws;
+	bool clocks_gated, phy_suspended, pm_masked;
+	u32 pm_l1_mask, pm_sleeps, pm_resumes, pm_skips;
+	u32 pm_bound, pm_speed;
+	int pm_error;
 };
 
 static int mtk_musb_clks_get(struct mtk_glue *glue)
@@ -202,8 +206,11 @@ static irqreturn_t mtk_musb_interrupt(int irq, void *dev_id)
 {
 	irqreturn_t retval = IRQ_NONE;
 	struct musb *musb = (struct musb *)dev_id;
+	struct mtk_glue *glue = dev_get_drvdata(musb->controller->parent);
 	u32 l1_ints;
 
+	if (READ_ONCE(glue->clocks_gated))
+		return IRQ_NONE;
 	l1_ints = musb_readl(musb->mregs, USB_L1INTS) &
 			musb_readl(musb->mregs, USB_L1INTM);
 
@@ -368,6 +375,13 @@ static void mtk_musb_enable(struct musb *musb)
 {
 	struct mtk_glue *glue = dev_get_drvdata(musb->controller->parent);
 
+	/* Normal child resume has now restored the core context and IRQ masks.
+	 * Do not unmask the wrapper earlier, while PHY recovery can latch IRQs.
+	 */
+	if (glue->pm_masked && !glue->clocks_gated && !glue->phy_suspended) {
+		musb_writel(musb->mregs, USB_L1INTM, glue->pm_l1_mask);
+		glue->pm_masked = false;
+	}
 	/* Keep the enumeration window awake until RESET takes the normal
 	 * active-link wake reference. With no host the timeout permits sleep.
 	 */
@@ -640,6 +654,107 @@ static void mtk_musb_remove(struct platform_device *pdev)
 	usb_phy_generic_unregister(usb_phy);
 }
 
+static int mtk_musb_suspend_late(struct device *dev)
+{
+	struct mtk_glue *glue = dev_get_drvdata(dev);
+	struct musb *musb = glue->musb;
+	unsigned long flags;
+	int ret;
+
+	if (!glue->mt6580 || !musb || musb->port_mode != MUSB_PERIPHERAL)
+		return 0;
+	glue->pm_error = 0;
+	spin_lock_irqsave(&musb->lock, flags);
+	/* Keep a bound gadget listening even before enumeration: a root-adbd
+	 * handoff can outlast its bounded wake reference. Until a real VBUS
+	 * wake path is available, only an explicitly unbound gadget may lose
+	 * its PHY clocks. Active links still use their existing wake source.
+	 */
+	glue->pm_bound = !!musb->gadget_driver;
+	glue->pm_speed = musb->g.speed;
+	/* MUSB stop clears gadget_driver but can retain the old negotiated
+	 * speed. That stale speed does not represent a link after unbind.
+	 */
+	if (glue->pm_bound) {
+		glue->pm_skips++;
+		spin_unlock_irqrestore(&musb->lock, flags);
+		return 0;
+	}
+	/* The child's normal suspend saved context and disabled core IRQs. */
+	if (!glue->pm_masked)
+		glue->pm_l1_mask = musb_readl(musb->mregs, USB_L1INTM);
+	musb_writel(musb->mregs, USB_L1INTM, 0);
+	glue->pm_masked = true;
+	spin_unlock_irqrestore(&musb->lock, flags);
+	synchronize_irq(musb->nIrq);
+	if (!glue->phy_suspended) {
+		ret = phy_power_off(glue->phy);
+		if (ret) {
+			musb_writel(musb->mregs, USB_L1INTM, glue->pm_l1_mask);
+			glue->pm_masked = false;
+			glue->pm_error = ret;
+			return ret;
+		}
+		glue->phy_suspended = true;
+	}
+	WRITE_ONCE(glue->clocks_gated, true);
+	clk_bulk_disable_unprepare(MTK_MUSB_CLKS_NUM, glue->clks);
+	glue->pm_sleeps++;
+	return 0;
+}
+
+static int mtk_musb_resume_early(struct device *dev)
+{
+	struct mtk_glue *glue = dev_get_drvdata(dev);
+	int ret;
+
+	if (!glue->clocks_gated && !glue->phy_suspended)
+		return 0;
+	if (glue->clocks_gated) {
+		ret = clk_bulk_prepare_enable(MTK_MUSB_CLKS_NUM, glue->clks);
+		if (ret)
+			goto error;
+		WRITE_ONCE(glue->clocks_gated, false);
+	}
+	/* Restore clocks/PHY before the child's normal MMIO context restore. */
+	ret = phy_power_on(glue->phy);
+	if (ret)
+		goto error;
+	glue->phy_suspended = false;
+	glue->pm_resumes++;
+	return 0;
+error:
+	glue->pm_error = ret;
+	dev_err(dev, "USB clocks/PHY resume failed: %d\n", ret);
+	return ret;
+}
+
+static const struct dev_pm_ops mtk_musb_pm_ops = {
+	LATE_SYSTEM_SLEEP_PM_OPS(mtk_musb_suspend_late, mtk_musb_resume_early)
+};
+
+static ssize_t pm_state_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct mtk_glue *glue = dev_get_drvdata(dev);
+
+	if (!glue->mt6580)
+		return -ENODEV;
+	/* Cached: reading this attribute never wakes or touches the USB core. */
+	return sysfs_emit(buf,
+		"gated=%u masked=%u sleeps=%u resumes=%u skips=%u error=%d "
+		"l1_mask=%08x phy_off=%u bound=%u speed=%u\n",
+		glue->clocks_gated, glue->pm_masked, glue->pm_sleeps,
+		glue->pm_resumes, glue->pm_skips, glue->pm_error, glue->pm_l1_mask,
+		glue->phy_suspended, glue->pm_bound, glue->pm_speed);
+}
+static DEVICE_ATTR_RO(pm_state);
+
+static struct attribute *mtk_musb_attrs[] = {
+	&dev_attr_pm_state.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(mtk_musb);
+
 #ifdef CONFIG_OF
 static const struct of_device_id mtk_musb_match[] = {
 	{.compatible = "mediatek,mtk-musb",},
@@ -654,6 +769,8 @@ static struct platform_driver mtk_musb_driver = {
 	.driver = {
 		   .name = "musb-mtk",
 		   .of_match_table = of_match_ptr(mtk_musb_match),
+		   .pm = pm_ptr(&mtk_musb_pm_ops),
+		   .dev_groups = mtk_musb_groups,
 	},
 };
 

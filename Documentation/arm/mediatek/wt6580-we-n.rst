@@ -1975,3 +1975,55 @@ RTC/PCM timers and tracing were cleared/restored. Evidence under
 ``modem-off-83-{initial,dmesg}.txt`` and
 ``modem-off-84-{initial,check,dmesg,resume,final}.txt``. USB clock/PHY system
 PM and physical clock/DDR transitions remain separate work.
+
+USB PHY and parent-clock system PM
+----------------------------------
+
+The MT6580 MUSB parent now runs its late-suspend callback after the child
+has saved core context and disabled core interrupts. It masks the wrapper
+interrupts, drains any in-flight handler, runs the BSP UTMI savecurrent
+sequence, releases the PHY and then disables its bus/univ48m clocks. Early
+resume enables those clocks and the PHY before normal child MMIO restore;
+the wrapper mask is restored by the child's platform-enable callback after
+its context is valid. The handler avoids MMIO while clocks are gated.
+PHY and clock ownership are tracked separately, preserving the original
+wrapper mask across a failed recovery rather than releasing PHY twice.
+Error injection for these recovery branches has not been run on hardware.
+
+Only an explicitly unbound peripheral may use this path. A bound gadget
+keeps listening, including before enumeration, pending real VBUS wake
+support. MUSB stop clears gadget_driver but can retain g.speed=HIGH;
+therefore the binding is authoritative and stale speed is diagnostic only.
+Build #88 incorrectly treated stale speed as a blocker: its first cold
+resume succeeded, but no clock gating occurred and the check stopped.
+Build #89 removed that blocker and captured bound=0/speed=3 during all
+four successful gate/recovery entries. A previous #85 root-ADB disconnect
+also did not execute clock gating: the recovered device had uptime 1117
+seconds, sleeps/resumes=0/0, skips=1 and no kernel Oops.
+
+Build #89 completed three CPU-reset standby entries lasting
+2.001060/2.001052/8.629751 seconds, followed by an 8.330990-second default
+s2idle. USB sleeps/resumes=4/4, error=0, gated/masked/phy_off=0 and restored
+wrapper mask=7. The filtered trace records four disable/unprepare and four
+prepare/enable operations for each of usb_bus, usb48m and univ48m, inside
+the correct late/early callback boundaries, with no trace overruns or
+lost events. Awake enable counts return to 2/1/1. An earlier bound-gadget
+sleep was skipped by clock gating; total suspend success/fail is 5/0.
+
+CPU cold/erratum counts are 3/3 with zero WFI aborts. MD1 stays off, the
+16 MiB RAM hash matches, 52 MHz eMMC direct write/fsync/two reads match,
+Mali pixel readback succeeds and RDMA has no underflow/abnormal frames.
+No new kernel WARNING/Oops or PHY calibration failure was captured.
+Standard product boot/kernel use #89. Temporary mode, timers, tracing and
+the two-minute post-test reconnect wake reference were cleared/restored;
+plugged-in stay-on remains zero. Evidence under ``out/a1260-runtime-pm/``
+is ``usb-system-pm-89-`` plus ``initial.txt``, ``check.txt``, ``trace.txt``,
+``trace-summary.txt``, ``dmesg.txt``, ``final.txt`` and ``resume.txt``.
+
+The owner confirms a separate unresolved defect: inserting USB while the
+device is asleep neither wakes it nor lights the screen; manual power-key
+wake and replug are needed. CHRDET/VBUS wake and automatic re-enumeration
+are deferred. The current change does not qualify bound-gadget gating,
+host remote wake, PLL-core power-off, physical 26 MHz stop or minimum
+standby current. Before physical clock stop, SPM must account for USB
+readiness and the system timer's SUSPEND_NONSTOP assumption must be audited.
