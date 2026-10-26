@@ -468,7 +468,7 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 		if (spm->wake.infra_blockers)
 			return -EBUSY;
 	}
-	if (mode && READ_ONCE(spm->timer_ms) > 20000)
+	if (mode == 1 && READ_ONCE(spm->timer_ms) > 20000)
 		return -ERANGE;
 	/* Keep a 32 kHz time base for external wakes too. The maximum timer
 	 * supplies a rollover wake after about 36 hours, not a short timeout.

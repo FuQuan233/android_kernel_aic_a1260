@@ -2422,3 +2422,33 @@ out/a1260-runtime-pm/precise-clock-105-{check,trace,short,short-trace,
 resume,final,dmesg}.txt. Production long sleep still requires replacing
 the qualification watchdog; physical USB insertion wake was verified in
 #104 as described above.
+
+Long hardware suspend without a qualification reset
+---------------------------------------------------
+
+Hardware CPU0 mode 2 no longer arms the temporary 30-second reset guard.
+It requires the normal watchdog driver's suspend callback to have stopped
+the hardware watchdog; an enabled watchdog rejects entry. The CPU helper
+reads and checks its mode but does not change mode, length or restart
+registers. The normal watchdog resume callback retains responsibility for
+restarting it. Software-restart qualification (mode 1) keeps the bounded
+30-second guard and 20-second PCM limit. Other suspend prerequisites and
+the default s2idle policy remain unchanged.
+
+Kernel #106 passed two sets of hardware entries plus software-restart
+checks, suspend success/fail 6/0. Initial 40-second PCM/external attempts
+were interrupted by Android's earlier alarms at about 8.35 and 4.43
+seconds; a repeat timer entry also woke early at 27.74 seconds. These are
+not counted as full 40-second sleeps. The subsequent external RTC wake
+completed 37.570840 seconds of timekeeping-suspended time, crossing the
+old reset limit. PCM-minus-CNT measured 37.569198 seconds stopped; CNT
+advanced about 0.914 ms over the CPU0 suspend helper. Watchdog mode was
+0x14/0x14/0x14, with no guard armed. Mode 1 separately retained
+0x14/0x15/0x14 and a successful software resume.
+
+Both 16 MiB RAM hashes matched. Post-resume 52 MHz eMMC direct I/O, Mali
+pixel readback, display and four-core checks passed without a new kernel
+WARNING/Oops. Temporary controls, alarms, tracing and wake references
+were cleared. Evidence is out/a1260-runtime-pm/long-sleep-106-{check,
+repeat,trace,resume,dmesg,final}.txt. This qualifies long explicit standby;
+Android's automatic deep-suspend policy is still separate work.

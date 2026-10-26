@@ -66,15 +66,19 @@ Description:
 		and uses the hardware reset vector; L2, banked and notifier state
 		are restored, including the BSP sibling-core erratum sequence.
 		It requires the UART/domain/source handoff checks to pass and
-		still retains infra, DDR, supplies and crystal control.
-		Modes 1/2 temporarily arm a 30-second hardware reset watchdog
+		retains infra/DDRPHY/crystal control unless their separate controls
+		below are enabled; supply voltage policy is unchanged.
+		Mode 1 temporarily arms a 30-second hardware reset watchdog
 		after normal device suspend, restoring its settings on return.
 		A stopped watchdog may retain its IRQ/dual-mode selection: the
 		guard clears that selection temporarily and restores it unchanged.
 		An enabled IRQ/dual-mode watchdog is rejected with -EBUSY.
-		PCM timer values above 20 seconds are rejected in those modes;
-		with timer=0 an external wake must arrive before the watchdog.
-		This is a bring-up guard, not a normal long-suspend policy.
+		PCM timer values above 20 seconds are rejected in mode 1; with
+		timer=0 an external wake must arrive before its watchdog.
+		Mode 2 requires the normal watchdog device suspend to have
+		stopped the hardware watchdog. It neither arms a temporary guard
+		nor writes watchdog registers, allowing long hardware sleep.
+		An enabled watchdog rejects mode 2 before CPU power-down.
 		Android's default s2idle is unchanged. Values above 2 are rejected.
 
 What:		/sys/devices/platform/10006000.power-controller/*suspend/pcm_timer_ms
@@ -138,11 +142,12 @@ Description:
 		are preserved. Uses the MT6580 BSP CLK_CON SRCLKENA mask and MD1
 		CXO32K selection with MD1 off, plus the qualified SYSCLK settle budget.
 		CLK_CON expected/wake/restored snapshots verify setup and rollback.
-		CPU/L2 may reset; infra and DDRPHY power and voltage policy stay retained.
+		CPU/L2 may reset; infra/DDRPHY stay retained unless separately
+		enabled below. Voltage policy stays retained.
 		Physical counter/RTC snapshots are needed to qualify actual clock stop;
 		successful register handoff alone does not prove crystal shutdown.
-		The existing 30-second CPU0 qualification watchdog applies. This is
-		not enabled for Android's default s2idle or unbounded production sleep.
+		Hardware mode 2 requires the normal watchdog to be stopped; it
+		has no temporary reset guard. Android's default s2idle is unchanged.
 
 What:		/sys/devices/platform/10006000.power-controller/*suspend/ddrphy_control
 Date:		October 2026
@@ -155,8 +160,9 @@ Description:
 		off to qualify PHY power sequencing with 26 MHz retained first.
 		Full DDRPHY fixed-field checks and DPY power-control restoration are
 		verified on return. State adds ddrphy requested and power before/after.
-		Infra power, voltage and MAINPLL policy remain retained. The existing
-		30-second reset watchdog and bounded/external wake restrictions apply.
+		Infra power is retained unless infra_control is enabled. Voltage
+		and MAINPLL policy remain retained. Hardware mode 2 uses the normal
+		watchdog suspend policy without a temporary reset guard.
 		Off/on snapshots alone do not measure the time spent powered down.
 
 What:		/sys/devices/platform/10006000.power-controller/*suspend/infra_control
@@ -173,8 +179,8 @@ Description:
 		Blockers: missing controls (0), IFR baseline (1), UART context (2),
 		SYSIRQ context (3), CIRQ (4), PWRAP (5). Failure aborts before output
 		handoff. On return the generic power status and IFR on-state must
-		match. Voltage and MAINPLL policy stay retained. Existing 30-second
-		CPU0 reset-guard restrictions apply; Android s2idle is unchanged.
+		match. Voltage and MAINPLL policy stay retained. Hardware mode 2
+		uses the normal watchdog suspend policy; Android s2idle is unchanged.
 
 What:		/sys/devices/platform/1000f000.pmic-wrap/spm_phase
 Date:		October 2026

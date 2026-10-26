@@ -107,17 +107,23 @@ static void __iomem *mt6580_cpu_config;
 static void __iomem *mt6580_cpu_wdt;
 u32 mt6580_saved_l2ctlr;
 
-static int mt6580_resume_watchdog_arm(struct mt6580_cpu0_context *ctx)
+static int mt6580_resume_watchdog_prepare(struct mt6580_cpu0_context *ctx, bool guard)
 {
 	u32 mode;
 
 	/* Device PM has quiesced watchdogd and the watchdog driver. Keep a
-	 * bounded reset fallback for the explicit CPU0 qualification modes.
+	 * bounded reset fallback only for the software-restart qualification.
 	 * IRQs are disabled and this is the only online CPU; no driver I/O
 	 * can race these temporary writes. Default WFI never uses this path.
 	 */
 	ctx->wdt_before = readl(mt6580_cpu_wdt);
 	ctx->wdt_length = readl(mt6580_cpu_wdt + 4);
+	ctx->wdt_armed = ctx->wdt_before;
+	/* Hardware CPU0 suspend may last indefinitely. Require normal device
+	 * suspend to have stopped the watchdog, and leave it untouched.
+	 */
+	if (!guard)
+		return ctx->wdt_before & WDT_MODE_EN ? -EBUSY : 0;
 	if ((ctx->wdt_before & WDT_MODE_EN) &&
 	    (ctx->wdt_before & (WDT_MODE_IRQ_EN | WDT_MODE_DUAL_EN)))
 		return -EBUSY;
@@ -134,11 +140,13 @@ static int mt6580_resume_watchdog_arm(struct mt6580_cpu0_context *ctx)
 	return ctx->wdt_armed & BIT(0) ? 0 : -EIO;
 }
 
-static int mt6580_resume_watchdog_restore(struct mt6580_cpu0_context *ctx)
+static int mt6580_resume_watchdog_restore(struct mt6580_cpu0_context *ctx, bool guard)
 {
-	writel(WDT_MODE_KEY | ctx->wdt_before, mt6580_cpu_wdt);
-	writel(ctx->wdt_length | 8, mt6580_cpu_wdt + 4);
-	writel(WDT_RESTART_KEY, mt6580_cpu_wdt + 8);
+	if (guard) {
+		writel(WDT_MODE_KEY | ctx->wdt_before, mt6580_cpu_wdt);
+		writel(ctx->wdt_length | 8, mt6580_cpu_wdt + 4);
+		writel(WDT_RESTART_KEY, mt6580_cpu_wdt + 8);
+	}
 	ctx->wdt_after = readl(mt6580_cpu_wdt);
 	return ctx->wdt_after == ctx->wdt_before ? 0 : -EIO;
 }
@@ -194,10 +202,10 @@ int mt6580_cpu0_suspend(struct mt6580_cpu0_context *ctx, unsigned int mode,
 	ret = cpu_cluster_pm_enter();
 	if (ret)
 		goto cpu_exit;
-	ret = mt6580_resume_watchdog_arm(ctx);
+	ret = mt6580_resume_watchdog_prepare(ctx, mode == 1);
 	if (ret) {
-		if (ret != -EBUSY)
-			mt6580_resume_watchdog_restore(ctx);
+		if (ret != -EBUSY && mode == 1)
+			mt6580_resume_watchdog_restore(ctx, true);
 		goto cluster_exit;
 	}
 	ctx->boot_before = readl(mt6580_cpu_boot + BOOT_ADDR);
@@ -252,7 +260,7 @@ int mt6580_cpu0_suspend(struct mt6580_cpu0_context *ctx, unsigned int mode,
 	} else if (!ret && status == 1) {
 		ctx->aborts++;
 	}
-	restore = mt6580_resume_watchdog_restore(ctx);
+	restore = mt6580_resume_watchdog_restore(ctx, mode == 1);
 	if (!ret)
 		ret = restore;
 	ctx->result = ret ? ret : status;
