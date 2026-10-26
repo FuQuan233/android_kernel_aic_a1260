@@ -33,6 +33,22 @@ Description:
 		CLK_CON, AP_STANDBY and MMDDR_MASK. These show request ownership;
 		they do not establish that 26 MHz physically stopped. R0 output
 		remains disconnected and APSRC retained in either policy.
+		cpu0 mode/resumes/result record CPU0 resume-entry qualification.
+		vector contains the original/programmed/restored shared boot
+		address; timer_ctrl and counter contain before/after physical
+		timer snapshots. resumes counts returns through cpu_resume.
+
+What:		/sys/devices/platform/10006000.power-controller/*suspend/cpu0_mode
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		CPU0 entry mode for explicit standby: 0 (default) retains normal
+		WFI, 1 saves ARM/CPU-PM context, waits for wakeup, then performs
+		a software MMU-off restart through cpu_resume before restoring
+		the original shared boot vector and PM state. Mode 1 keeps CPU0,
+		L2, infra, DDR and supplies powered; it qualifies the resume entry
+		and does not prove hardware power-down or Boot ROM handoff.
+		Android's default s2idle is unchanged. Values above 1 are rejected.
 
 What:		/sys/devices/platform/10006000.power-controller/*suspend/pcm_timer_ms
 Date:		October 2026

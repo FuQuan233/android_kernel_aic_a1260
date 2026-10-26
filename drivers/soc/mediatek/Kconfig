@@ -69,6 +69,7 @@ config MTK_MT6580_SPM
 	depends on ARM && MACH_MT6580 && SUSPEND
 	depends on MTK_SCPSYS && MTK_MT6580_PMIC_WRAP=y
 	depends on SERIAL_8250_MT6577=y
+	depends on CPU_PM && ARM_CPU_SUSPEND
 	help
 	  Execute the BSP PCM program with retained power during explicit
 	  standby, with SPM timer/external wakeup and MT6350 command slots.

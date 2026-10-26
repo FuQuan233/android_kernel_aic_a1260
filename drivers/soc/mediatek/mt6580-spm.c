@@ -12,6 +12,7 @@
 #include <linux/smp.h>
 #include <linux/soc/mediatek/mt6580-pwrap.h>
 #include <linux/soc/mediatek/mt6580-uart.h>
+#include <linux/soc/mediatek/mt6580-cpu-pm.h>
 #include <linux/suspend.h>
 
 #include <asm/proc-fns.h>
@@ -108,6 +109,8 @@ struct mt6580_spm {
 	u32 loaded_fsm, restored_fsm;
 	unsigned int loads;
 	unsigned int runs, irqs, timer_ms;
+	unsigned int cpu0_mode;
+	struct mt6580_cpu0_context cpu0;
 	u32 irq_status;
 	int irq;
 	bool irq_wake;
@@ -258,9 +261,26 @@ static void mt6580_pcm_source_requests(struct mt6580_spm *spm)
 	writel(wake->src_expected, spm->base + PCM_SRC_REQ);
 }
 
+static int mt6580_pcm_idle_finish(unsigned long arg)
+{
+	struct mt6580_spm *spm = (void *)arg;
+	u32 con0 = readl(spm->base + PCM_CON0) & ~(PCM_KICK | PCM_IM_KICK);
+
+	writel(PCM_KEY | con0 | PCM_KICK, spm->base + PCM_CON0);
+	writel(PCM_KEY | con0, spm->base + PCM_CON0);
+	spm->runs++;
+	cpu_do_idle();
+	spm->wake.timer_con_wake = readl(spm->base + PCM_CON1);
+	spm->wake.timer_val_wake = readl(spm->base + PCM_TIMER_VAL);
+	spm->wake.timer_at_wake = readl(spm->base + PCM_TIMER_OUT);
+	spm->wake.sleep_sta = readl(spm->base + 0x720);
+	spm->wake.fsm_at_wake = readl(spm->base + PCM_FSM_STA);
+	return 0;
+}
+
 static int mt6580_pcm_run(struct mt6580_spm *spm)
 {
-	u32 val, con0, con1, ticks = READ_ONCE(spm->timer_ms) * 32768 / 1000;
+	u32 val, con1, ticks = READ_ONCE(spm->timer_ms) * 32768 / 1000;
 	int i, ret, capture;
 
 	memset(&spm->wake, 0, sizeof(spm->wake));
@@ -302,16 +322,13 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 	    readl(spm->base + PCM_SRC_REQ) != spm->wake.src_expected)
 		return -EIO;
 	writel(PCM_R7_OUTPUT, spm->base + PCM_PWR_IO_EN);
-	con0 = readl(spm->base + PCM_CON0) & ~(PCM_KICK | PCM_IM_KICK);
-	writel(PCM_KEY | con0 | PCM_KICK, spm->base + PCM_CON0);
-	writel(PCM_KEY | con0, spm->base + PCM_CON0);
-	spm->runs++;
-	cpu_do_idle();
-	spm->wake.timer_con_wake = readl(spm->base + PCM_CON1);
-	spm->wake.timer_val_wake = readl(spm->base + PCM_TIMER_VAL);
-	spm->wake.timer_at_wake = readl(spm->base + PCM_TIMER_OUT);
-	spm->wake.sleep_sta = readl(spm->base + 0x720);
-	spm->wake.fsm_at_wake = readl(spm->base + PCM_FSM_STA);
+	if (READ_ONCE(spm->cpu0_mode))
+		ret = mt6580_cpu0_resume_entry(&spm->cpu0, mt6580_pcm_idle_finish,
+					     (unsigned long)spm);
+	else
+		ret = mt6580_pcm_idle_finish((unsigned long)spm);
+	if (ret)
+		return ret;
 	/* An external IRQ can wake CPU0 before the PCM return sequence ends. */
 	if (!(readl(spm->base + SPM_ISR_STATUS) & PCM_RETURN)) {
 		spm->wake.forced_exit = true;
@@ -433,7 +450,9 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 "timer_cfg=%08x/%08x val=%u/%u at_wake=%u sleep=%08x wake_fsm=%08x\n"
 			 "wake_pwr_io=%08x flags=%08x src_req=%08x\n"
 			 "source before=%08x applied=%08x blockers=%08x r13_before=%08x\n"
-			 "source poweron=%08x/%08x clk_con=%08x standby=%08x mmddr=%08x\n",
+			 "source poweron=%08x/%08x clk_con=%08x standby=%08x mmddr=%08x\n"
+			 "cpu0 mode=%u resumes=%u result=%d vector=%08x/%08x/%08x\n"
+			 "cpu0 timer_ctrl=%08x/%08x counter=%llu/%llu\n",
 			 ARRAY_SIZE(mt6580_suspend_pcm), &spm->pcm_dma,
 			 spm->loads, spm->last_error, spm->loaded_fsm, spm->restored_fsm,
 			 readl(spm->base + PCM_FSM_STA), readl(spm->base + PCM_CON0),
@@ -451,7 +470,11 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 spm->wake.pwr_io, spm->wake.flags, spm->wake.src_req,
 			 spm->wake.src_before, spm->wake.src_expected, spm->wake.src_blockers,
 			 spm->wake.r13_before, spm->wake.poweron0, spm->wake.poweron1,
-			 spm->wake.clk_con, spm->wake.standby, spm->wake.mmddr);
+			 spm->wake.clk_con, spm->wake.standby, spm->wake.mmddr,
+			 READ_ONCE(spm->cpu0_mode), spm->cpu0.resumes, spm->cpu0.result,
+			 spm->cpu0.boot_before, spm->cpu0.boot_resume, spm->cpu0.boot_after,
+			 spm->cpu0.timer_ctrl, spm->cpu0.timer_ctrl_after,
+			 spm->cpu0.counter_before, spm->cpu0.counter_after);
 }
 static DEVICE_ATTR_RO(state);
 
@@ -478,9 +501,33 @@ static ssize_t pcm_timer_ms_store(struct device *dev, struct device_attribute *a
 }
 static DEVICE_ATTR_RW(pcm_timer_ms);
 
+static ssize_t cpu0_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct mt6580_spm *spm = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(spm->cpu0_mode));
+}
+
+static ssize_t cpu0_mode_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct mt6580_spm *spm = dev_get_drvdata(dev);
+	unsigned int mode;
+	int ret = kstrtouint(buf, 0, &mode);
+
+	if (ret)
+		return ret;
+	if (mode > 1)
+		return -ERANGE;
+	WRITE_ONCE(spm->cpu0_mode, mode);
+	return count;
+}
+static DEVICE_ATTR_RW(cpu0_mode);
+
 static struct attribute *mt6580_spm_attrs[] = {
 	&dev_attr_state.attr,
 	&dev_attr_pcm_timer_ms.attr,
+	&dev_attr_cpu0_mode.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(mt6580_spm);

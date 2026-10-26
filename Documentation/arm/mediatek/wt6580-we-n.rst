@@ -1854,3 +1854,27 @@ temporary files and wake references were cleared/restored; console_suspend
 is Y and plugged-in stay-on remains zero. CPU0 dormant context can next be
 qualified with these retained clock/memory constraints, before attempting
 physical clock stop or DDR/cluster transitions.
+
+CPU0 MMU-off resume-entry qualification
+-------------------------------------
+
+The optional cpu0_mode=1 standby path calls cpu_pm_enter and
+cpu_cluster_pm_enter for the generic VFP, GIC and timer notifier state.
+It saves the shared INFRACFG boot vector, physical timer control/compare
+and counter, programs cpu_resume_arm, then calls ARM cpu_suspend. The
+finisher starts PCM and waits for wakeup before soft_restart uses the
+programmed physical vector with the MMU off. A zero cpu_suspend result
+therefore exercises cpu_resume, rather than just returning from the WFI
+finisher. The original shared vector is restored before secondary CPUs
+may start; physical timer and PM notifier state and the original FIQ mask
+are restored too. Default mode 0 and Android s2idle are unchanged.
+
+Build #76 completed the initial two-second run with result=0/resumes=1,
+vector 0x80113000 -> 0x8011e1b8 -> 0x80113000, unchanged timer control and
+a monotonically advancing counter. Four CPUs resumed, the 16 MiB RAM hash
+matched and PCM/PWRAP state restored. Evidence is under
+``out/a1260-runtime-pm/cpu0-76-`` with ``initial.txt``, ``check.txt`` and
+``resume.txt``. This retains CPU0, L2, infra and memory power: it qualifies
+the MMU-off entry and restore path, not a hardware reset or Boot ROM path.
+The PCM CPU-power branch also powers L2 down, so cache/cluster restoration
+and the BSP's sibling-core erratum sequence must precede enabling it.
