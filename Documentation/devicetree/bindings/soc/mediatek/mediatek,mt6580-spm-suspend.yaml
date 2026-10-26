@@ -36,6 +36,13 @@ properties:
     maxItems: 1
     description: SPM IRQ0, used for PCM return and timer wakeup
 
+  mediatek,usbs:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    maxItems: 1
+    items:
+      maxItems: 1
+    description: All enabled MT6580 USB controllers requiring PHY/clock shutdown
+
   clocks:
     maxItems: 1
     description: SPM register clock
@@ -47,6 +54,7 @@ required:
   - compatible
   - mediatek,pwrap
   - mediatek,uarts
+  - mediatek,usbs
   - interrupts
   - clocks
   - clock-names
@@ -63,6 +71,7 @@ examples:
         compatible = "mediatek,mt6580-spm-suspend";
         mediatek,pwrap = <&pwrap>;
         mediatek,uarts = <&uart0>;
+        mediatek,usbs = <&usb>;
         interrupts = <GIC_SPI 88 IRQ_TYPE_LEVEL_LOW>;
         clocks = <&topckgen CLK_MT6580_TOP_SPM>;
         clock-names = "spm";
