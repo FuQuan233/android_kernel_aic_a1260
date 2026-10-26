@@ -19,6 +19,17 @@ description: |
   retention fallback when prerequisites are busy before hardware entry.
 
 properties:
+  mediatek,vproc-retention:
+    type: boolean
+    description: |
+      Opt into the board-qualified MT6350 VPROC hardware sleep policy for
+      automatic mem/deep. The provider borrows hardware voltage control,
+      the 0.85 V sleep selector and SRCLKEN/oscillator clock handoff only
+      across suspend, restoring software ownership before CPUFreq resumes.
+      Requires the qualified 1.15 V suspend OPP and matching software/on/
+      sleep baseline selectors; unsupported firmware-owned baselines keep
+      their existing policy. This is not an active CPU undervolt setting.
+
   compatible:
     const: mediatek,mt6580-spm-suspend
 
@@ -37,8 +48,8 @@ properties:
     items:
       maxItems: 1
     description:
-      TOPCKGEN followed by APMIXED providers for optional guarded AXI
-      source parking during explicit CPU0 standby qualification.
+      TOPCKGEN followed by APMIXED providers for guarded AXI source
+      parking and MAINPLL power control during deep and explicit standby.
 
   mediatek,uarts:
     $ref: /schemas/types.yaml#/definitions/phandle-array
