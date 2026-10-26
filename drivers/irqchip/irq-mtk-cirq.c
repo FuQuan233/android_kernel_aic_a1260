@@ -139,6 +139,8 @@ static struct irq_chip mtk_cirq_chip = {
 #ifdef CONFIG_SMP
 	.irq_set_affinity	= irq_chip_set_affinity_parent,
 #endif
+	/* Wake routing is configured by the SoC sleep controller. */
+	.flags			= IRQCHIP_SKIP_SET_WAKE,
 };
 
 static int mtk_cirq_domain_translate(struct irq_domain *d,
@@ -287,6 +289,7 @@ static inline void mtk_cirq_syscore_init(void) {}
 
 static const struct of_device_id mtk_cirq_of_match[] = {
 	{ .compatible = "mediatek,mt2701-cirq", .data = &mtk_cirq_regoffs_v1 },
+	{ .compatible = "mediatek,mt6580-cirq", .data = &mtk_cirq_regoffs_v1 },
 	{ .compatible = "mediatek,mt8135-cirq", .data = &mtk_cirq_regoffs_v1 },
 	{ .compatible = "mediatek,mt8173-cirq", .data = &mtk_cirq_regoffs_v1 },
 	{ .compatible = "mediatek,mt8192-cirq", .data = &mtk_cirq_regoffs_v2 },

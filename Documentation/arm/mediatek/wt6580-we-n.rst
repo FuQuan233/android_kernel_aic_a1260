@@ -1527,3 +1527,42 @@ capture before adding CPU dormant or DDR power transitions. SPM is already
 used by SMP and genpd, so no initialization may blindly reset their live
 state. The current kernel still uses s2idle/WFI, not PCM deep sleep, DDR
 self-refresh or cluster power-down.
+
+CIRQ and retained-state standby
+------------------------------
+
+Build #59 inserts the MT6580 CIRQ v1 hierarchy between peripheral IRQs and
+SYSIRQ/GIC. The BSP specifies 126 CIRQ lines at 0x10202000, covering SPI
+32 through 157 inclusive. Physical and virtual timer PPIs remain directly
+on GIC. The CIRQ driver uses the existing v1 register layout and wake-routing
+policy of the SoC sleep controller, without requiring a per-line wake
+operation. Peripheral polarity is configured before SYSIRQ inversion.
+
+An explicit retained-state ``standby`` entry now lets the suspend core take
+CPU1--3 offline and execute syscore PM, including CIRQ record/flush. CPU0
+uses WFI with its context, GIC, infra and DDR retained. PCM is not reset or
+started, and no new PLL, memory or supply power-down is performed. The
+entry is not advertised as PM_SUSPEND_MEM deep sleep: ``mem_sleep`` remains
+``[s2idle] shallow`` and Android's default suspend behavior stays s2idle.
+This gives a staged way to exercise the syscore path before a PCM port.
+
+Three RTC-woken standby rounds succeeded with zero failures, with measured
+sleep intervals of 8.067, 14.892 and 9.257 seconds. Each restored CPU0--3,
+kept the 16 MiB RAM SHA256 and returned with CIRQ control disabled. The final
+trace includes syscore_suspend, machine_suspend[2] and syscore_resume. PMIC
+IRQ 47 supplied the wake event and ADB automatically returned configured.
+DISP/MFG remained runtime off while the screen was off. A subsequent 4 MiB
+O_DIRECT write/fsync and two direct reads matched RAM; eMMC stayed at 52 MHz
+with every controller error counter zero. Mali GLES readback, automatic
+GPU governor, display output without RDMA errors, PMIC ADC and thermal
+sampling all recovered. Temporary files, wake references, RTC alarms and
+tracing were cleared. Standard product boot/kernel now use this #59 image.
+
+Captures under ``out/a1260-runtime-pm/`` are ``cirq-59-`` followed by
+``initial.txt``, ``standby.txt``, ``trace.txt`` and ``resume.txt``. This
+qualifies the retained-state standby path only. CIRQ edge replay across
+actual GIC/MCUSYS power loss, PCM sequencing, DDR self-refresh and CPU0
+dormant resume still require their own implementation and hardware checks.
+The BSP uses a software pending-bit replay during its deep-sleep flow;
+that path has not been substituted for the generic driver's hardware flush
+without testing the actual power-loss case.

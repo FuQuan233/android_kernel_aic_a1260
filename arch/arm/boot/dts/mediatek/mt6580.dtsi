@@ -12,7 +12,7 @@
 	compatible = "mediatek,mt6580";
 	#address-cells = <1>;
 	#size-cells = <1>;
-	interrupt-parent = <&sysirq>;
+	interrupt-parent = <&cirq>;
 
 	cpus {
 		#address-cells = <1>;
@@ -79,6 +79,16 @@
 		interrupts = <GIC_SPI 92 IRQ_TYPE_LEVEL_LOW>;
 		clocks = <&system_clk>, <&rtc_clk>;
 		clock-names = "system-clk", "rtc-clk";
+	};
+
+	cirq: interrupt-controller@10202000 {
+		compatible = "mediatek,mt6580-cirq", "mediatek,mtk-cirq";
+		reg = <0x10202000 0x1000>;
+		interrupt-controller;
+		#interrupt-cells = <3>;
+		interrupt-parent = <&sysirq>;
+		/* BSP: 126 external lines, starting at SPI 32. */
+		mediatek,ext-irq-range = <32 157>;
 	};
 
 	sysirq: interrupt-controller@10200100 {

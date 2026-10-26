@@ -936,6 +936,11 @@
 	reg = <0 0x10008000 0 0x80>;
 };
 
+&cirq {
+	reg = <0 0x10202000 0 0x1000>;
+	#address-cells = <0>;
+};
+
 &sysirq {
 	reg = <0 0x10200100 0 0x1c>;
 	#address-cells = <0>;
