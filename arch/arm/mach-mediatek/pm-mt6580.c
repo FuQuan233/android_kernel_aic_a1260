@@ -31,7 +31,9 @@ static const struct platform_suspend_ops mt6580_suspend_ops = {
 
 static int __init mt6580_pm_init(void)
 {
-	if (of_machine_is_compatible("mediatek,mt6580"))
+	/* The optional SPM child driver supplies the staged PCM path. */
+	if (of_machine_is_compatible("mediatek,mt6580") &&
+	    !IS_ENABLED(CONFIG_MTK_MT6580_SPM))
 		suspend_set_ops(&mt6580_suspend_ops);
 	return 0;
 }

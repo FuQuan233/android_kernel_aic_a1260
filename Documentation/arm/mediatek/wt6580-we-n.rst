@@ -1566,3 +1566,65 @@ dormant resume still require their own implementation and hardware checks.
 The BSP uses a software pending-bit replay during its deep-sleep flow;
 that path has not been substituted for the generic driver's hardware flush
 without testing the actual power-loss case.
+
+PCM instruction loading and PWRAP suspend slots
+---------------------------------------------
+
+Build #62 adds an optional suspend child of MT6580 SCPSYS. Its lifetime is
+managed with the suspend provider; failed binding clears the provider before
+releasing its mapped registers or coherent DMA buffer. SCPSYS continues to
+own MTCMOS domains. The fallback architecture standby remains available when
+the staged SPM driver is disabled, and Android still defaults to s2idle.
+
+The driver retains the BSP's unmodified GPL 725-word
+``pcm_suspend_v14.0_auxadc_workaround3_6`` program and four event vectors.
+Probe only allocates/copies a 32-bit coherent DMA buffer; it does not reset
+or start a firmware PCM. Explicit standby refuses to proceed if the PCM is
+not in its stopped/default state or power-output control is enabled.
+
+Sleepable late preparation reads the actual MT6350 STRUP_CON10 (0x004e),
+preserves all bits except AUXADC_START bit 4, and installs clear/set commands
+in PWRAP slots 4/5 (0x104..0x110). These are the indices used by this PCM,
+not normal VCORE slot 0. Only those two slots are saved/touched and the exact
+previous words are restored after standby, including aborted entry. Staging
+a command does not execute it or change a PMIC register. Normal WACS2
+regulator, RTC and power-off accesses retain their existing serialization.
+
+After device/genpd suspend and secondary CPU power-off, the atomic enter
+callback saves the PCM controls, instruction pointer/length and four vectors.
+It resets PCM and fetches the coherent buffer with bounded 10 ms polls,
+then enters the already-qualified retained WFI standby. PCM_KICK is never
+asserted, the PCM timer/watchdog and power outputs are never enabled, and
+no DDR, PLL or MTCMOS control is written. After wake, another bounded reset
+restores the saved controls and vectors, suppressing any sampled command
+bits. This qualifies instruction fetch and restoration, not PCM execution
+or deeper sleep. The phase ordering serializes these PCM-only accesses
+against the completed genpd and CPU hotplug operations; it does not yet
+provide arbitration for an autonomously running PCM.
+
+Two #61 standby rounds and the final #62 round completed with zero failures.
+The instruction-fetch FSM reached 0x02c48610 and restored to 0x02848490;
+CON0/CON1, IM pointer/length and power IO matched their original values.
+Each round saved/restored the slots successfully; the observed staged
+values were 0x004e/0x0000 and 0x004e/0x0010, with all four original slot
+words zero. The PMIC register itself remained zero. Four cores resumed,
+16 MiB RAM SHA256 remained identical, PMIC IRQ 47 woke the system and ADB
+returned automatically. Measured sleep intervals were 11.140, 11.345 and
+11.865 seconds. Runtime-off DISP/MFG, subsequent GLES pixel readback and
+zero-error RDMA output passed. On #62, a 4 MiB O_DIRECT write/fsync and two
+direct reads matched RAM at 52 MHz, with all MMC error counters zero;
+thermal and PMIC ADC sampling also resumed.
+
+Read-only ``state`` and ``spm_phase`` diagnostics are documented in
+``Documentation/ABI/testing/sysfs-platform-mt6580-spm``. Evidence under
+``out/a1260-runtime-pm/`` is ``pcm-59-baseline.txt``, ``pcm-61-`` followed by
+``initial.txt``, ``standby.txt`` and ``resume.txt``, and ``pcm-62-`` followed
+by the same suffixes plus ``final.txt``. Standard product boot/kernel now
+use the tested #62 image. Temporary files, RTC alarms and wake references
+were removed; plugged-in stay-on remains zero.
+
+Next work must add SPM IRQ ownership, actual PCM execution/wake-status
+handling and UART/clock request coordination while retaining power first.
+Only then should CPU0 dormant resume, GIC-loss edge replay and DDR/cluster
+power transitions be enabled. No PCM sleep-power claim follows from an IM
+fetch completing successfully.

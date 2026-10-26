@@ -1,0 +1,23 @@
+What:		/sys/devices/platform/10006000.power-controller/*suspend/state
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Read-only diagnostic snapshot of the MT6580 staged PCM loader.
+		mode=load-only means instructions are fetched but never executed.
+		pcm_words and dma identify the coherent instruction buffer. loads
+		counts completed instruction fetches, not PCM sleep executions.
+		last_error is the last loader/handoff errno; loaded_fsm and
+		restored_fsm record its hardware FSM values. fsm/con0/con1/pwr_io
+		are live always-on SPM registers. No write operation is provided.
+
+What:		/sys/devices/platform/1000f000.pmic-wrap/spm_phase
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Read-only snapshot of the MT6350 suspend command-slot handoff.
+		active indicates an installed suspend table. prepared counts
+		successful installations; restored counts successful restores,
+		including rollback. saved and staged retain the latest four
+		words in ADR4/WDATA4/ADR5/WDATA5 order. They are snapshots, not
+		live reads. Staging slots does not execute a PMIC command or
+		change voltage; no write operation is provided.

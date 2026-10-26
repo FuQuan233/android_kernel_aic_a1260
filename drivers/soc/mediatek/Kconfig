@@ -61,7 +61,17 @@ config MTK_MT6580_PMIC_WRAP
 	select REGMAP
 	help
 	  Share the firmware-initialized WACS2 channel between MT6350
-	  regulators and RTC reboot-mode control. Does not initialize PWRAP.
+	  regulators and RTC reboot-mode control. Provide the SPM suspend
+	  command-slot handoff without reinitializing PWRAP.
+
+config MTK_MT6580_SPM
+	bool "MT6580 staged SPM suspend support"
+	depends on ARM && MACH_MT6580 && SUSPEND
+	depends on MTK_SCPSYS && MTK_MT6580_PMIC_WRAP=y
+	help
+	  Prepare the MT6350 suspend command slots and load the BSP PCM program
+	  during explicit retained-state standby. The PCM is not executed yet;
+	  CPU0, GIC, infra and DDR remain powered. Android keeps using s2idle.
 
 config MTK_REGULATOR_COUPLER
 	bool "MediaTek SoC Regulator Coupler" if COMPILE_TEST

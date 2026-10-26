@@ -8,6 +8,7 @@
 #include <linux/iopoll.h>
 #include <linux/mfd/syscon.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/regulator/consumer.h>
@@ -1183,6 +1184,13 @@ static int scpsys_probe(struct platform_device *pdev)
 		if (ret && IS_ENABLED(CONFIG_PM))
 			dev_err(&pdev->dev, "Failed to add subdomain: %d\n",
 				ret);
+	}
+
+	/* The MT6580 suspend child shares PCM registers, not genpd controls. */
+	if (of_device_is_compatible(pdev->dev.of_node, "mediatek,mt6580-scpsys")) {
+		ret = devm_of_platform_populate(&pdev->dev);
+		if (ret)
+			dev_err(&pdev->dev, "Could not populate suspend child: %d\n", ret);
 	}
 
 	return 0;

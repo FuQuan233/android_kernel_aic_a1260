@@ -58,6 +58,11 @@
 			 <&topckgen CLK_MT6580_TOP_MFG>,
 			 <&topckgen CLK_MT6580_TOP_SMI>;
 		clock-names = "mm", "mfg", "smi";
+
+		suspend {
+			compatible = "mediatek,mt6580-spm-suspend";
+			mediatek,pwrap = <&pwrap>;
+		};
 	};
 
 	mfgcfg: clock-controller@13000000 {

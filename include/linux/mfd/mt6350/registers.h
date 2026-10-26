@@ -3,6 +3,7 @@
 #define __MFD_MT6350_REGISTERS_H__
 
 /* MT6580 BSP MT6350 register map; addresses are 16-bit byte offsets. */
+#define MT6350_STRUP_CON10	0x004e
 #define MT6350_CID		0x0100
 #define MT6350_TOP_CKPDN0		0x0102
 #define MT6350_TOP_CKPDN1		0x0108

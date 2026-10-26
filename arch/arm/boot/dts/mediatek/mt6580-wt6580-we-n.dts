@@ -525,7 +525,7 @@
 		timeout-sec = <30>;
 	};
 
-	pmic-wrap@1000f000 {
+	pwrap: pmic-wrap@1000f000 {
 		compatible = "mediatek,mt6580-firmware-pwrap";
 		reg = <0 0x1000f000 0 0x1000>;
 		clocks = <&topckgen CLK_MT6580_TOP_PMIC_SPI>,
