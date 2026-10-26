@@ -36,6 +36,7 @@ Description:
 		CLK_CON, AP_STANDBY and MMDDR_MASK. These show request ownership;
 		they do not establish that 26 MHz physically stopped. r0_control
 		and apsrc_control explicitly override their respective defaults.
+		f26m_control additionally releases the F26M override with all guards.
 		cpu0 mode/resumes/result record CPU0 resume-entry qualification.
 		vector contains the original/programmed/restored shared boot
 		address; timer_ctrl and counter contain before/after physical
@@ -87,8 +88,8 @@ Description:
 		during explicit CPU0-reset standby (cpu0_mode=2). Requires UART/USB
 		clock handoff, qualified firmware baseline, MD1/CONN/DISP/MFG/ISP
 		domains off and external/MD1/CONN clock requests clear. F26M is forced
-		throughout; APSRC is also forced unless apsrc_control is enabled;
-		it does not permit physical crystal stop or DDR power changes.
+		unless f26m_control is enabled; APSRC is forced unless apsrc_control
+		is enabled. R0 alone does not permit crystal stop or DDR power changes.
 		R0 must return to POWER_ON_VAL0 before disconnecting PCM output.
 		The BSP SYSCLK settle selector and 99-tick (about 3 ms) budget are
 		prepared only for this qualification. Readback includes the MD
@@ -111,11 +112,28 @@ Description:
 		DDRPHY SPM prerequisite fields to match before entry and on resume.
 		Offset 0x5cc bit 31 may be clear or set as in the BSP PCM APSRC
 		routines; all other bits must match. Snapshots retain the complete value.
-		F26M, DDRPHY/infra power, voltage and memory PLL policy are retained.
+		F26M is retained unless f26m_control is also enabled. DDRPHY/infra
+		power, voltage and memory PLL policy are retained.
 		This hands APSRC to hardware without proving DDR self-refresh duration.
 		State adds apsrc requested/ddr_check and DDRPHY before/after snapshots
 		for offsets 0x5c0, 0x5c4, 0x5c8 and 0x5cc. Failed prerequisites abort
 		before connecting outputs; all control registers are restored on exit.
+
+What:		/sys/devices/platform/10006000.power-controller/*suspend/f26m_control
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Boolean, default false. Hand F26M to hardware during explicit standby.
+		Requires cpu0_mode=2, r0_control=1, apsrc_control=1 and all their UART,
+		USB, power-domain, firmware and DDR prerequisite checks. CCIF masks
+		are preserved. Uses the MT6580 BSP CLK_CON SRCLKENA mask and MD1
+		CXO32K selection with MD1 off, plus the qualified SYSCLK settle budget.
+		CLK_CON expected/wake/restored snapshots verify setup and rollback.
+		CPU/L2 may reset; infra and DDRPHY power and voltage policy stay retained.
+		Physical counter/RTC snapshots are needed to qualify actual clock stop;
+		successful register handoff alone does not prove crystal shutdown.
+		The existing 30-second CPU0 qualification watchdog applies. This is
+		not enabled for Android's default s2idle or unbounded production sleep.
 
 What:		/sys/devices/platform/1000f000.pmic-wrap/spm_phase
 Date:		October 2026

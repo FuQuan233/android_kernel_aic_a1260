@@ -81,7 +81,8 @@ config MTK_MT6580_SPM
 	  banked-register and L2 recovery. Infra and DDR stay retained, and
 	  Android keeps using s2idle. UART handshake and USB clock/PHY
 	  shutdown gate the software 26 MHz override. Optional R0 and APSRC
-	  handoff qualification retains the crystal and DDRPHY/infra power;
+	  handoff qualification retains DDRPHY/infra power. A further guarded
+	  F26M handoff can exercise system-clock stop with RTC compensation;
 	  the DDR supplier audits BSP prerequisites without changing timings.
 	  Firmware-initialized MT6350 PWRAP and CIRQ are required.
 

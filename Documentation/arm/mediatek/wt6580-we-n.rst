@@ -2186,3 +2186,37 @@ kernel-apsrc-handoff-fixed (#95). Evidence under out/a1260-runtime-pm is
 apsrc-95- plus check.txt, trace.txt, dmesg.txt, analysis.json, resume.txt and
 final.txt; apsrc-94-* records the initial overstrict check. Actual 26 MHz
 stop and infra power loss remain unqualified.
+
+F26M handoff and stopped system counter
+--------------------------------------
+
+The default-off f26m_control option additionally requires APSRC/R0 cold
+qualification and all its prerequisites. It preserves CCIF masks, removes
+both software source requests and applies the MT6580 BSP SRCLKENA mask /
+MD1 CXO32K selection. CLK_CON is verified at wake and after restoration.
+Infra and DDRPHY power and existing voltage/PLL policy remain retained.
+
+Kernel #96 completed two 2-second PCM-timer cold entries and an external
+wake cold entry, then default s2idle and bound-gadget standby. Success/fail
+was 5/1: one Android alarm cancelled before external entry and retry passed.
+For cold entries SRC_REQ stayed 0x0c, CLK_CON changed
+0x082f0000 -> 0x082f0270 -> 0x082f0000, debug flags were 0x1f and SYSCLK
+settle returned to zero. Cold/erratum counts were 3/3, with no WFI abort.
+The physical 13 MHz counter advanced only 0.882000/0.882385/0.883308 ms,
+versus 2.000447/2.000464 seconds for timed retained-clock #95 entries.
+The 32 kHz PCM timers and RTC still woke the system. This qualifies actual
+system-counter clock stop; no external measurement of crystal current or
+full infra/DDRPHY power loss has been made.
+
+RTC compensation added 1.491984/1.813942/9.245813 seconds for the cold
+entries. REALTIME/MONOTONIC/RAW/BOOTTIME were monotonic and the two
+sleep additions agreed within 2 microseconds. The analyzer's
+rtc_minus_counter field is no longer RTC error when the counter stops.
+The 16 MiB RAM hash matched, memory source remained 266499673 Hz, and
+52 MHz eMMC I/O, Mali pixel readback, zero-underflow display and four CPUs
+recovered without a kernel WARNING/Oops. Temporary controls, timers,
+tracing and wake references were cleared. Standard images use
+boot-f26m-handoff.img / kernel-f26m-handoff (#96); Android default is still
+s2idle. Evidence is out/a1260-runtime-pm/f26m-96- plus check.txt, trace.txt,
+dmesg.txt, analysis.json, resume.txt and final.txt. Qualification's 30-second
+watchdog must be removed/replaced before unbounded production sleep.

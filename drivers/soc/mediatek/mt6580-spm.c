@@ -42,6 +42,8 @@
 #define SPM_CLK_SETTLE		0x100
 #define SPM_SYSCLK_SETTLE	99 /* BSP 32 kHz ticks, approximately 3 ms. */
 #define SPM_SYSSETTLE_SEL	BIT(4)
+#define SPM_SRCLKENA_MASK	BIT(6)
+#define SPM_CXO32K_MD1		BIT(9)
 #define SPM_POWER_ON_VAL0	0x010
 #define SPM_POWER_ON_VAL1	0x014
 #define SPM_AP_STANDBY		0x608
@@ -106,10 +108,12 @@ struct mt6580_pcm_wake {
 	u32 settle_before, settle_md, settle_programmed, settle_applied;
 	u32 settle_wake, settle_restored;
 	u32 ddr_before[4], ddr_after[4];
+	u32 clk_expected, clk_wake, clk_restored;
 	int ddr_check_before, ddr_check_after;
 	bool irq_pending, forced_exit;
 	bool r0_requested, settle_changed;
 	bool apsrc_requested;
+	bool f26m_requested;
 };
 
 struct mt6580_spm {
@@ -130,6 +134,7 @@ struct mt6580_spm {
 	unsigned int cpu0_mode;
 	bool r0_control;
 	bool apsrc_control;
+	bool f26m_control;
 	struct mt6580_cpu0_context cpu0;
 	u32 irq_status;
 	int irq;
@@ -225,6 +230,7 @@ static int mt6580_pcm_restore(struct mt6580_spm *spm)
 	value = spm->saved[0] & 0xffff & ~(BIT(0) | PCM_IM_KICK | PCM_SW_RESET);
 	writel(PCM_KEY | value, spm->base + PCM_CON0);
 	spm->restored_fsm = readl(spm->base + PCM_FSM_STA);
+	spm->wake.clk_restored = readl(spm->base + SPM_CLK_CON);
 	if (spm->wake.settle_changed) {
 		/* Readback includes the MD contribution, not just the SW field.
 		 * Use the BSP's unsigned difference for both setup and rollback.
@@ -237,6 +243,8 @@ static int mt6580_pcm_restore(struct mt6580_spm *spm)
 			1, 1000);
 		if (ret)
 			return ret;
+		if (spm->wake.clk_restored != spm->wake.clk_con)
+			return -EIO;
 	} else {
 		spm->wake.settle_restored = readl(spm->base + SPM_CLK_SETTLE);
 	}
@@ -250,6 +258,7 @@ static int mt6580_pcm_capture(struct mt6580_spm *spm)
 
 	wake->r0 = readl(spm->base + PCM_REG0);
 	wake->settle_wake = readl(spm->base + SPM_CLK_SETTLE);
+	wake->clk_wake = readl(spm->base + SPM_CLK_CON);
 	wake->r11 = readl(spm->base + PCM_REG11);
 	wake->r12 = readl(spm->base + PCM_REG12);
 	wake->r13 = readl(spm->base + PCM_REG13);
@@ -353,7 +362,7 @@ static int mt6580_pcm_sysclk_settle(struct mt6580_spm *spm)
 	/* BSP MD-off sequence: readback adds the MD contribution to the SW
 	 * field. Unsigned subtraction intentionally compensates that addition;
 	 * writing the observed total directly would add the MD delay twice.
-	 * This qualification still holds F26M; it does not stop the oscillator.
+	 * Complete this setup before any optional F26M request handoff.
 	 */
 	writel(readl(spm->base + SPM_CLK_CON) | SPM_SYSSETTLE_SEL,
 	       spm->base + SPM_CLK_CON);
@@ -376,8 +385,11 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 
 	spm->wake.r0_requested = READ_ONCE(spm->r0_control);
 	spm->wake.apsrc_requested = READ_ONCE(spm->apsrc_control);
+	spm->wake.f26m_requested = READ_ONCE(spm->f26m_control);
 	spm->wake.pwr_io_expected = PCM_R7_OUTPUT;
 	if (spm->wake.apsrc_requested && !spm->wake.r0_requested)
+		return -EINVAL;
+	if (spm->wake.f26m_requested && !spm->wake.apsrc_requested)
 		return -EINVAL;
 	if (mode && ticks > 20 * 32768)
 		return -ERANGE;
@@ -412,11 +424,16 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 			spm->wake.r0_blockers |= BIT(3);
 		if (spm->wake.r0_blockers)
 			return -EBUSY;
-		/* Qualify R0 with F26M forced. APSRC is also forced unless its
-		 * separate DDR-prerequisite-checked qualification is requested.
+		/* Prepare R0 with F26M forced before the separate, guarded
+		 * APSRC/F26M request handoffs below.
 		 */
 		spm->wake.src_expected |= PCM_F26M_REQ;
 		writel(spm->wake.src_expected, spm->base + PCM_SRC_REQ);
+		if (spm->wake.f26m_requested)
+			/* MT6580 BSP spm_register_init(), with MD1 already off. */
+			writel(readl(spm->base + SPM_CLK_CON) |
+			       SPM_SRCLKENA_MASK | SPM_CXO32K_MD1,
+			       spm->base + SPM_CLK_CON);
 		ret = mt6580_pcm_sysclk_settle(spm);
 		if (ret)
 			return ret;
@@ -426,9 +443,11 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 			if (spm->wake.ddr_check_before)
 				return spm->wake.ddr_check_before;
 			/* Hand APSRC to hardware with DDRPHY/infra power retained.
-			 * F26M remains forced throughout this separate qualification.
+			 * F26M stays forced unless its additional handoff is requested.
 			 */
 			spm->wake.src_expected &= ~PCM_APSRC_REQ;
+			if (spm->wake.f26m_requested)
+				spm->wake.src_expected &= ~PCM_F26M_REQ;
 			writel(spm->wake.src_expected, spm->base + PCM_SRC_REQ);
 		}
 		spm->wake.pwr_io_expected |= PCM_R0_OUTPUT;
@@ -436,6 +455,11 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 	if (mode == 2 && spm->wake.src_blockers)
 		return -EBUSY;
 	writel(readl(spm->base + SPM_CLK_CON) | BIT(5), spm->base + SPM_CLK_CON);
+	spm->wake.clk_expected = spm->wake.clk_con | BIT(5);
+	if (spm->wake.r0_requested)
+		spm->wake.clk_expected |= SPM_SYSSETTLE_SEL;
+	if (spm->wake.f26m_requested)
+		spm->wake.clk_expected |= SPM_SRCLKENA_MASK | SPM_CXO32K_MD1;
 	writel((readl(spm->base + SPM_AP_STANDBY) & ~GENMASK(7, 4)) | BIT(4) | BIT(6),
 	       spm->base + SPM_AP_STANDBY);
 	/* Only CPU0 participates: CPU1--3 are already physically offline. */
@@ -482,6 +506,7 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 		     spm->wake.pwr_io != spm->wake.pwr_io_expected ||
 		     spm->wake.flags != spm->wake.flags_expected ||
 		     spm->wake.src_req != spm->wake.src_expected ||
+		     spm->wake.clk_wake != spm->wake.clk_expected ||
 		     (spm->wake.r0_requested &&
 		      (spm->wake.r0 != spm->wake.poweron0 ||
 		       spm->wake.settle_wake != spm->wake.settle_applied))))
@@ -549,8 +574,8 @@ static int mt6580_spm_enter(suspend_state_t state)
 	memset(&spm->wake, 0, sizeof(spm->wake));
 	spm->wake.settle_before = readl(spm->base + SPM_CLK_SETTLE);
 	/* Genpd/device suspend and secondary CPU power-off have completed.
-	 * Retained flags/requests keep system power on; R0 qualification also
-	 * holds F26M while connecting the crystal control output.
+	 * Retained flags keep infra/DDRPHY power on. Optional request/output
+	 * handoffs are validated before allowing PCM to control those signals.
 	 */
 	for (i = 0; i < ARRAY_SIZE(pcm_saved_regs); i++)
 		spm->saved[i] = readl(spm->base + pcm_saved_regs[i]);
@@ -595,6 +620,7 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 "r0 requested=%u value=%08x baseline=%08x blockers=%08x\n"
 			 "sysclk_settle before=%u md=%u programmed=%08x applied=%u wake=%u restored=%u\n"
 			 "apsrc requested=%u ddr_check=%d/%d\n"
+			 "f26m requested=%u clk_con expected=%08x wake=%08x restored=%08x\n"
 			 "ddr before=%08x/%08x/%08x/%08x after=%08x/%08x/%08x/%08x\n"
 			 "cpu0 mode=%u resumes=%u result=%d vector=%08x/%08x/%08x\n"
 			 "cpu0 timer_ctrl=%08x/%08x counter=%llu/%llu\n"
@@ -626,6 +652,8 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 spm->wake.settle_restored,
 			 spm->wake.apsrc_requested, spm->wake.ddr_check_before,
 			 spm->wake.ddr_check_after,
+			 spm->wake.f26m_requested, spm->wake.clk_expected,
+			 spm->wake.clk_wake, spm->wake.clk_restored,
 			 spm->wake.ddr_before[0], spm->wake.ddr_before[1],
 			 spm->wake.ddr_before[2], spm->wake.ddr_before[3],
 			 spm->wake.ddr_after[0], spm->wake.ddr_after[1],
@@ -729,12 +757,34 @@ static ssize_t apsrc_control_store(struct device *dev, struct device_attribute *
 }
 static DEVICE_ATTR_RW(apsrc_control);
 
+static ssize_t f26m_control_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct mt6580_spm *spm = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(spm->f26m_control));
+}
+
+static ssize_t f26m_control_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct mt6580_spm *spm = dev_get_drvdata(dev);
+	bool enable;
+	int ret = kstrtobool(buf, &enable);
+
+	if (ret)
+		return ret;
+	WRITE_ONCE(spm->f26m_control, enable);
+	return count;
+}
+static DEVICE_ATTR_RW(f26m_control);
+
 static struct attribute *mt6580_spm_attrs[] = {
 	&dev_attr_state.attr,
 	&dev_attr_pcm_timer_ms.attr,
 	&dev_attr_cpu0_mode.attr,
 	&dev_attr_r0_control.attr,
 	&dev_attr_apsrc_control.attr,
+	&dev_attr_f26m_control.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(mt6580_spm);
