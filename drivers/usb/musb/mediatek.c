@@ -14,6 +14,7 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_wakeup.h>
+#include <linux/soc/mediatek/mt6580-usb.h>
 #include <linux/usb/role.h>
 #include <linux/usb/usb_phy_generic.h>
 #include "musb_core.h"
@@ -773,6 +774,19 @@ static struct platform_driver mtk_musb_driver = {
 		   .dev_groups = mtk_musb_groups,
 	},
 };
+
+bool mt6580_usb_sleep_ready(struct device *dev)
+{
+	struct mtk_glue *glue;
+
+	if (dev->driver != &mtk_musb_driver.driver)
+		return false;
+	glue = dev_get_drvdata(dev);
+	return glue->mt6580 && READ_ONCE(glue->clocks_gated) &&
+		READ_ONCE(glue->phy_suspended) && READ_ONCE(glue->pm_masked) &&
+		!READ_ONCE(glue->pm_error);
+}
+EXPORT_SYMBOL_GPL(mt6580_usb_sleep_ready);
 
 module_platform_driver(mtk_musb_driver);
 

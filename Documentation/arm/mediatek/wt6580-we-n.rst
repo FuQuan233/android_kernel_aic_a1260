@@ -2027,3 +2027,42 @@ are deferred. The current change does not qualify bound-gadget gating,
 host remote wake, PLL-core power-off, physical 26 MHz stop or minimum
 standby current. Before physical clock stop, SPM must account for USB
 readiness and the system timer's SUSPEND_NONSTOP assumption must be audited.
+
+SPM USB clock ownership
+-----------------------
+
+DT now lists every enabled MT6580 USB controller in mediatek,usbs. SPM
+holds its supplier reference/device link and rejects missing enabled
+controllers; the built-in MUSB driver exports a cached, non-sleeping
+late-suspend readiness query. Readiness requires clocks_gated,
+phy_suspended and wrapper IRQ masking, with no PM error. SPM records a
+usb_ready bit per controller and retains its software F26M request with
+blocker bit 4 if any controller is not ready. The existing source/event
+masks, APSRC hold and disconnected R0 crystal output remain unchanged.
+
+Build #90 verified both policies. Three unbound-gadget CPU-reset entries
+slept 2.001075/2.001074/8.789211 seconds with usb_ready=1, blockers=0 and
+SRC_REQ 0x0c -> 0x0d -> 0x0c. Default s2idle slept 8.226165 seconds. After
+rebinding the gadget, a retained-CPU standby slept 2.000741 seconds with
+usb_ready=0, blockers=0x10 and SRC_REQ 0x0c -> 0x0f -> 0x0c. USB clocks
+remained on for that last entry: sleeps/resumes stayed 4/4 and skips became
+1, with bound=1. Total suspend success/fail was 5/0. The enabled-controller
+omission and wrong-driver rejection paths were reviewed, not injected.
+
+Three cold/erratum recoveries completed without a WFI abort. MD1 remained
+off, the 16 MiB RAM hash matched and 52 MHz eMMC direct I/O, Mali pixel
+readback and zero-underflow RDMA recovered. No new kernel WARNING/Oops was
+captured. Standard product boot/kernel use #90. Temporary modes, timers,
+tracing and reconnect wake references were cleared/restored. Evidence is
+``out/a1260-runtime-pm/usb-source-90-`` plus ``initial.txt``, ``check.txt``,
+``trace.txt``, ``dmesg.txt``, ``resume.txt`` and ``final.txt``.
+
+The #90 bring-up ramdisk also sets service.adb.root=1 through Android 17's
+system/etc/ramdisk/build.prop first-stage handover, avoiding a second USB
+reset just to obtain root. Initial ADB had uid 0 without adb root and
+ro.secure stayed 1. Only service.adb.root was added; authorization-related
+properties were not changed by this packaging tool. The device repository
+has the reproducible tools/make_root_adb_ramdisk.py and a debug-variant-only
+system property for future full builds. This is a temporary bring-up
+setting to remove before production, independently of physical USB wake
+work. The original ramdisk and pack-base-before-root-adb.json are retained.

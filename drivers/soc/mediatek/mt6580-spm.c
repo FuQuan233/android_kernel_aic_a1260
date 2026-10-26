@@ -12,6 +12,7 @@
 #include <linux/smp.h>
 #include <linux/soc/mediatek/mt6580-pwrap.h>
 #include <linux/soc/mediatek/mt6580-uart.h>
+#include <linux/soc/mediatek/mt6580-usb.h>
 #include <linux/soc/mediatek/mt6580-cpu-pm.h>
 #include <linux/suspend.h>
 
@@ -71,6 +72,7 @@
 #define F26M_KEEP_DOMAIN	BIT(1)
 #define F26M_KEEP_XTAL		BIT(2)
 #define F26M_KEEP_FIRMWARE	BIT(3)
+#define F26M_KEEP_USB		BIT(4)
 /* BSP CPU/infra/DDRPHY/VCORE/PASR/DPD/SODI-EMI/MAINPLL/CPU-DVS disable. */
 #define PCM_RETAIN_FLAGS	(GENMASK(5, 0) | GENMASK(9, 7))
 #define PCM_WAKE_SOURCES	(BIT(0) | BIT(2) | BIT(3) | BIT(5) | BIT(14) | \
@@ -92,7 +94,7 @@ struct mt6580_pcm_wake {
 	u32 timer_con_start, timer_val_start, timer_con_wake, timer_val_wake;
 	u32 timer_at_wake, sleep_sta, fsm_at_wake;
 	u32 pwr_io, flags, src_req, flags_expected;
-	u32 src_before, src_expected, src_blockers, r13_before;
+	u32 src_before, src_expected, src_blockers, r13_before, usb_ready;
 	u32 poweron0, poweron1, clk_con, standby, mmddr;
 	bool irq_pending, forced_exit;
 };
@@ -102,6 +104,8 @@ struct mt6580_spm {
 	struct device *pwrap;
 	struct device *uarts[2];
 	unsigned int num_uarts;
+	struct device *usbs[1];
+	unsigned int num_usbs;
 	void __iomem *base;
 	void *pcm;
 	dma_addr_t pcm_dma;
@@ -245,6 +249,12 @@ static void mt6580_pcm_source_requests(struct mt6580_spm *spm)
 	for (i = 0; i < spm->num_uarts; i++)
 		if (!mt6580_uart_sleep_ready(spm->uarts[i]))
 			wake->src_blockers |= F26M_KEEP_UART;
+	for (i = 0; i < spm->num_usbs; i++) {
+		if (mt6580_usb_sleep_ready(spm->usbs[i]))
+			wake->usb_ready |= BIT(i);
+		else
+			wake->src_blockers |= F26M_KEEP_USB;
+	}
 	if ((wake->power_before | wake->power2_before) & (BIT(3) | BIT(4)))
 		wake->src_blockers |= F26M_KEEP_DOMAIN;
 	/* Only remove our software override while crystal control and the
@@ -473,7 +483,7 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 "power=%08x/%08x power2=%08x/%08x\n"
 			 "timer_cfg=%08x/%08x val=%u/%u at_wake=%u sleep=%08x wake_fsm=%08x\n"
 			 "wake_pwr_io=%08x flags=%08x src_req=%08x\n"
-			 "source before=%08x applied=%08x blockers=%08x r13_before=%08x\n"
+			 "source before=%08x applied=%08x blockers=%08x r13_before=%08x usb_ready=%08x\n"
 			 "source poweron=%08x/%08x clk_con=%08x standby=%08x mmddr=%08x\n"
 			 "cpu0 mode=%u resumes=%u result=%d vector=%08x/%08x/%08x\n"
 			 "cpu0 timer_ctrl=%08x/%08x counter=%llu/%llu\n"
@@ -495,7 +505,8 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 spm->wake.timer_at_wake, spm->wake.sleep_sta, spm->wake.fsm_at_wake,
 			 spm->wake.pwr_io, spm->wake.flags, spm->wake.src_req,
 			 spm->wake.src_before, spm->wake.src_expected, spm->wake.src_blockers,
-			 spm->wake.r13_before, spm->wake.poweron0, spm->wake.poweron1,
+			 spm->wake.r13_before, spm->wake.usb_ready,
+			 spm->wake.poweron0, spm->wake.poweron1,
 			 spm->wake.clk_con, spm->wake.standby, spm->wake.mmddr,
 			 READ_ONCE(spm->cpu0_mode), spm->cpu0.resumes, spm->cpu0.result,
 			 spm->cpu0.boot_before, spm->cpu0.boot_resume, spm->cpu0.boot_after,
@@ -583,6 +594,7 @@ static int mt6580_spm_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct platform_device *pwrap;
 	struct platform_device *uart;
+	struct platform_device *usb;
 	struct device_node *node;
 	struct mt6580_spm *spm;
 	struct clk_bulk_data *clks;
@@ -651,6 +663,44 @@ static int mt6580_spm_probe(struct platform_device *pdev)
 			if (spm->uarts[i]->of_node == node)
 				break;
 		if (i == spm->num_uarts) {
+			of_node_put(node);
+			return -EINVAL;
+		}
+	}
+	ret = of_count_phandle_with_args(dev->of_node, "mediatek,usbs", NULL);
+	if (ret < 1 || ret > ARRAY_SIZE(spm->usbs))
+		return -EINVAL;
+	spm->num_usbs = ret;
+	for (i = 0; i < spm->num_usbs; i++) {
+		node = of_parse_phandle(dev->of_node, "mediatek,usbs", i);
+		if (!of_device_is_compatible(node, "mediatek,mt6580-musb") ||
+		    !of_device_is_available(node)) {
+			of_node_put(node);
+			return -EINVAL;
+		}
+		usb = of_find_device_by_node(node);
+		of_node_put(node);
+		if (!usb)
+			return -EPROBE_DEFER;
+		if (!device_is_bound(&usb->dev)) {
+			put_device(&usb->dev);
+			return -EPROBE_DEFER;
+		}
+		ret = devm_add_action_or_reset(dev, mt6580_spm_put_device, &usb->dev);
+		if (ret)
+			return ret;
+		if (!device_link_add(dev, &usb->dev, DL_FLAG_AUTOREMOVE_CONSUMER))
+			return -EINVAL;
+		spm->usbs[i] = &usb->dev;
+	}
+	/* An enabled USB controller cannot be omitted from the clock audit. */
+	for_each_compatible_node(node, NULL, "mediatek,mt6580-musb") {
+		if (!of_device_is_available(node))
+			continue;
+		for (i = 0; i < spm->num_usbs; i++)
+			if (spm->usbs[i]->of_node == node)
+				break;
+		if (i == spm->num_usbs) {
 			of_node_put(node);
 			return -EINVAL;
 		}

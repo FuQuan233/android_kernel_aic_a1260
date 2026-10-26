@@ -63,6 +63,7 @@
 			compatible = "mediatek,mt6580-spm-suspend";
 			mediatek,pwrap = <&pwrap>;
 			mediatek,uarts = <&uart0>;
+			mediatek,usbs = <&usb>;
 			interrupts = <GIC_SPI 88 IRQ_TYPE_LEVEL_LOW>;
 			clocks = <&topckgen CLK_MT6580_TOP_SPM>;
 			clock-names = "spm";
