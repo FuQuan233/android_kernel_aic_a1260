@@ -473,6 +473,105 @@ static int mt6580_hold_firmware_parent(struct device *dev, void __iomem *reg,
 	return mt6580_register_parent_alias(dev, name, parent, CLK_IS_CRITICAL);
 }
 
+/* The non-glitch-free input may only change while the GF mux bypasses it.
+ * CCF enables the new source before reparenting and releases the old one
+ * afterwards, matching the BSP's glitch_free_clkmux_sel_op ordering.
+ */
+struct mt6580_mfg_mux {
+	struct clk_hw hw;
+	void __iomem *base;
+	bool nongf;
+};
+
+static const char * const mt6580_mfg_ng_parents[] = {
+	"dummy26m", "mt6580_upll_d3",
+};
+
+static const char * const mt6580_mfg_gf_parents[] = {
+	"mt6580_mfg_ng_src", "mt6580_mpll_d3", "mt6580_mpll_d5",
+	"mt6580_mpll_d7", "mt6580_mpll_d14",
+};
+
+static const u8 mt6580_mfg_gf_values[] = { 0x08, 0x10, 0x21, 0x22, 0x24 };
+
+static u8 mt6580_mfg_get_parent(struct clk_hw *hw)
+{
+	struct mt6580_mfg_mux *mux = container_of(hw, struct mt6580_mfg_mux, hw);
+	u32 val = readl(mux->base + (mux->nongf ? 0 : 4)) >> 8;
+	unsigned int i;
+
+	if (mux->nongf)
+		return (val & 5) == 4 ? 0 : 1;
+	if ((val & 0x38) == 0x08)
+		return 0;
+	if ((val & 0x38) == 0x10)
+		return 1;
+	for (i = 2; i < ARRAY_SIZE(mt6580_mfg_gf_values); i++)
+		if ((val & 0x3f) == mt6580_mfg_gf_values[i])
+			return i;
+	return 0xff;
+}
+
+static int mt6580_mfg_set_parent(struct clk_hw *hw, u8 index)
+{
+	struct mt6580_mfg_mux *mux = container_of(hw, struct mt6580_mfg_mux, hw);
+	unsigned long flags;
+	void __iomem *reg = mux->base + (mux->nongf ? 0 : 4);
+	u32 val, mask = mux->nongf ? 7 : 0x3f;
+
+	if (index >= (mux->nongf ? ARRAY_SIZE(mt6580_mfg_ng_parents) :
+					 ARRAY_SIZE(mt6580_mfg_gf_parents)))
+		return -EINVAL;
+	spin_lock_irqsave(&mt6580_usb_clk_lock, flags);
+	if (mux->nongf && ((readl(mux->base + 4) >> 8) & 0x38) == 0x08) {
+		spin_unlock_irqrestore(&mt6580_usb_clk_lock, flags);
+		return -EBUSY;
+	}
+	val = readl(reg) & ~(mask << 8);
+	val |= (mux->nongf ? (index ? 2 : 4) : mt6580_mfg_gf_values[index]) << 8;
+	writel(val, reg);
+	readl(reg);
+	spin_unlock_irqrestore(&mt6580_usb_clk_lock, flags);
+	return 0;
+}
+
+static const struct clk_ops mt6580_mfg_mux_ops = {
+	.get_parent = mt6580_mfg_get_parent,
+	.set_parent = mt6580_mfg_set_parent,
+	.determine_rate = __clk_mux_determine_rate,
+};
+
+static int mt6580_register_mfg_muxes(struct device *dev, void __iomem *base)
+{
+	struct mt6580_mfg_mux *mux;
+	struct clk_init_data init = {
+		.ops = &mt6580_mfg_mux_ops,
+		.flags = CLK_SET_RATE_PARENT,
+	};
+	u32 ng = (readl(base) >> 8) & 7;
+	int i, ret;
+
+	if ((ng & 5) != 4 && ng != 2)
+		return dev_err_probe(dev, -EINVAL, "Unknown firmware MFG non-GF mux\n");
+	for (i = 0; i < 2; i++) {
+		mux = devm_kzalloc(dev, sizeof(*mux), GFP_KERNEL);
+		if (!mux)
+			return -ENOMEM;
+		mux->base = base;
+		mux->nongf = !i;
+		init.name = i ? "mt6580_mfg_src" : "mt6580_mfg_ng_src";
+		init.parent_names = i ? mt6580_mfg_gf_parents : mt6580_mfg_ng_parents;
+		init.num_parents = i ? ARRAY_SIZE(mt6580_mfg_gf_parents) :
+				      ARRAY_SIZE(mt6580_mfg_ng_parents);
+		init.flags = CLK_SET_RATE_PARENT | (i ? 0 : CLK_SET_PARENT_GATE);
+		mux->hw.init = &init;
+		ret = devm_clk_hw_register(dev, &mux->hw);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 static int mt6580_register_top_sources(struct device *dev, void __iomem *base,
 				      struct clk_hw_onecell_data *data)
 {
@@ -513,7 +612,9 @@ static int mt6580_register_top_sources(struct device *dev, void __iomem *base,
 	ret = mt6580_register_parent_alias(dev, "mt6580_usb_bus_src", usb, 0);
 	if (ret)
 		return ret;
-	ret = mt6580_register_parent_alias(dev, "mt6580_mfg_src", mfg, 0);
+	if (!mfg)
+		return dev_err_probe(dev, -EINVAL, "Unknown firmware MFG mux\n");
+	ret = mt6580_register_mfg_muxes(dev, base);
 	if (ret)
 		return ret;
 	ret = mt6580_register_parent_alias(dev, "mt6580_msdc0_src",
@@ -697,7 +798,7 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 
 		data->hws[CLK_MT6580_TOP_MFG] = devm_clk_hw_register_gate(dev,
-			"mt6580_mfg_bus", "mt6580_mfg_src", 0, base + 0x20, 2,
+			"mt6580_mfg_bus", "mt6580_mfg_src", CLK_SET_RATE_PARENT, base + 0x20, 2,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 		data->hws[CLK_MT6580_TOP_PMIC_SPI] = devm_clk_hw_register_gate(dev,
 			"mt6580_pmic_spi", "mt6580_pmic_spi_src", 0, base + 0x24, 20,

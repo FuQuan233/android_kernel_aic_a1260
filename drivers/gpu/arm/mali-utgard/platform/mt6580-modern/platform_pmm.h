@@ -19,6 +19,7 @@ int mali_platform_device_init(struct platform_device *pdev);
 int mali_platform_device_deinit(struct platform_device *pdev);
 
 struct mali_gpu_utilization_data;
+extern void (*mali_utilization_callback)(struct mali_gpu_utilization_data *data);
 
 typedef enum mali_power_mode
 {
@@ -68,6 +69,26 @@ void mali_pmm_utilization_handler(struct mali_gpu_utilization_data *data);
 unsigned int gpu_get_current_utilization(void);
 
 int mali_platform_runtime_resume(void);
-void mali_platform_runtime_suspend(void);
+int mali_platform_runtime_suspend(void);
+
+#ifdef CONFIG_MALI400_DEVFREQ
+void mali_platform_devfreq_prepare(void);
+void mali_platform_devfreq_unprepare(void);
+int mali_platform_devfreq_init(struct platform_device *pdev);
+void mali_platform_devfreq_term(struct platform_device *pdev);
+int mali_platform_devfreq_suspend(void);
+int mali_platform_devfreq_resume(void);
+void mali_platform_gpu_active(void);
+void mali_platform_gpu_idle(void);
+#else
+static inline void mali_platform_devfreq_prepare(void) {}
+static inline void mali_platform_devfreq_unprepare(void) {}
+static inline int mali_platform_devfreq_init(struct platform_device *pdev) { return 0; }
+static inline void mali_platform_devfreq_term(struct platform_device *pdev) {}
+static inline int mali_platform_devfreq_suspend(void) { return 0; }
+static inline int mali_platform_devfreq_resume(void) { return 0; }
+static inline void mali_platform_gpu_active(void) {}
+static inline void mali_platform_gpu_idle(void) {}
+#endif
 
 #endif

@@ -1459,3 +1459,71 @@ the exact tested #55 image. Captures are ``emmc-hs-55-`` followed by
 ``initial.txt``, ``pads.txt``, ``io.txt``, ``render.txt``, ``suspend.txt`` and
 ``resume.txt`` under ``out/a1260-runtime-pm/``. The high-speed work does not
 establish HS200/HS400 operation or identify the fixed I/O rail wiring.
+
+Utgard GPU clock scaling
+------------------------
+
+Build #57 adds frequency-only OPPs and standard devfreq simple_ondemand
+control at 107.25, 214.5, 300.3, 416 and 500.5 MHz, matching the MT6580 BSP's
+``mt_gpufreq.c`` table. CCF owns the MFG glitch-free mux and its separate
+non-glitch-free input: sources are MPLL_D14/D7/D5/D3 and UPLL_D3. CCF enables
+the new source before mux handover and releases the old source afterwards.
+The non-GF mux refuses changes while selected by the GF mux. These are
+source changes, not PLL retuning.
+
+All BSP steps require 1.15 V and share VPROC with the CPU. GPU OPPs therefore
+contain no voltage requests; the target callback checks the real shared rail
+is at least 1.15 V and changes only the clock. Existing CPU OPPs retain that
+floor and may require up to 1.3 V. GPU downclocking must never lower a rail
+still needed by the CPU.
+
+The 100 ms deferrable monitor measures intervals with queued or running DDK
+GP/PP jobs, from enqueue through completion, independently of the legacy
+DDK utilization timer. This is job busy time, not a hardware cycle counter.
+Runtime suspend stops the monitor before gating clocks; resume restores
+clocks, resets sampling and restarts monitoring. Disabling MALI400_DEVFREQ
+retains the fixed-clock integration.
+
+Hardware validation exercised all five steps and repeated source changes,
+with a correct green GLES pixel readback at each step. CPU was held at
+1.3 GHz during that check and VPROC remained 1.3 V throughout GPU downclocking.
+With simple_ondemand, an eight-second 1024x1024 GLES draw loop automatically
+rose from 107.25 to 500.5 MHz, completed 1804 frames and returned the expected
+pixel with no GL error. After the load it fell to 107.25 MHz; MFG then powered
+off and the devfreq transition/time counters stopped advancing.
+
+One USB-unbound s2idle/RTC cycle succeeded with zero aborts, retained the
+16 MiB RAM SHA256 and automatically restored ADB. Subsequent GLES drawing
+and display restoration passed with zero RDMA underflows/abnormal events.
+eMMC retained 52 MHz high speed and all controller error counters were zero.
+The final image also completed Android boot and screen off/on with idle MFG
+power-off. No new GPU fault, warning or Oops was observed. Standard product
+boot/kernel use the tested #57 image. Captures under
+``out/a1260-runtime-pm/`` are ``gpu-devfreq-57-`` followed by ``manual.txt``,
+``auto.txt``, ``suspend.txt``, ``resume.txt`` and ``final.txt``. Temporary
+CPU clamps, runtime overrides, wake references and RTC alarms were cleared.
+
+SPM deep-sleep source audit
+--------------------------
+
+The old MT6580 BSP provides a 725-word GPL PCM program named
+``pcm_suspend_v14.0_auxadc_workaround3_6`` in
+``drivers/misc/mediatek/base/power/spm_v1/mt_spm_sleep.c``. Its four vectors
+are 26M wake/sleep and APSRC wake/sleep. The flow coordinates UART sleep
+acknowledgement, GIC masking, CIRQ recording/flush, PCM register/event setup,
+PMIC wrapper commands and wake-status cleanup. CPU/infra power-down also
+requires CPU dormant context save/restore, GIC/L2 handling and a working
+CPU0 resume entry; secondary CPU hotplug alone does not supply that path.
+
+Specifically for MT6580, the suspend PWRAP command phase clears/sets the
+MT6350 STRUP_AUXADC_START_SW bit, preserving the rest of the register. It is
+not the CPU voltage table. The deep-idle phase separately switches VCORE
+control. Modern WACS2 CPU voltage writes do not implement these autonomous
+SPM command slots or phase handoff.
+
+The next stages are CIRQ hierarchy integration, shared SPM ownership and
+bounded PCM setup with CPU/infra/DDR power retained, then verified wake
+capture before adding CPU dormant or DDR power transitions. SPM is already
+used by SMP and genpd, so no initialization may blindly reset their live
+state. The current kernel still uses s2idle/WFI, not PCM deep sleep, DDR
+self-refresh or cluster power-down.

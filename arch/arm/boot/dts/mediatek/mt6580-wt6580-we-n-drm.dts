@@ -67,6 +67,15 @@
 		power-domains = <&scpsys MT6580_POWER_DOMAIN_MFG>;
 	};
 
+	gpu_opp_table: opp-table-gpu {
+		compatible = "operating-points-v2";
+		opp-107250000 { opp-hz = /bits/ 64 <107250000>; };
+		opp-214500000 { opp-hz = /bits/ 64 <214500000>; };
+		opp-300300000 { opp-hz = /bits/ 64 <300300000>; };
+		opp-416000000 { opp-hz = /bits/ 64 <416000000>; };
+		opp-500500000 { opp-hz = /bits/ 64 <500500000>; };
+	};
+
 	gpu: gpu@13010000 {
 		compatible = "mediatek,mt6580-mali", "arm,mali-400";
 		reg = <0 0x13010000 0 0x10000>;
@@ -82,6 +91,9 @@
 			 <&mfgcfg CLK_MT6580_MFG_BG3D>;
 		clock-names = "bus", "core";
 		power-domains = <&scpsys MT6580_POWER_DOMAIN_MFG>;
+		/* Shared VPROC: CPU OPPs retain >=1.15 V; GPU changes only clocks. */
+		mali-supply = <&vproc>;
+		operating-points-v2 = <&gpu_opp_table>;
 	};
 
 	mmsys: syscon@14000000 {

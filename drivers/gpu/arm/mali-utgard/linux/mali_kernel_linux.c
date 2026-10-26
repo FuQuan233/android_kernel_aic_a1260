@@ -588,6 +588,9 @@ static int mali_probe(struct platform_device *pdev)
 	if (_MALI_OSK_ERR_OK == _mali_osk_wq_init()) {
 		/* Initialize the Mali GPU HW specified by pdev */
 		if (_MALI_OSK_ERR_OK == mali_initialize_subsystems()) {
+			err = mali_platform_devfreq_init(pdev);
+			if (err)
+				goto terminate_subsystems;
 			/* Register a misc device (so we are accessible from user space) */
 			err = mali_miscdevice_register(pdev);
 			if (0 == err) {
@@ -608,6 +611,8 @@ static int mali_probe(struct platform_device *pdev)
 			} else {
 				MALI_PRINT_ERROR(("mali_probe(): failed to register Mali misc device."));
 			}
+terminate_subsystems:
+			mali_platform_devfreq_term(pdev);
 			mali_terminate_subsystems();
 		} else {
 			MALI_PRINT_ERROR(("mali_probe(): Failed to initialize Mali device driver."));
@@ -654,6 +659,7 @@ static void mali_remove(struct platform_device *pdev)
 		return;
 	mali_sysfs_unregister();
 	mali_miscdevice_unregister();
+	mali_platform_devfreq_term(pdev);
 	mali_terminate_subsystems();
 	_mali_osk_wq_term();
 
@@ -781,7 +787,12 @@ static int mali_driver_runtime_suspend(struct device *dev)
 #endif
 
 	if (MALI_TRUE == mali_pm_runtime_suspend()) {
-		mali_platform_runtime_suspend();
+		int ret = mali_platform_runtime_suspend();
+
+		if (ret) {
+			mali_pm_runtime_resume();
+			return ret;
+		}
 		/* Tracing the frequency and voltage after mali is suspended */
 		_mali_osk_profiling_add_event(MALI_PROFILING_EVENT_TYPE_SINGLE |
 					      MALI_PROFILING_EVENT_CHANNEL_GPU |

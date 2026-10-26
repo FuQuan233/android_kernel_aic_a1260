@@ -11,8 +11,9 @@ config MALI400
 	  for matching proprietary EGL/GLES userspace, with dma-buf and
 	  Linux sync_file support. This is separate from the KMS display driver.
 
-	  This integration holds the firmware-selected GPU clock and voltage
-	  while bound. DVFS, protected rendering and suspend are not supported.
+	  Runtime and system PM are supported. The shared supply remains under
+	  CPU voltage control; optional devfreq changes only GPU clock sources.
+	  Protected rendering is not supported.
 	  Disable Lima: both drivers target the same GPU and cannot own it
 	  simultaneously. No proprietary userspace binaries are included.
 
@@ -22,3 +23,13 @@ config MALI400_DEBUG
 	help
 	  Compile the DDK's diagnostic messages and internal assertions.
 	  The mali_debug_level parameter controls message verbosity at runtime.
+
+config MALI400_DEVFREQ
+	bool "MT6580 Utgard devfreq clock scaling"
+	depends on MALI400 && PM_DEVFREQ && PM_OPP
+	select DEVFREQ_GOV_SIMPLE_ONDEMAND
+	help
+	  Use the five BSP GPU clock steps from 107.25 to 500.5 MHz with
+	  measured busy time and the simple ondemand governor. The CPU's
+	  shared VPROC supply must remain at or above 1.15 V; GPU devfreq
+	  never changes its voltage. Runtime suspend stops polling.

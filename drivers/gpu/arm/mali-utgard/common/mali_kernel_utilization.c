@@ -8,6 +8,7 @@
  *
  */
 
+#include "platform_pmm.h"
 #include "mali_kernel_utilization.h"
 #include "mali_osk.h"
 #include "mali_osk_mali.h"
@@ -218,6 +219,7 @@ void mali_utilization_term(void)
 
 void mali_utilization_gp_start(void)
 {
+	mali_platform_gpu_active();
 	mali_utilization_data_lock();
 
 	++num_running_gp_cores;
@@ -276,6 +278,7 @@ void mali_utilization_gp_start(void)
 
 void mali_utilization_pp_start(void)
 {
+	mali_platform_gpu_active();
 	mali_utilization_data_lock();
 
 	++num_running_pp_cores;
@@ -334,6 +337,7 @@ void mali_utilization_pp_start(void)
 
 void mali_utilization_gp_end(void)
 {
+	mali_platform_gpu_idle();
 	mali_utilization_data_lock();
 
 	--num_running_gp_cores;
@@ -359,6 +363,7 @@ void mali_utilization_gp_end(void)
 
 void mali_utilization_pp_end(void)
 {
+	mali_platform_gpu_idle();
 	mali_utilization_data_lock();
 
 	--num_running_pp_cores;

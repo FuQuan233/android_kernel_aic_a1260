@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* MT6580 runtime clock gating; genpd controls MFG, frequency stays fixed. */
+/* MT6580 runtime clock gating and optional DFS; genpd controls MFG. */
 #include <linux/platform_device.h>
 #include <linux/clk.h>
 #include <linux/pm_runtime.h>
@@ -34,15 +34,17 @@ int mali_platform_device_init(struct platform_device *pdev)
 	pm_runtime_set_autosuspend_delay(&pdev->dev, 100);
 	pm_runtime_use_autosuspend(&pdev->dev);
 	pm_runtime_enable(&pdev->dev);
+	mali_platform_devfreq_prepare();
 	/* Keep initialization powered until the DDK has registered all groups. */
 	pm_runtime_get_noresume(&pdev->dev);
 	dev_info(&pdev->dev,
-		 "Utgard r8p0: runtime MFG gating, fixed firmware clock/voltage\n");
+		 "Utgard r8p0: runtime MFG gating, shared VPROC retained\n");
 	return 0;
 }
 
 int mali_platform_device_deinit(struct platform_device *pdev)
 {
+	mali_platform_devfreq_unprepare();
 	pm_runtime_put_noidle(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
 	clk_bulk_disable_unprepare(mali_num_clocks, mali_clocks);
@@ -51,10 +53,22 @@ int mali_platform_device_deinit(struct platform_device *pdev)
 
 int mali_platform_runtime_resume(void)
 {
-	return clk_bulk_prepare_enable(mali_num_clocks, mali_clocks);
+	int ret = clk_bulk_prepare_enable(mali_num_clocks, mali_clocks);
+
+	if (ret)
+		return ret;
+	ret = mali_platform_devfreq_resume();
+	if (ret)
+		clk_bulk_disable_unprepare(mali_num_clocks, mali_clocks);
+	return ret;
 }
 
-void mali_platform_runtime_suspend(void)
+int mali_platform_runtime_suspend(void)
 {
+	int ret = mali_platform_devfreq_suspend();
+
+	if (ret)
+		return ret;
 	clk_bulk_disable_unprepare(mali_num_clocks, mali_clocks);
+	return 0;
 }

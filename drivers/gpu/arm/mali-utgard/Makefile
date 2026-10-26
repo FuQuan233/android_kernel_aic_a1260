@@ -75,6 +75,8 @@ mali-y := \
 	linux/mali_internal_sync.o \
 	linux/mali_dma_fence.o
 
+mali-$(CONFIG_MALI400_DEVFREQ) += platform/mt6580-modern/devfreq.o
+
 ccflags-y += -I$(src) -I$(src)/include -I$(src)/common -I$(src)/linux
 ccflags-y += -I$(src)/linux/license/gpl -I$(src)/platform/mt6580-modern
 ccflags-y += -include $(src)/linux/mali_compat_618.h
