@@ -9,10 +9,14 @@ struct mt6580_cpu0_context {
 	u32 timer_ctrl, timer_ctrl_after;
 	u64 timer_cval, counter_before, counter_after;
 	u32 resumes;
+	u32 cold_resumes, aborts, errata_runs;
+	u32 banked[32], l2ctlr, l2ctlr_after, cache_config, cache_after;
+	u32 wdt_before, wdt_armed, wdt_after, wdt_length;
 	int result;
 };
 
-int mt6580_cpu0_resume_entry(struct mt6580_cpu0_context *ctx,
-			   int (*idle)(unsigned long), unsigned long arg);
+int mt6580_cpu0_suspend(struct mt6580_cpu0_context *ctx, unsigned int mode,
+		       int (*idle)(unsigned long), int (*wait)(unsigned long),
+		       unsigned long arg);
 
 #endif

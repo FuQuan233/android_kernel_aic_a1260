@@ -9,12 +9,15 @@
 #include <linux/iopoll.h>
 #include <linux/sizes.h>
 #include <linux/smp.h>
+#include <linux/soc/mediatek/mt6580-cpu-pm.h>
 
 #include <asm/barrier.h>
 #include <asm/cacheflush.h>
 #include <asm/cp15.h>
 #include <asm/proc-fns.h>
 #include <asm/smp_plat.h>
+
+#include "pm-mt6580.h"
 
 #define MT6580_INFRACFG_AO	0x10001000
 #define MT6580_SPM		0x10006000
@@ -45,7 +48,7 @@ static void mt6580_spm_update(unsigned int reg, u32 clear, u32 set)
 	       mt6580_spm + reg);
 }
 
-static int mt6580_boot_secondary(unsigned int cpu, struct task_struct *idle)
+static int mt6580_boot_at(unsigned int cpu, u32 vector)
 {
 	unsigned int id = cpu_logical_map(cpu);
 	u32 power, l1, mask, val;
@@ -62,7 +65,7 @@ static int mt6580_boot_secondary(unsigned int cpu, struct task_struct *idle)
 	mask = BIT(13 - id);
 
 	/* CPU boot requests are serialized by the ARM SMP core. */
-	writel(__pa_symbol(secondary_startup_arm), mt6580_infracfg + BOOT_ADDR);
+	writel(vector, mt6580_infracfg + BOOT_ADDR);
 	writel(SPM_REGWR_EN, mt6580_spm + POWERON_CONFIG_EN);
 	mt6580_spm_update(power, 0, PWR_ON);
 	udelay(1);
@@ -99,6 +102,11 @@ timeout:
 	       readl(mt6580_spm + PWR_STATUS),
 	       readl(mt6580_spm + PWR_STATUS_2ND));
 	return ret;
+}
+
+static int mt6580_boot_secondary(unsigned int cpu, struct task_struct *idle)
+{
+	return mt6580_boot_at(cpu, __pa_symbol(secondary_startup_arm));
 }
 
 static void __init mt6580_smp_prepare_cpus(unsigned int max_cpus)
@@ -142,8 +150,11 @@ static int mt6580_cpu_kill(unsigned int cpu)
 	u32 mask = BIT(13 - id), val;
 	int ret;
 
-	/* SLEEP_TIMER_STA has a separate STANDBYWFI bit for each A7 core. */
-	ret = readl_poll_timeout(mt6580_spm + 0x720, val,
+	/* Also used after CPU0 reset, before timekeeping/syscore resume.
+	 * Poll atomically: neither sleeping nor ktime_get is available there.
+	 * SLEEP_TIMER_STA has one STANDBYWFI bit per A7 core.
+	 */
+	ret = readl_poll_timeout_atomic(mt6580_spm + 0x720, val,
 				val & BIT(16 + id), 10, 100000);
 	if (ret)
 		goto timeout;
@@ -151,17 +162,17 @@ static int mt6580_cpu_kill(unsigned int cpu)
 	mt6580_spm_update(power, 0, PWR_ISO | SRAM_CKISO);
 	mt6580_spm_update(power, SRAM_ISOINT_B, 0);
 	mt6580_spm_update(l1, 0, L1_PDN);
-	ret = readl_poll_timeout(mt6580_spm + l1, val,
+	ret = readl_poll_timeout_atomic(mt6580_spm + l1, val,
 				val & L1_PDN_ACK, 1, 100000);
 	if (ret)
 		goto timeout;
 	mt6580_spm_update(power, PWR_RST_B, PWR_CLK_DIS);
 	mt6580_spm_update(power, PWR_ON | PWR_ON_2ND, 0);
-	ret = readl_poll_timeout(mt6580_spm + PWR_STATUS, val,
+	ret = readl_poll_timeout_atomic(mt6580_spm + PWR_STATUS, val,
 				!(val & mask), 1, 100000);
 	if (ret)
 		goto timeout;
-	ret = readl_poll_timeout(mt6580_spm + PWR_STATUS_2ND, val,
+	ret = readl_poll_timeout_atomic(mt6580_spm + PWR_STATUS_2ND, val,
 				!(val & mask), 1, 100000);
 	if (!ret)
 		return 1;
@@ -171,6 +182,30 @@ timeout:
 	       readl(mt6580_spm + l1));
 	return 0;
 }
+
+#ifdef CONFIG_SUSPEND
+int mt6580_cpu0_l2_recover(void)
+{
+	unsigned int cpu, powered = 0, max = min(4U, num_possible_cpus());
+	int ret = 0;
+
+	/* BSP erratum 802022: after L2 loss, run each sibling into the small
+	 * physical WFI stub before normal Linux secondary boot is permitted.
+	 */
+	for (cpu = 1; cpu < max; cpu++) {
+		ret = mt6580_boot_at(cpu, __pa_symbol(mt6580_l2_erratum_entry));
+		if (ret)
+			break;
+		powered = cpu;
+	}
+	while (powered) {
+		if (!mt6580_cpu_kill(powered))
+			ret = -EIO;
+		powered--;
+	}
+	return ret;
+}
+#endif
 #endif
 
 static const struct smp_operations mt6580_smp_ops __initconst = {

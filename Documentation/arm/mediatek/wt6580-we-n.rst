@@ -1878,3 +1878,56 @@ matched and PCM/PWRAP state restored. Evidence is under
 the MMU-off entry and restore path, not a hardware reset or Boot ROM path.
 The PCM CPU-power branch also powers L2 down, so cache/cluster restoration
 and the BSP's sibling-core erratum sequence must precede enabling it.
+
+CPU0/TOP/L2 hardware reset and recovery
+-------------------------------------
+
+The explicit cpu0_mode=2 path clears only CPU_PDN_DIS in the qualified PCM
+flags (0x3be). ARM cpu_suspend saves the MMU context, and the finisher
+flushes L1/L2 and exits coherency before starting PCM. Unlike mode 1, this
+finisher never calls soft_restart: a zero cpu_suspend return identifies
+entry through the programmed hardware reset vector. A WFI return without
+reset restores cache/coherency state and is counted separately as an abort.
+The physical resume wrapper restores writable L2CTLR fields before generic
+cpu_resume enables caches. Banked registers, physical timer, L2 reset policy,
+shared boot vector and CPU/cluster PM notifier state are restored too.
+
+The PCM return handshake finishes before running the BSP erratum 802022
+sequence: temporarily start each sibling in a physical GIC-CPU-disable/WFI
+stub, power it off, then permit normal Linux secondary bring-up. Those
+bounded power-status polls must use readl_poll_timeout_atomic: timekeeping
+and syscore resume have not run yet. Build #79 proved four cold entries but
+its non-atomic helper caused ktime_get warnings. Build #81 completed three
+cold entries with matching erratum counts, no WFI abort and no such warning.
+The 16 MiB RAM hash, four CPUs, 52 MHz eMMC direct I/O, Mali rendering and
+zero-underflow RDMA recovered.
+
+A qualification-only 30-second reset watchdog is armed after device PM and
+restored before normal watchdog resume. Modes 1/2 reject PCM timers above
+20 seconds; timer=0 requires an external wake within the guard interval.
+This temporary guard must be removed or replaced by a normal PM policy
+before using unbounded CPU-reset sleeps. Its reset expiry has not been
+intentionally exercised. The stopped watchdog may retain IRQ/dual-mode
+bits (0x5c); the guard now temporarily clears them and restores the exact
+original selection. An enabled IRQ/dual watchdog is still rejected.
+Build #81 initially rejected the disabled 0x5c configuration; later trials
+worked after normal watchdog resume changed it to 0x14. This rejection
+happened before PCM_KICK and must not be counted as a sleep.
+
+The default remains cpu0_mode=0 and Android s2idle. Infra, DDR, APSRC and
+crystal control remain retained even in mode 2; this is not complete deep
+sleep. MD1/USB ownership, physical 26 MHz stop, DDR self-refresh, MCUSYS
+edge-wakeup replay and long-term stress still require separate work.
+Evidence is under ``out/a1260-runtime-pm/cpu0-79-*`` and ``cpu0-81-*``.
+
+Build #82 then completed three first-attempt cold entries, with sleeps of
+2.001072/2.001055 seconds (PCM timer) and 8.556566 seconds (RTC).
+Cold/erratum counts were 3/3, WFI aborts 0 and suspend success/fail 3/0.
+The first watchdog round restored 0x5c -> 0x15 -> 0x5c; later rounds restored
+0x14 -> 0x15 -> 0x14. The shared vector was
+0x80113000 -> 0x801310d8 -> 0x80113000. RAM hashes matched, L2CTLR/cache
+policy matched, and direct eMMC I/O, Mali pixel readback and RDMA with no
+underflows recovered. No kernel WARNING/Oops was captured. Evidence is
+``cpu0-82-multi.txt``, ``cpu0-82-dmesg.txt`` and ``cpu0-82-resume.txt``.
+Standard product boot/kernel use #82. Qualification mode, RTC/PCM timers,
+trace overrides and temporary wake references were cleared/restored.

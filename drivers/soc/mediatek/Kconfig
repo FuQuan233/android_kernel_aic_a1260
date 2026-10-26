@@ -74,8 +74,10 @@ config MTK_MT6580_SPM
 	  Execute the BSP PCM program with retained power during explicit
 	  standby, with SPM timer/external wakeup and MT6350 command slots.
 	  R7 provides timer/control sequencing; R0 stays disconnected and
-	  CPU0, GIC, infra and DDR use retained power. Android keeps using
-	  s2idle. The MT6580 UART handshake gates release of the software
+	  CPU0 normally uses retained power. Explicit qualification modes
+	  can exercise MMU-off resume or CPU0/TOP/L2 reset, including GIC,
+	  banked-register and L2 recovery. Infra and DDR stay retained, and
+	  Android keeps using s2idle. The UART handshake gates the software
 	  26 MHz override; APSRC and crystal control remain retained.
 	  Firmware-initialized MT6350 PWRAP and CIRQ are required.
 

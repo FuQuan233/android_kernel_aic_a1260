@@ -37,6 +37,10 @@ Description:
 		vector contains the original/programmed/restored shared boot
 		address; timer_ctrl and counter contain before/after physical
 		timer snapshots. resumes counts returns through cpu_resume.
+		cold counts hardware-mode cpu_resume returns, aborts counts WFI
+		returns without reset, and errata counts completed sibling-core
+		L2 recovery sequences. L2 control/cache reset policy and temporary
+		watchdog before/armed/restored values are also captured.
 
 What:		/sys/devices/platform/10006000.power-controller/*suspend/cpu0_mode
 Date:		October 2026
@@ -48,7 +52,20 @@ Description:
 		the original shared boot vector and PM state. Mode 1 keeps CPU0,
 		L2, infra, DDR and supplies powered; it qualifies the resume entry
 		and does not prove hardware power-down or Boot ROM handoff.
-		Android's default s2idle is unchanged. Values above 1 are rejected.
+		Mode 2 permits PCM CPU0/TOP/L2 power-down, exits cache coherency,
+		and uses the hardware reset vector; L2, banked and notifier state
+		are restored, including the BSP sibling-core erratum sequence.
+		It requires the UART/domain/source handoff checks to pass and
+		still retains infra, DDR, supplies and crystal control.
+		Modes 1/2 temporarily arm a 30-second hardware reset watchdog
+		after normal device suspend, restoring its settings on return.
+		A stopped watchdog may retain its IRQ/dual-mode selection: the
+		guard clears that selection temporarily and restores it unchanged.
+		An enabled IRQ/dual-mode watchdog is rejected with -EBUSY.
+		PCM timer values above 20 seconds are rejected in those modes;
+		with timer=0 an external wake must arrive before the watchdog.
+		This is a bring-up guard, not a normal long-suspend policy.
+		Android's default s2idle is unchanged. Values above 2 are rejected.
 
 What:		/sys/devices/platform/10006000.power-controller/*suspend/pcm_timer_ms
 Date:		October 2026

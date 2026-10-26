@@ -91,7 +91,7 @@ struct mt6580_pcm_wake {
 	u32 power_before, power_after, power2_before, power2_after, dvfs;
 	u32 timer_con_start, timer_val_start, timer_con_wake, timer_val_wake;
 	u32 timer_at_wake, sleep_sta, fsm_at_wake;
-	u32 pwr_io, flags, src_req;
+	u32 pwr_io, flags, src_req, flags_expected;
 	u32 src_before, src_expected, src_blockers, r13_before;
 	u32 poweron0, poweron1, clk_con, standby, mmddr;
 	bool irq_pending, forced_exit;
@@ -261,6 +261,32 @@ static void mt6580_pcm_source_requests(struct mt6580_spm *spm)
 	writel(wake->src_expected, spm->base + PCM_SRC_REQ);
 }
 
+static void mt6580_pcm_wake_snapshot(struct mt6580_spm *spm)
+{
+	spm->wake.timer_con_wake = readl(spm->base + PCM_CON1);
+	spm->wake.timer_val_wake = readl(spm->base + PCM_TIMER_VAL);
+	spm->wake.timer_at_wake = readl(spm->base + PCM_TIMER_OUT);
+	spm->wake.sleep_sta = readl(spm->base + 0x720);
+	spm->wake.fsm_at_wake = readl(spm->base + PCM_FSM_STA);
+}
+
+static int mt6580_pcm_wait_finish(unsigned long arg)
+{
+	struct mt6580_spm *spm = (void *)arg;
+	u32 val;
+
+	/* PCM must have finished its CPU/TOP sequencing before the BSP's
+	 * sibling-core L2 recovery is allowed to access those power registers.
+	 */
+	mt6580_pcm_wake_snapshot(spm);
+	if (!(readl(spm->base + SPM_ISR_STATUS) & PCM_RETURN)) {
+		spm->wake.forced_exit = true;
+		writel(1, spm->base + SPM_CPU_WAKE);
+	}
+	return readl_poll_timeout_atomic(spm->base + SPM_ISR_STATUS, val,
+					val & PCM_RETURN, 1, 100000);
+}
+
 static int mt6580_pcm_idle_finish(unsigned long arg)
 {
 	struct mt6580_spm *spm = (void *)arg;
@@ -270,20 +296,22 @@ static int mt6580_pcm_idle_finish(unsigned long arg)
 	writel(PCM_KEY | con0, spm->base + PCM_CON0);
 	spm->runs++;
 	cpu_do_idle();
-	spm->wake.timer_con_wake = readl(spm->base + PCM_CON1);
-	spm->wake.timer_val_wake = readl(spm->base + PCM_TIMER_VAL);
-	spm->wake.timer_at_wake = readl(spm->base + PCM_TIMER_OUT);
-	spm->wake.sleep_sta = readl(spm->base + 0x720);
-	spm->wake.fsm_at_wake = readl(spm->base + PCM_FSM_STA);
+	mt6580_pcm_wake_snapshot(spm);
 	return 0;
 }
 
 static int mt6580_pcm_run(struct mt6580_spm *spm)
 {
-	u32 val, con1, ticks = READ_ONCE(spm->timer_ms) * 32768 / 1000;
+	u32 con1, ticks = READ_ONCE(spm->timer_ms) * 32768 / 1000;
+	unsigned int mode = READ_ONCE(spm->cpu0_mode);
 	int i, ret, capture;
 
 	memset(&spm->wake, 0, sizeof(spm->wake));
+	if (mode && ticks > 20 * 32768)
+		return -ERANGE;
+	spm->wake.flags_expected = PCM_RETAIN_FLAGS;
+	if (mode == 2)
+		spm->wake.flags_expected &= ~BIT(0);
 	spm->wake.power_before = readl(spm->base + SPM_PWR_STATUS);
 	spm->wake.power2_before = readl(spm->base + SPM_PWR_STATUS2);
 	/* Synchronize internal registers before connecting R7 control. R0
@@ -297,9 +325,11 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 	writel(0, spm->base + PCM_PWR_IO_EN);
 	writel(0, spm->base + PCM_DATA_INI);
 	writel(~0U, spm->base + PCM_MAS_PAUSE_MASK);
-	writel(PCM_RETAIN_FLAGS, spm->base + PCM_FLAGS);
+	writel(spm->wake.flags_expected, spm->base + PCM_FLAGS);
 	writel(0, spm->base + 0xb00);
 	mt6580_pcm_source_requests(spm);
+	if (mode == 2 && spm->wake.src_blockers)
+		return -EBUSY;
 	writel(readl(spm->base + SPM_CLK_CON) | BIT(5), spm->base + SPM_CLK_CON);
 	writel((readl(spm->base + SPM_AP_STANDBY) & ~GENMASK(7, 4)) | BIT(4) | BIT(6),
 	       spm->base + SPM_AP_STANDBY);
@@ -318,24 +348,18 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 	writel(PCM_KEY | con1, spm->base + PCM_CON1);
 	spm->wake.timer_con_start = readl(spm->base + PCM_CON1);
 	spm->wake.timer_val_start = readl(spm->base + PCM_TIMER_VAL);
-	if (readl(spm->base + PCM_FLAGS) != PCM_RETAIN_FLAGS ||
+	if (readl(spm->base + PCM_FLAGS) != spm->wake.flags_expected ||
 	    readl(spm->base + PCM_SRC_REQ) != spm->wake.src_expected)
 		return -EIO;
 	writel(PCM_R7_OUTPUT, spm->base + PCM_PWR_IO_EN);
-	if (READ_ONCE(spm->cpu0_mode))
-		ret = mt6580_cpu0_resume_entry(&spm->cpu0, mt6580_pcm_idle_finish,
-					     (unsigned long)spm);
+	if (mode)
+		ret = mt6580_cpu0_suspend(&spm->cpu0, mode, mt6580_pcm_idle_finish,
+					 mt6580_pcm_wait_finish, (unsigned long)spm);
 	else
 		ret = mt6580_pcm_idle_finish((unsigned long)spm);
 	if (ret)
 		return ret;
-	/* An external IRQ can wake CPU0 before the PCM return sequence ends. */
-	if (!(readl(spm->base + SPM_ISR_STATUS) & PCM_RETURN)) {
-		spm->wake.forced_exit = true;
-		writel(1, spm->base + SPM_CPU_WAKE);
-	}
-	ret = readl_poll_timeout_atomic(spm->base + SPM_ISR_STATUS, val,
-				       val & PCM_RETURN, 1, 100000);
+	ret = mt6580_pcm_wait_finish((unsigned long)spm);
 	capture = mt6580_pcm_capture(spm);
 	if (!ret)
 		ret = capture;
@@ -345,7 +369,7 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 		     spm->wake.power_before != spm->wake.power_after ||
 		     spm->wake.power2_before != spm->wake.power2_after ||
 		     spm->wake.pwr_io != PCM_R7_OUTPUT ||
-		     spm->wake.flags != PCM_RETAIN_FLAGS ||
+		     spm->wake.flags != spm->wake.flags_expected ||
 		     spm->wake.src_req != spm->wake.src_expected))
 		ret = -EIO;
 	return ret;
@@ -452,7 +476,9 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 "source before=%08x applied=%08x blockers=%08x r13_before=%08x\n"
 			 "source poweron=%08x/%08x clk_con=%08x standby=%08x mmddr=%08x\n"
 			 "cpu0 mode=%u resumes=%u result=%d vector=%08x/%08x/%08x\n"
-			 "cpu0 timer_ctrl=%08x/%08x counter=%llu/%llu\n",
+			 "cpu0 timer_ctrl=%08x/%08x counter=%llu/%llu\n"
+			 "cpu0 cold=%u aborts=%u errata=%u l2=%08x/%08x cache=%08x/%08x\n"
+			 "cpu0 watchdog=%08x/%08x/%08x length=%08x\n",
 			 ARRAY_SIZE(mt6580_suspend_pcm), &spm->pcm_dma,
 			 spm->loads, spm->last_error, spm->loaded_fsm, spm->restored_fsm,
 			 readl(spm->base + PCM_FSM_STA), readl(spm->base + PCM_CON0),
@@ -474,7 +500,11 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 READ_ONCE(spm->cpu0_mode), spm->cpu0.resumes, spm->cpu0.result,
 			 spm->cpu0.boot_before, spm->cpu0.boot_resume, spm->cpu0.boot_after,
 			 spm->cpu0.timer_ctrl, spm->cpu0.timer_ctrl_after,
-			 spm->cpu0.counter_before, spm->cpu0.counter_after);
+			 spm->cpu0.counter_before, spm->cpu0.counter_after, spm->cpu0.cold_resumes,
+			 spm->cpu0.aborts, spm->cpu0.errata_runs, spm->cpu0.l2ctlr,
+			 spm->cpu0.l2ctlr_after, spm->cpu0.cache_config, spm->cpu0.cache_after,
+			 spm->cpu0.wdt_before, spm->cpu0.wdt_armed, spm->cpu0.wdt_after,
+			 spm->cpu0.wdt_length);
 }
 static DEVICE_ATTR_RO(state);
 
@@ -517,7 +547,7 @@ static ssize_t cpu0_mode_store(struct device *dev, struct device_attribute *attr
 
 	if (ret)
 		return ret;
-	if (mode > 1)
+	if (mode > 2)
 		return -ERANGE;
 	WRITE_ONCE(spm->cpu0_mode, mode);
 	return count;
