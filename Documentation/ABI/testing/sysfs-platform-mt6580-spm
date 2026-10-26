@@ -135,6 +135,21 @@ Description:
 		The existing 30-second CPU0 qualification watchdog applies. This is
 		not enabled for Android's default s2idle or unbounded production sleep.
 
+What:		/sys/devices/platform/10006000.power-controller/*suspend/ddrphy_control
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Boolean, default false. Allow the BSP PCM DDRPHY power-down sequence
+		by clearing DDRPHY_PDN_DIS during explicit CPU0-reset standby.
+		Requires cpu0_mode=2, r0_control=1, apsrc_control=1, their dependency
+		checks and DPY_PWR_CON=0x0d before entry. f26m_control can be left
+		off to qualify PHY power sequencing with 26 MHz retained first.
+		Full DDRPHY fixed-field checks and DPY power-control restoration are
+		verified on return. State adds ddrphy requested and power before/after.
+		Infra power, voltage and MAINPLL policy remain retained. The existing
+		30-second reset watchdog and bounded/external wake restrictions apply.
+		Off/on snapshots alone do not measure the time spent powered down.
+
 What:		/sys/devices/platform/1000f000.pmic-wrap/spm_phase
 Date:		October 2026
 Contact:	FuQuan <i@fuquan.moe>

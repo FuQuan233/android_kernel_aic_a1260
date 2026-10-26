@@ -49,6 +49,7 @@
 #define SPM_AP_STANDBY		0x608
 #define SPM_PWR_STATUS		0x60c
 #define SPM_PWR_STATUS2		0x610
+#define SPM_DPY_PWR_CON		0x240
 #define SPM_WAKE_MASK		0x810
 #define SPM_CPU_WAKE		0x814
 #define SPM_ISR_MASK		0x900
@@ -109,11 +110,13 @@ struct mt6580_pcm_wake {
 	u32 settle_wake, settle_restored;
 	u32 ddr_before[4], ddr_after[4];
 	u32 clk_expected, clk_wake, clk_restored;
+	u32 dpy_before, dpy_after;
 	int ddr_check_before, ddr_check_after;
 	bool irq_pending, forced_exit;
 	bool r0_requested, settle_changed;
 	bool apsrc_requested;
 	bool f26m_requested;
+	bool ddrphy_requested;
 };
 
 struct mt6580_spm {
@@ -135,6 +138,7 @@ struct mt6580_spm {
 	bool r0_control;
 	bool apsrc_control;
 	bool f26m_control;
+	bool ddrphy_control;
 	struct mt6580_cpu0_context cpu0;
 	u32 irq_status;
 	int irq;
@@ -259,6 +263,7 @@ static int mt6580_pcm_capture(struct mt6580_spm *spm)
 	wake->r0 = readl(spm->base + PCM_REG0);
 	wake->settle_wake = readl(spm->base + SPM_CLK_SETTLE);
 	wake->clk_wake = readl(spm->base + SPM_CLK_CON);
+	wake->dpy_after = readl(spm->base + SPM_DPY_PWR_CON);
 	wake->r11 = readl(spm->base + PCM_REG11);
 	wake->r12 = readl(spm->base + PCM_REG12);
 	wake->r13 = readl(spm->base + PCM_REG13);
@@ -386,16 +391,27 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 	spm->wake.r0_requested = READ_ONCE(spm->r0_control);
 	spm->wake.apsrc_requested = READ_ONCE(spm->apsrc_control);
 	spm->wake.f26m_requested = READ_ONCE(spm->f26m_control);
+	spm->wake.ddrphy_requested = READ_ONCE(spm->ddrphy_control);
+	spm->wake.dpy_before = readl(spm->base + SPM_DPY_PWR_CON);
 	spm->wake.pwr_io_expected = PCM_R7_OUTPUT;
 	if (spm->wake.apsrc_requested && !spm->wake.r0_requested)
 		return -EINVAL;
 	if (spm->wake.f26m_requested && !spm->wake.apsrc_requested)
 		return -EINVAL;
+	if (spm->wake.ddrphy_requested && !spm->wake.apsrc_requested)
+		return -EINVAL;
+	/* BSP DPY power-on baseline: both power switches/RST_B on, no isolation
+	 * or clock-disable. Do not enter PHY power-down from another state.
+	 */
+	if (spm->wake.ddrphy_requested && spm->wake.dpy_before != 0x0d)
+		return -EBUSY;
 	if (mode && ticks > 20 * 32768)
 		return -ERANGE;
 	spm->wake.flags_expected = PCM_RETAIN_FLAGS;
 	if (mode == 2)
 		spm->wake.flags_expected &= ~BIT(0);
+	if (spm->wake.ddrphy_requested)
+		spm->wake.flags_expected &= ~BIT(2); /* BSP DDRPHY_PDN_DIS. */
 	spm->wake.power_before = readl(spm->base + SPM_PWR_STATUS);
 	spm->wake.power2_before = readl(spm->base + SPM_PWR_STATUS2);
 	/* Synchronize internal registers before connecting power control.
@@ -507,6 +523,8 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 		     spm->wake.flags != spm->wake.flags_expected ||
 		     spm->wake.src_req != spm->wake.src_expected ||
 		     spm->wake.clk_wake != spm->wake.clk_expected ||
+		     (spm->wake.ddrphy_requested &&
+		      spm->wake.dpy_after != spm->wake.dpy_before) ||
 		     (spm->wake.r0_requested &&
 		      (spm->wake.r0 != spm->wake.poweron0 ||
 		       spm->wake.settle_wake != spm->wake.settle_applied))))
@@ -621,6 +639,7 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 "sysclk_settle before=%u md=%u programmed=%08x applied=%u wake=%u restored=%u\n"
 			 "apsrc requested=%u ddr_check=%d/%d\n"
 			 "f26m requested=%u clk_con expected=%08x wake=%08x restored=%08x\n"
+			 "ddrphy requested=%u power=%08x/%08x\n"
 			 "ddr before=%08x/%08x/%08x/%08x after=%08x/%08x/%08x/%08x\n"
 			 "cpu0 mode=%u resumes=%u result=%d vector=%08x/%08x/%08x\n"
 			 "cpu0 timer_ctrl=%08x/%08x counter=%llu/%llu\n"
@@ -654,6 +673,7 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 spm->wake.ddr_check_after,
 			 spm->wake.f26m_requested, spm->wake.clk_expected,
 			 spm->wake.clk_wake, spm->wake.clk_restored,
+			 spm->wake.ddrphy_requested, spm->wake.dpy_before, spm->wake.dpy_after,
 			 spm->wake.ddr_before[0], spm->wake.ddr_before[1],
 			 spm->wake.ddr_before[2], spm->wake.ddr_before[3],
 			 spm->wake.ddr_after[0], spm->wake.ddr_after[1],
@@ -778,6 +798,27 @@ static ssize_t f26m_control_store(struct device *dev, struct device_attribute *a
 }
 static DEVICE_ATTR_RW(f26m_control);
 
+static ssize_t ddrphy_control_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct mt6580_spm *spm = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(spm->ddrphy_control));
+}
+
+static ssize_t ddrphy_control_store(struct device *dev, struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct mt6580_spm *spm = dev_get_drvdata(dev);
+	bool enable;
+	int ret = kstrtobool(buf, &enable);
+
+	if (ret)
+		return ret;
+	WRITE_ONCE(spm->ddrphy_control, enable);
+	return count;
+}
+static DEVICE_ATTR_RW(ddrphy_control);
+
 static struct attribute *mt6580_spm_attrs[] = {
 	&dev_attr_state.attr,
 	&dev_attr_pcm_timer_ms.attr,
@@ -785,6 +826,7 @@ static struct attribute *mt6580_spm_attrs[] = {
 	&dev_attr_r0_control.attr,
 	&dev_attr_apsrc_control.attr,
 	&dev_attr_f26m_control.attr,
+	&dev_attr_ddrphy_control.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(mt6580_spm);

@@ -2220,3 +2220,34 @@ boot-f26m-handoff.img / kernel-f26m-handoff (#96); Android default is still
 s2idle. Evidence is out/a1260-runtime-pm/f26m-96- plus check.txt, trace.txt,
 dmesg.txt, analysis.json, resume.txt and final.txt. Qualification's 30-second
 watchdog must be removed/replaced before unbounded production sleep.
+
+DDRPHY power sequencing qualification
+-------------------------------------
+
+The default-off ddrphy_control option clears only BSP DDRPHY_PDN_DIS in
+addition to CPU0 reset. APSRC/R0 and all their supplier/domain checks must
+pass and DPY_PWR_CON must start at 0x0d. PCM owns the existing DDRPHY
+power sequence; Linux does not write live DRAM timings/PLL fields. The
+before/after power-control word and DDRPHY prerequisite fields are checked
+on return. Infra power, voltage and MAINPLL policy remain retained.
+
+Kernel #97 first qualified this branch with F26M held (flags=0x3ba,
+SRC_REQ=0x0e), then combined it with F26M handoff for a second timed entry
+and external wake (SRC_REQ=0x0c). All three cold/erratum returns completed,
+with zero WFI aborts; DPY_PWR_CON was 0x0d before/after each. The physical
+counter advanced 2.000451 seconds in the retained-clock entry and only
+0.892923/0.893615 ms in the stopped-clock entries. Default s2idle and
+bound-gadget standby also recovered. Success/fail was 5/1, with an Android
+alarm cancellation retried before the external entry. The 16 MiB RAM hash
+matched across all entries, memory source stayed 266499673 Hz and 52 MHz
+eMMC I/O, Mali pixel readback, zero-underflow RDMA and four CPUs recovered
+without kernel WARNING/Oops. These observations qualify execution and
+recovery of the BSP PHY-power branch, not an independent measurement of
+PHY-off residency or whole-system power consumption.
+
+Standard images use boot-ddrphy-power.img and kernel-ddrphy-power (#97).
+Temporary controls/timers/tracing/wake references were cleared. Evidence
+is out/a1260-runtime-pm/ddrphy-97- plus check.txt, trace.txt, dmesg.txt,
+analysis.json, resume.txt and final.txt. Before allowing infra power loss,
+SYSIRQ polarity, UART context and remaining infra register ownership need
+explicit suspend/resume handling and verification.
