@@ -1,0 +1,15 @@
+What:		/sys/devices/platform/11005000.serial/sleep_state
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Read-only cached MT6580 UART system-sleep handshake snapshots.
+		Available on enabled MT6580 UART controller devices, including
+		11006000.serial when enabled. No UART register reads are performed
+		by this attribute. prepared means the temporary register-clock
+		references are held for a sleep request. requests counts accepted
+		sleep acknowledgments, restores counts completed request/control
+		restoration, and skips counts live-console/wakeup-tty bypasses.
+		error records the last suspend handshake or wake restoration errno.
+		saved_en/saved_req are the original controls; sleep_ack/wake_ack
+		are the acknowledgment snapshots after request and restoration.
+		The handshake does not by itself turn off the UART or system clocks.

@@ -1742,3 +1742,53 @@ Mali pixel readback and zero-error RDMA also passed. This evidence is
 boot/kernel now use #70. Tracing, filters, buffer/clock overrides, timer,
 RTC alarm and maintenance wake references were cleared/restored; Android
 plugged-in stay-on remains zero. UART/clock request coordination is next.
+
+UART sleep-request coordination
+------------------------------
+
+The MT6580 UART now performs the BSP SLEEP_EN (0x48), SLEEP_REQ (0xb4)
+and SLEEP_ACK (0xb8) handshake during system-suspend late, after the serial
+core has stopped RX/TX and suspended console output. A bounded 10 ms poll
+checks TX empty; sleep acknowledgment has a 1 ms bound. Temporary register
+clock references stay held through the request and are released after
+early resume clears it, waits for wake acknowledgment and restores the
+original controls. An entry failure rolls back its request before returning
+an error. A stuck wake acknowledgment retains its clock references and
+reports the error instead of stopping the register clocks.
+
+The new behavior is selected only for MT6580. A port left live by
+no_console_suspend or tty wakeup skips the handshake and retains its clock
+request. The console's critical clock and the PCM's existing APSRC/26 MHz
+retention are unchanged. This qualifies UART handoff while system power
+is retained; it does not yet permit crystal, infra or CPU0 power-off.
+Cached request/restore/skip/error and ACK snapshots are documented in
+``Documentation/ABI/testing/sysfs-platform-mt6580-uart``. Reading them never
+accesses potentially unclocked UART registers.
+
+Build #72 passed two PCM timer standby sleeps (1.000727/1.000709 seconds),
+an RTC standby sleep (8.409366 seconds) and default Android s2idle
+(8.658305 seconds). Each of these four entries obtained sleep ACK=1,
+cleared it to zero on wake and restored EN/REQ to their original zero
+values. A separate 1.000721-second PCM standby with console_suspend=N
+left the console live and correctly incremented skips without increasing
+requests. The final snapshot is requests=4/restores=4/skips=1/error=0,
+prepared=0, with the UART clock count back at its original 2. The physical
+controls also read EN=REQ=ACK=0 afterward.
+
+The first timer attempt was cancelled by alarmtimer with -EBUSY before
+UART late preparation, then retried successfully. Trace retains all 298
+events and confirms UART late completion before each of the five machine
+sleep entries and early restoration before normal serial resume. No UART
+handshake timeout, new I2C warning or Oops occurred. Four CPUs and the
+4 MiB RAM hash recovered; PWRAP slots, 500 mA input limit, thermal sampling,
+Mali pixel readback and zero-error RDMA also passed.
+
+Evidence under ``out/a1260-runtime-pm/`` is ``uart-sleep-72-`` followed by
+``initial.txt``, ``check.txt``, ``trace.txt``, ``trace-summary.txt``,
+``dmesg.txt`` and ``final.txt``. Standard boot/kernel use #72. Tracing and
+its overrides, maintenance wake references, RTC/PCM timers and the live
+console test setting were cleared/restored; console_suspend is Y and
+plugged-in stay-on remains zero. Before allowing 26 MHz or APSRC requests
+to drop, audit the other consumers and require UART handoff eligibility;
+a live-console skip must continue to retain those requests. CPU0 dormant
+context and DDR/cluster power transitions remain later work.

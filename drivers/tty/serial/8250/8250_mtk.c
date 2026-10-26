@@ -7,6 +7,7 @@
  */
 #include <linux/clk.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of_irq.h>
 #include <linux/of_platform.h>
@@ -33,6 +34,10 @@
 #define MTK_UART_FRACDIV_L	0x15	/* Fractional divider LSB address */
 #define MTK_UART_FRACDIV_M	0x16	/* Fractional divider MSB address */
 #define MTK_UART_DEBUG0	0x18
+#define MT6580_UART_SLEEP_EN	0x48
+#define MT6580_UART_SLEEP_REQ	0xb4
+#define MT6580_UART_SLEEP_ACK	0xb8
+#define MT6580_UART_SLEEP_BIT	BIT(0)
 #define MTK_UART_IER_XOFFI	0x20	/* Enable XOFF character interrupt */
 #define MTK_UART_IER_RTSI	0x40	/* Enable RTS Modem status interrupt */
 #define MTK_UART_IER_CTSI	0x80	/* Enable CTS Modem status interrupt */
@@ -76,6 +81,12 @@ struct mtk8250_data {
 	enum dma_rx_status	rx_status;
 #endif
 	int			rx_wakeup_irq;
+	bool			sleep_supported;
+	bool			sleep_prepared;
+	u32			saved_sleep_en, saved_sleep_req;
+	u32			sleep_ack, wake_ack;
+	unsigned int		sleep_requests, sleep_restores, sleep_skips;
+	int			sleep_error;
 };
 
 /* flow control mode */
@@ -542,6 +553,8 @@ static int mtk8250_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	data->clk_count = 0;
+	data->sleep_supported = of_device_is_compatible(pdev->dev.of_node,
+						       "mediatek,mt6580-uart");
 
 	if (pdev->dev.of_node) {
 		err = mtk8250_probe_of(pdev, &uart.port, data);
@@ -637,8 +650,133 @@ static int __maybe_unused mtk8250_resume(struct device *dev)
 	return 0;
 }
 
+static int mtk8250_restore_sleep(struct mtk8250_data *data,
+				struct uart_8250_port *up)
+{
+	void __iomem *base = up->port.membase;
+	int ret;
+
+	writel(data->saved_sleep_req, base + MT6580_UART_SLEEP_REQ);
+	ret = readl_poll_timeout(base + MT6580_UART_SLEEP_ACK, data->wake_ack,
+				!(data->wake_ack & MT6580_UART_SLEEP_BIT), 10, 1000);
+	writel(data->saved_sleep_en, base + MT6580_UART_SLEEP_EN);
+	if (ret) {
+		/* Retain the register clocks if wake acknowledgment is stuck. */
+		data->sleep_error = ret;
+		return ret;
+	}
+	clk_disable_unprepare(data->uart_clk);
+	clk_disable_unprepare(data->bus_clk);
+	data->sleep_prepared = false;
+	data->sleep_restores++;
+	return 0;
+}
+
+static int __maybe_unused mtk8250_suspend_late(struct device *dev)
+{
+	struct mtk8250_data *data = dev_get_drvdata(dev);
+	struct uart_8250_port *up = serial8250_get_port(data->line);
+	void __iomem *base = up->port.membase;
+	u32 val;
+	int ret;
+
+	if (!data->sleep_supported)
+		return 0;
+	data->sleep_error = 0;
+	if (data->sleep_prepared) {
+		ret = -EBUSY;
+		goto error;
+	}
+	/* A live console or a wakeup-enabled tty must retain its clock request. */
+	if (!up->port.suspended) {
+		data->sleep_skips++;
+		return 0;
+	}
+	ret = clk_prepare_enable(data->bus_clk);
+	if (ret)
+		goto error;
+	ret = clk_prepare_enable(data->uart_clk);
+	if (ret) {
+		clk_disable_unprepare(data->bus_clk);
+		goto error;
+	}
+	data->saved_sleep_en = readl(base + MT6580_UART_SLEEP_EN);
+	data->saved_sleep_req = readl(base + MT6580_UART_SLEEP_REQ);
+	data->sleep_ack = readl(base + MT6580_UART_SLEEP_ACK);
+	if ((data->saved_sleep_req | data->sleep_ack) & MT6580_UART_SLEEP_BIT) {
+		ret = -EBUSY;
+		goto clocks;
+	}
+	/* The serial core has stopped RX/TX and suspended console output. */
+	ret = readl_poll_timeout(base + (UART_LSR << up->port.regshift), val,
+				val & UART_LSR_TEMT, 10, 10000);
+	if (ret)
+		goto clocks;
+	data->sleep_prepared = true;
+	writel(data->saved_sleep_en | MT6580_UART_SLEEP_BIT,
+	       base + MT6580_UART_SLEEP_EN);
+	writel(data->saved_sleep_req | MT6580_UART_SLEEP_BIT,
+	       base + MT6580_UART_SLEEP_REQ);
+	ret = readl_poll_timeout(base + MT6580_UART_SLEEP_ACK, data->sleep_ack,
+				data->sleep_ack & MT6580_UART_SLEEP_BIT, 10, 1000);
+	if (ret) {
+		mtk8250_restore_sleep(data, up);
+		goto error;
+	}
+	data->sleep_requests++;
+	return 0;
+clocks:
+	clk_disable_unprepare(data->uart_clk);
+	clk_disable_unprepare(data->bus_clk);
+error:
+	data->sleep_error = ret;
+	return ret;
+}
+
+static int __maybe_unused mtk8250_resume_early(struct device *dev)
+{
+	struct mtk8250_data *data = dev_get_drvdata(dev);
+
+	if (!data->sleep_prepared)
+		return 0;
+	return mtk8250_restore_sleep(data, serial8250_get_port(data->line));
+}
+
+static ssize_t sleep_state_show(struct device *dev, struct device_attribute *attr,
+			       char *buf)
+{
+	struct mtk8250_data *data = dev_get_drvdata(dev);
+
+	/* Cached snapshots only: never touch an unclocked UART from sysfs. */
+	return sysfs_emit(buf, "prepared=%u requests=%u restores=%u skips=%u error=%d\n"
+			 "saved_en=%08x saved_req=%08x sleep_ack=%08x wake_ack=%08x\n",
+			 data->sleep_prepared, data->sleep_requests, data->sleep_restores,
+			 data->sleep_skips, data->sleep_error, data->saved_sleep_en,
+			 data->saved_sleep_req, data->sleep_ack, data->wake_ack);
+}
+static DEVICE_ATTR_RO(sleep_state);
+
+static umode_t mtk8250_attr_visible(struct kobject *kobj, struct attribute *attr, int n)
+{
+	struct mtk8250_data *data = dev_get_drvdata(kobj_to_dev(kobj));
+
+	return data->sleep_supported ? attr->mode : 0;
+}
+
+static struct attribute *mtk8250_attrs[] = {
+	&dev_attr_sleep_state.attr,
+	NULL,
+};
+
+static const struct attribute_group mtk8250_group = {
+	.attrs = mtk8250_attrs,
+	.is_visible = mtk8250_attr_visible,
+};
+__ATTRIBUTE_GROUPS(mtk8250);
+
 static const struct dev_pm_ops mtk8250_pm_ops = {
 	SET_SYSTEM_SLEEP_PM_OPS(mtk8250_suspend, mtk8250_resume)
+	LATE_SYSTEM_SLEEP_PM_OPS(mtk8250_suspend_late, mtk8250_resume_early)
 	SET_RUNTIME_PM_OPS(mtk8250_runtime_suspend, mtk8250_runtime_resume,
 				NULL)
 };
@@ -654,6 +792,7 @@ static struct platform_driver mtk8250_platform_driver = {
 		.name		= "mt6577-uart",
 		.pm		= &mtk8250_pm_ops,
 		.of_match_table	= mtk8250_of_match,
+		.dev_groups	= mtk8250_groups,
 	},
 	.probe			= mtk8250_probe,
 	.remove			= mtk8250_remove,
