@@ -732,7 +732,7 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	if (of_device_is_compatible(dev->of_node, "mediatek,mt6580-mfgcfg"))
 		return mtk_clk_simple_probe(pdev);
 	if (top)
-		count = 18;
+		count = 19;
 
 	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
@@ -812,6 +812,10 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 		data->hws[CLK_MT6580_TOP_UART1] = devm_clk_hw_register_gate(dev,
 			"mt6580_uart1", "mt6580_uart1_src", mt6580_uart_clk_flags(base, 1),
 			base + 0x24, 11, CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
+		/* SMP and genpd also access this always-on SPM register clock. */
+		data->hws[CLK_MT6580_TOP_SPM] = devm_clk_hw_register_gate(dev,
+			"mt6580_spm", "dummy26m", CLK_IS_CRITICAL, base + 0x24, 26,
+			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 
 	} else {
 		data->hws[CLK_MT6580_APMIXED_MAINPLL] =

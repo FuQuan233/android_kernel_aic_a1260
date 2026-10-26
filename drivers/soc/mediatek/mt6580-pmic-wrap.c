@@ -36,6 +36,7 @@ struct mt6580_pwrap {
 	struct mutex phase_lock;
 	u32 saved_slots[ARRAY_SIZE(suspend_slot_regs)];
 	u32 suspend_slots[ARRAY_SIZE(suspend_slot_regs)];
+	unsigned int saved_auxadc, resume_auxadc, restored_auxadc;
 	unsigned int prepared, restored;
 	bool suspend_phase;
 };
@@ -74,6 +75,7 @@ int mt6580_pwrap_prepare_suspend(struct device *dev)
 	ret = regmap_read(wrp->regmap, MT6350_STRUP_CON10, &value);
 	if (ret)
 		goto out;
+	wrp->saved_auxadc = value;
 	for (i = 0; i < ARRAY_SIZE(suspend_slot_regs); i++)
 		wrp->saved_slots[i] = readl(wrp->base + suspend_slot_regs[i]);
 	wrp->suspend_slots[0] = MT6350_STRUP_CON10;
@@ -100,11 +102,27 @@ EXPORT_SYMBOL_GPL(mt6580_pwrap_prepare_suspend);
 int mt6580_pwrap_finish_suspend(struct device *dev)
 {
 	struct mt6580_pwrap *wrp = dev_get_drvdata(dev);
-	int ret = 0;
+	int ret = 0, restore;
 
 	mutex_lock(&wrp->phase_lock);
-	if (wrp->suspend_phase)
-		ret = mt6580_pwrap_restore_slots(wrp);
+	if (wrp->suspend_phase) {
+		ret = regmap_read(wrp->regmap, MT6350_STRUP_CON10, &wrp->resume_auxadc);
+		if (ret)
+			goto restore_slots;
+		/* PCM may have executed the AUXADC pulse sequence. Restore only
+		 * START, retaining any unrelated PMIC state changed since entry.
+		 */
+		ret = regmap_update_bits(wrp->regmap, MT6350_STRUP_CON10,
+					 AUXADC_START, wrp->saved_auxadc & AUXADC_START);
+		if (ret)
+			goto restore_slots;
+		ret = regmap_read(wrp->regmap, MT6350_STRUP_CON10, &wrp->restored_auxadc);
+restore_slots:
+		/* PCM is stopped: release its slots even if the PMIC bus failed. */
+		restore = mt6580_pwrap_restore_slots(wrp);
+		if (!ret)
+			ret = restore;
+	}
 	mutex_unlock(&wrp->phase_lock);
 	return ret;
 }
@@ -119,12 +137,14 @@ static ssize_t spm_phase_show(struct device *dev, struct device_attribute *attr,
 	mutex_lock(&wrp->phase_lock);
 	len = sysfs_emit(buf, "active=%u prepared=%u restored=%u\n"
 			 "saved=%08x/%08x/%08x/%08x\n"
-			 "staged=%08x/%08x/%08x/%08x\n",
+			 "staged=%08x/%08x/%08x/%08x\n"
+			 "auxadc=%04x/%04x/%04x (saved/resume/restored)\n",
 			 wrp->suspend_phase, wrp->prepared, wrp->restored,
 			 wrp->saved_slots[0], wrp->saved_slots[1],
 			 wrp->saved_slots[2], wrp->saved_slots[3],
 			 wrp->suspend_slots[0], wrp->suspend_slots[1],
-			 wrp->suspend_slots[2], wrp->suspend_slots[3]);
+			 wrp->suspend_slots[2], wrp->suspend_slots[3],
+			 wrp->saved_auxadc, wrp->resume_auxadc, wrp->restored_auxadc);
 	mutex_unlock(&wrp->phase_lock);
 	return len;
 }

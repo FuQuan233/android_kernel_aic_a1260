@@ -1628,3 +1628,71 @@ handling and UART/clock request coordination while retaining power first.
 Only then should CPU0 dormant resume, GIC-loss edge replay and DDR/cluster
 power transitions be enabled. No PCM sleep-power claim follows from an IM
 fetch completing successfully.
+
+PCM execution with retained power
+--------------------------------
+
+The SPM provider now owns IRQ0 (SPI 88) and its 26 MHz register clock.
+The clock remains critical because SCPSYS and secondary CPU hotplug also
+access this register block. The separate BSP fast clock was tried during
+timer diagnosis and was not the cause; it is not added as a clock consumer.
+
+Explicit standby now executes the same 725-word program after devices,
+power domains and secondary CPUs have completed suspend. It synchronizes
+R0/R7 from POWERON_VAL0/1, connects R7 for timer/control sequencing, and
+keeps R0 crystal control disconnected. The retained flags (0x3bf), APSRC
+and 26 MHz requests keep CPU0, GIC, infra, memory and supplies retained.
+An optional 0..60000 ms PCM timer defaults to zero (external wake only).
+Android's default remains s2idle; no CPU0 dormant or DDR power transition
+is enabled by this change.
+
+Both instruction fetch and PCM return have bounded polls. After WFI the
+driver captures the timer, R11/R12/R13, return ISR, wake status, pending IRQ,
+assertion and both power-status registers. An external IRQ may return WFI
+before PCM completes, in which case CPU_WAKE requests its exit and the
+forced return is not misreported as the original SPM wakeup. Cleanup
+disconnects power output, masks/acknowledges the source, stops PCM and
+restores controls, vectors and command slots. The AUXADC START bit is
+restored independently of other PMIC state; command slots are released
+even if the PMIC read fails.
+
+The timer did not advance with both output banks disconnected, despite
+correctly reading back its enable bit and compare value. Connecting R7
+fixed the counter and produced an autonomous PCM return. R0 remains off;
+no minimum-power claim follows from these retained-power tests.
+
+Build #69 passed a final three-round sequence with the fast gate disabled:
+two PCM timer sleeps of 2.000707 and 2.000699 seconds, followed by an
+11.816427-second RTC sleep. The timer returned 65539 ticks for a 65536-tick
+compare, R12=1 and wake-misc=0x002a0001, with IRQ59 pending and no forced
+exit. RTC wake reported PMIC IRQ47 and the PCM return IRQ59; R12 recorded
+the external sources and the timer remained zero. Every round restored
+four CPUs, retained the 16 MiB RAM hash and matched both power-status
+registers. R7 read 0x80, flags 0x3bf and retained source-request bits were
+set. The stopped FSM restored to 0x02848490, power IO returned to zero,
+and PWRAP preparation/restoration counts matched. An earlier single timer
+round on the same build also passed. DISP/MFG were runtime off afterward.
+
+Captures under ``out/a1260-runtime-pm/`` are ``pcm-run-69-`` followed by
+``initial.txt``, ``first-standby.txt``, ``standby.txt`` and ``resume.txt``.
+The AUXADC START commands were staged/restored, but the retained-power
+path did not exercise their 26 MHz off/on event sequence; those snapshots
+remained zero. UART/clock request coordination, CPU0 dormant context,
+GIC-loss edge replay and DDR/cluster power transitions remain separate
+work before enabling deeper sleep.
+
+Post-wake #69 regression passed a 4 MiB O_DIRECT write/fsync and two direct
+reads with identical hashes, eMMC 52 MHz with all error counters zero,
+Mali GLES pixel readback and RDMA with no underflows/abnormal frames.
+CPU policy remained 604.5--1300 MHz, GPU used simple_ondemand, and thermal,
+battery ADC, charge status and 500 mA input limit recovered. The standard
+product boot/kernel use this #69 image. Temporary RTC/timer settings,
+maintenance wake references and I/O files were cleared; plugged-in stay-on
+remains zero.
+
+One charger PM race was captured during the explicit standby checks:
+power_supply_changed_work tried to read BQ24190 current after i2c-0 was
+suspended, producing ``Transfer while suspended`` and -ESHUTDOWN. The
+resume and subsequent charge readings completed, but this workqueue/PM
+ordering needs a separate fix; these checks do not establish warning-free
+charger suspend. The full trace is ``pcm-run-69-dmesg.txt``.

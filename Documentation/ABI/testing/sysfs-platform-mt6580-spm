@@ -2,13 +2,36 @@ What:		/sys/devices/platform/10006000.power-controller/*suspend/state
 Date:		October 2026
 Contact:	FuQuan <i@fuquan.moe>
 Description:
-		Read-only diagnostic snapshot of the MT6580 staged PCM loader.
-		mode=load-only means instructions are fetched but never executed.
+		Read-only diagnostic snapshot of the MT6580 PCM suspend provider.
+		mode=load-only identifies the initial instruction-fetch stage;
+		mode=retained-run executes PCM with retention flags and clock/memory
+		requests held. R7 is connected for timer/control sequencing; R0
+		crystal control remains disconnected.
 		pcm_words and dma identify the coherent instruction buffer. loads
 		counts completed instruction fetches, not PCM sleep executions.
 		last_error is the last loader/handoff errno; loaded_fsm and
 		restored_fsm record its hardware FSM values. fsm/con0/con1/pwr_io
 		are live always-on SPM registers. No write operation is provided.
+		runs counts execution attempts, irqs counts normal IRQ handler
+		dispatches, and pending records the GIC pending state at cleanup.
+		Normal suspend return is acknowledged in the atomic entry callback,
+		so irqs may remain zero despite a real SPM timer wake. forced_exit
+		means CPU_WAKE was requested after an external IRQ returned WFI.
+		wake fields contain PCM R11/R12/R13, raw/misc/timer, return ISR,
+		event, PC, assertion and debug snapshots. power/power2 compare the
+		two power-status registers before and after the retained run.
+		timer_cfg/val/at_wake record timer setup and its state immediately
+		after WFI, before any forced PCM exit. wake_pwr_io/flags/src_req
+		record the applied R7 connection and retention constraints.
+
+What:		/sys/devices/platform/10006000.power-controller/*suspend/pcm_timer_ms
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Optional PCM timer for explicit standby, in milliseconds, 0..60000.
+		Default 0 disables it and uses external wakeup. A nonzero value
+		arms a 32.768 kHz PCM timer for the next standby entry. It neither
+		changes Android's default s2idle policy nor enables power gating.
 
 What:		/sys/devices/platform/1000f000.pmic-wrap/spm_phase
 Date:		October 2026
@@ -21,3 +44,6 @@ Description:
 		words in ADR4/WDATA4/ADR5/WDATA5 order. They are snapshots, not
 		live reads. Staging slots does not execute a PMIC command or
 		change voltage; no write operation is provided.
+		auxadc contains STRUP_CON10 saved/resume/restored snapshots. After
+		PCM execution, only its START bit is restored before releasing the
+		slots; unrelated PMIC bits are retained.
