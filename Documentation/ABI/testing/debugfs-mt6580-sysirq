@@ -1,0 +1,15 @@
+What:		/sys/kernel/debug/mt6580_sysirq
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Read-only cached MT6580 SYSIRQ polarity PM snapshots. saved values
+		are captured in syscore suspend after device IRQ setup; resume values
+		are captured before restoring changed polarity words. restored values
+		are read back after restoration, before global IRQ enable. No MMIO
+		reads are performed by the debugfs attribute. prepared indicates a
+		pending restore, saves/restores count completed callbacks, lost_words
+		counts changed words observed on resume and errors counts failed
+		restoration checks. Each polarity[n] lists saved/resume/restored.
+		Only MT6580 enables these callbacks; other SYSIRQ SoCs are unchanged.
+		Matching values with lost_words=0 qualify retention and PM ordering,
+		not actual recovery after infra power loss.

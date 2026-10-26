@@ -13,6 +13,10 @@
 #include <linux/io.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/debugfs.h>
+#include <linux/init.h>
+#include <linux/seq_file.h>
+#include <linux/syscore_ops.h>
 
 struct mtk_sysirq_chip_data {
 	raw_spinlock_t lock;
@@ -21,7 +25,92 @@ struct mtk_sysirq_chip_data {
 	u32 *intpol_words;
 	u8 *intpol_idx;
 	u16 *which_word;
+	u32 *saved_intpol, *resume_intpol, *restored_intpol;
+	u32 nr_saved_words;
+	unsigned int saves, restores, lost_words, errors;
+	bool prepared;
 };
+
+/* MT6580 has one SYSIRQ instance. Keep other SoCs' PM policy unchanged. */
+static struct mtk_sysirq_chip_data *mt6580_sysirq_pm;
+
+static int mt6580_sysirq_suspend(void)
+{
+	struct mtk_sysirq_chip_data *data = mt6580_sysirq_pm;
+	unsigned long flags;
+	u32 i, j, word = 0;
+
+	raw_spin_lock_irqsave(&data->lock, flags);
+	for (i = 0; i < data->nr_intpol_bases; i++)
+		for (j = 0; j < data->intpol_words[i]; j++)
+			data->saved_intpol[word++] = readl(data->intpol_bases[i] + j * 4);
+	data->prepared = true;
+	data->saves++;
+	raw_spin_unlock_irqrestore(&data->lock, flags);
+	return 0;
+}
+
+static void mt6580_sysirq_resume(void)
+{
+	struct mtk_sysirq_chip_data *data = mt6580_sysirq_pm;
+	unsigned long flags;
+	u32 i, j, word = 0;
+
+	raw_spin_lock_irqsave(&data->lock, flags);
+	if (!data->prepared)
+		goto out;
+	for (i = 0; i < data->nr_intpol_bases; i++) {
+		for (j = 0; j < data->intpol_words[i]; j++, word++) {
+			void __iomem *reg = data->intpol_bases[i] + j * 4;
+
+			data->resume_intpol[word] = readl(reg);
+			if (data->resume_intpol[word] != data->saved_intpol[word]) {
+				data->lost_words++;
+				writel(data->saved_intpol[word], reg);
+			}
+			data->restored_intpol[word] = readl(reg);
+			if (data->restored_intpol[word] != data->saved_intpol[word])
+				data->errors++;
+		}
+	}
+	data->restores++;
+	data->prepared = false;
+out:
+	raw_spin_unlock_irqrestore(&data->lock, flags);
+}
+
+static struct syscore_ops mt6580_sysirq_pm_ops = {
+	.suspend = mt6580_sysirq_suspend,
+	.resume = mt6580_sysirq_resume,
+};
+
+static int mt6580_sysirq_state_show(struct seq_file *s, void *unused)
+{
+	struct mtk_sysirq_chip_data *data = s->private;
+	u32 i;
+
+	/* Cached PM snapshots only: never access potentially suspended MMIO. */
+	seq_printf(s, "prepared=%u saves=%u restores=%u lost_words=%u errors=%u\n",
+		   READ_ONCE(data->prepared), READ_ONCE(data->saves),
+		   READ_ONCE(data->restores), READ_ONCE(data->lost_words),
+		   READ_ONCE(data->errors));
+	for (i = 0; i < data->nr_saved_words; i++)
+		seq_printf(s, "polarity[%u]=%08x/%08x/%08x\n", i,
+			   READ_ONCE(data->saved_intpol[i]),
+			   READ_ONCE(data->resume_intpol[i]),
+			   READ_ONCE(data->restored_intpol[i]));
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(mt6580_sysirq_state);
+
+static int __init mt6580_sysirq_debugfs_init(void)
+{
+	if (mt6580_sysirq_pm)
+		debugfs_create_file("mt6580_sysirq", 0400, NULL, mt6580_sysirq_pm,
+				    &mt6580_sysirq_state_fops);
+	return 0;
+}
+late_initcall(mt6580_sysirq_debugfs_init);
 
 static int mtk_sysirq_set_type(struct irq_data *data, unsigned int type)
 {
@@ -214,9 +303,29 @@ static int __init mtk_sysirq_of_init(struct device_node *node,
 		goto out_free_which_word;
 	}
 	raw_spin_lock_init(&chip_data->lock);
+	chip_data->nr_intpol_bases = nr_intpol_bases;
+	if (of_device_is_compatible(node, "mediatek,mt6580-sysirq")) {
+		if (mt6580_sysirq_pm) {
+			ret = -EBUSY;
+			goto out_remove_domain;
+		}
+		chip_data->nr_saved_words = intpol_num / 32;
+		chip_data->saved_intpol = kcalloc(chip_data->nr_saved_words * 3,
+						 sizeof(u32), GFP_KERNEL);
+		if (!chip_data->saved_intpol) {
+			ret = -ENOMEM;
+			goto out_remove_domain;
+		}
+		chip_data->resume_intpol = chip_data->saved_intpol + chip_data->nr_saved_words;
+		chip_data->restored_intpol = chip_data->resume_intpol + chip_data->nr_saved_words;
+		mt6580_sysirq_pm = chip_data;
+		register_syscore_ops(&mt6580_sysirq_pm_ops);
+	}
 
 	return 0;
 
+out_remove_domain:
+	irq_domain_remove(domain);
 out_free_which_word:
 	kfree(chip_data->which_word);
 out_free_intpol_idx:

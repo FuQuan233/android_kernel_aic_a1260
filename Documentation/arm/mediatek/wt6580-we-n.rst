@@ -2251,3 +2251,23 @@ is out/a1260-runtime-pm/ddrphy-97- plus check.txt, trace.txt, dmesg.txt,
 analysis.json, resume.txt and final.txt. Before allowing infra power loss,
 SYSIRQ polarity, UART context and remaining infra register ownership need
 explicit suspend/resume handling and verification.
+
+SYSIRQ polarity PM prerequisite
+-------------------------------
+
+MT6580 SYSIRQ now saves its seven polarity words in syscore suspend and
+restores changed words before global IRQ enable. Other SYSIRQ SoCs keep
+their previous PM behavior. CIRQ is registered after its SYSIRQ parent,
+so reverse syscore resume order replays CIRQ then restores polarity,
+matching the BSP flush-before-IRQ-restore order. Cached debugfs snapshots
+at mt6580_sysirq show saved/resume/restored values and cumulative counts.
+
+Kernel #98 completed the DDRPHY/clock qualification matrix and both normal
+sleep paths: success/fail 5/0; SYSIRQ saves/restores 4/4, lost_words=0 and
+errors=0. All seven snapshots matched, with nonzero words 1..4 of
+0x1741, 0x11000000, 0x02000000 and 0x003f0004. RAM, 52 MHz eMMC direct
+I/O, Mali pixel readback and zero-underflow display recovered without new
+kernel WARNING/Oops. Temporary controls and wake references were cleared.
+This verifies retention and callback ordering, not restoration after actual
+infra power loss. Evidence under out/a1260-runtime-pm is sysirq-98- plus
+check.txt, trace.txt, dmesg.txt, resume.txt and final.txt.
