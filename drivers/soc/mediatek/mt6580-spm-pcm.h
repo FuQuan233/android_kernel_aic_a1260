@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright (C) 2015 MediaTek Inc.
  * MT6580 suspend PCM from the GPL 3.18 BSP spm_v1/mt_spm_sleep.c.
- * Preserve the program unmodified; the bring-up driver only fetches it.
+ * Preserve the program unmodified; execute it with retained power.
  */
 #ifndef __MT6580_SPM_PCM_H
 #define __MT6580_SPM_PCM_H

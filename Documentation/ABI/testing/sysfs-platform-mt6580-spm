@@ -23,6 +23,16 @@ Description:
 		timer_cfg/val/at_wake record timer setup and its state immediately
 		after WFI, before any forced PCM exit. wake_pwr_io/flags/src_req
 		record the applied R7 connection and retention constraints.
+		source before/applied record the original and selected SRC_REQ;
+		CCIF event masks are preserved, APSRC bit 0 stays asserted, and
+		software F26M bit 1 is omitted only if all configured UARTs completed
+		their sleep handshake and DISP/MFG are off. blockers bits retain
+		F26M for an unready UART (0), powered DISP/MFG (1), an unqualified
+		POWER_ON_VAL0/1 baseline (2), or an existing firmware F26M request
+		(3). Source snapshots also include pre-run R13, POWER_ON_VAL0/1,
+		CLK_CON, AP_STANDBY and MMDDR_MASK. These show request ownership;
+		they do not establish that 26 MHz physically stopped. R0 output
+		remains disconnected and APSRC retained in either policy.
 
 What:		/sys/devices/platform/10006000.power-controller/*suspend/pcm_timer_ms
 Date:		October 2026

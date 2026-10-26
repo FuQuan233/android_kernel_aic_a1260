@@ -1792,3 +1792,65 @@ plugged-in stay-on remains zero. Before allowing 26 MHz or APSRC requests
 to drop, audit the other consumers and require UART handoff eligibility;
 a live-console skip must continue to retain those requests. CPU0 dormant
 context and DDR/cluster power transitions remain later work.
+
+Source-request ownership
+------------------------
+
+The MT6580 BSP assigns SRC_REQ bits 0/1 to software APSRC/F26M requests;
+bits 2/3 are CCIF event masks, not more clock holds. This board boots with
+SRC_REQ=0x0c. The retained PCM path now adds APSRC (0x0d) when every enabled
+UART completed its late-suspend handshake and both DISP/MFG are off in
+both power-status mirrors. Otherwise it also adds F26M (0x0f). It preserves
+any pre-existing firmware F26M request and every event-mask bit, and
+restores the complete original SRC_REQ on exit. DT lists the UART suppliers;
+missing enabled UARTs are rejected and the UART driver supplies a cached,
+non-sleeping readiness query. A live-console skip cannot authorize release.
+
+The source audit separates these dependencies:
+
+* APSRC remains forced for CPU0/infra/DDR retention. Removing it requires
+  separate CPU0 and memory sequencing work.
+* The new policy only omits this driver's extra F26M override. R0 crystal
+  control remains disconnected, POWER_ON_VAL0 stays zero and the qualified
+  POWER_ON_VAL1=0x60015830 baseline is not changed. An unrecognized baseline
+  also keeps F26M asserted.
+* Hardware arbitration masks in CLK_CON/AP_STANDBY/MMDDR_MASK and the
+  CCIF masks are retained. DISP/MFG state and the pre-run R13/clock/control
+  values are captured for diagnosis.
+* R13 on this board still has MD1_SRCLKENA, MD1_APSRC_REQ and AP_MD1SRC_ACK
+  asserted (bits 3/4/5). A product with no telephony does not establish
+  that the SoC's firmware modem requests are idle. MD1's domain remains on;
+  its requests must not be masked without qualifying modem ownership.
+* USB glue still keeps its clocks enabled, and PWRAP/SPM/console retain
+  their existing references. The software-request change does not qualify
+  physical 26 MHz stop, USB deep-power recovery or minimum standby current.
+
+Build #74 verified three eligible standby entries with before=0x0c,
+applied=0x0d and blockers=0: PCM timer sleeps of 1.000725/1.000731 seconds
+and an 8.649511-second RTC sleep. A live-console standby retained F26M,
+applied=0x0f/blockers=1, and slept 1.000719 seconds. Each restored the exact
+0x0c source register. POWER_ON_VAL0/1 remained 0/0x60015830, the audit
+captured CLK_CON=0x082f0000, AP_STANDBY=0x029f0000 and MMDDR_MASK=0, and
+both power-status mirrors matched before/after.
+
+Android then completed two default s2idle entries, with the last recorded
+sleep lasting 6.476948 seconds and RTC IRQ47 waking it. Total suspend
+success/failure was 6/0. The 313-event trace confirms UART late/early
+ordering for all six entries without overruns/drops. The final UART
+snapshot is requests/restores=5/5, skips=1, error=0 and clock count 2;
+four CPUs and the 16 MiB RAM hash recovered. A subsequent 4 MiB O_DIRECT
+write/fsync and two direct reads matched RAM at eMMC 52 MHz, with all MMC
+error counters zero. Mali GLES pixel readback, RDMA without underflows or
+abnormal frames, thermal and 500 mA charge-limit readings recovered.
+No new UART/I2C warning, Oops or PCM error was captured. The firmware-hold,
+unknown-baseline and powered-domain fallback branches were not injected
+on hardware; only eligible and live-console policies were exercised.
+
+Evidence under ``out/a1260-runtime-pm/`` is ``src-72-baseline.txt`` and
+``source-74-`` followed by ``initial.txt``, ``check.txt``, ``trace.txt``,
+``trace-summary.txt``, ``dmesg.txt``, ``resume.txt`` and ``final.txt``.
+Standard product boot/kernel use #74. Trace overrides, RTC/PCM timers,
+temporary files and wake references were cleared/restored; console_suspend
+is Y and plugged-in stay-on remains zero. CPU0 dormant context can next be
+qualified with these retained clock/memory constraints, before attempting
+physical clock stop or DDR/cluster transitions.

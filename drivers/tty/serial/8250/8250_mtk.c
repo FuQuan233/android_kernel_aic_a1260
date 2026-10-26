@@ -16,6 +16,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/serial_8250.h>
 #include <linux/serial_reg.h>
+#include <linux/soc/mediatek/mt6580-uart.h>
 #include <linux/console.h>
 #include <linux/dma-mapping.h>
 #include <linux/tty.h>
@@ -797,6 +798,20 @@ static struct platform_driver mtk8250_platform_driver = {
 	.probe			= mtk8250_probe,
 	.remove			= mtk8250_remove,
 };
+
+/* Atomic SPM entry queries the completed late-suspend handshake only. */
+bool mt6580_uart_sleep_ready(struct device *dev)
+{
+	struct mtk8250_data *data;
+
+	if (dev->driver != &mtk8250_platform_driver.driver)
+		return false;
+	data = dev_get_drvdata(dev);
+	return data->sleep_supported && READ_ONCE(data->sleep_prepared) &&
+		!READ_ONCE(data->sleep_error) &&
+		(READ_ONCE(data->sleep_ack) & MT6580_UART_SLEEP_BIT);
+}
+EXPORT_SYMBOL_GPL(mt6580_uart_sleep_ready);
 module_platform_driver(mtk8250_platform_driver);
 
 #ifdef CONFIG_SERIAL_8250_CONSOLE
