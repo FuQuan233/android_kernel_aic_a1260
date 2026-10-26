@@ -2644,3 +2644,61 @@ power-down or measured sleep current. Standard images are boot-axi-park.img
 and kernel-axi-park (#113). Evidence under out/a1260-runtime-pm is
 axi-113-check.txt, axi-113-clocks.json, axi-113-resume.txt,
 axi-113-dmesg.txt and axi-113-final.txt.
+
+MAINPLL power-cycle qualification
+--------------------------------
+
+The clock helper now supports an explicit MAINPLL power transaction after
+verified AXI parking. It follows mt_clkmgr.c's RSTB-clear, EN-clear,
+ISO-set, PWR-clear sequence. After PCM_RETURN it applies PWR-set, 1 us,
+ISO-clear, 1 us, EN/SDM-set, 20 us, RSTB-set, with posted-write readback
+and barriers before each delay. It never changes PCW/posdiv, AP_PLL
+ownership selectors, divider enables or MEMPLL. All unknown RMW bits are
+preserved. PWR bits above bit 1 have no documented meaning in this BSP,
+so intermediate state does not require them to match the powered-on
+baseline. Final recovery compares the complete baseline except CON1's
+bit-31 PCW-change trigger. Failed recovery retains AXI at 26 MHz and
+ownership. If abort cleanup cannot restore PLL power, the qualification
+panics before normal device resume; an off PLL is not a recoverable
+suspend error for its consumers.
+
+mainpll_control defaults false, requires axi_26m_control and all its
+single-CPU/R0/supplier guards, and affects only explicit standby. Normal
+Android mem/deep still retains the previous PLL policy. State records
+verified power-down/up counts, off/wake register values, and whether the
+powered-on state existed before any software enable. State output is
+split across sysfs_emit calls to stay within the ARM stack-frame limit.
+
+Kernel #114 passed the retained-clock, full infra/DDRPHY/F26M and external
+RTC wake cases. MAINPLL CON0 changed 0x08000011 -> 0x00000010 and PWR_CON0
+0x5 -> 0x6; the same off values were present at wake in all three cases.
+Software then restored CON0/PWR to their original values before AXI
+0x27613c16 -> 0x27613c46 and L2 recovery. Counts were 3/3, automatic=0,
+software_enable=1 and error=0. Thus the PCM had not restored the sampled
+PLL control state before software. FQMTR with a 26 MHz reference and
+4096-cycle window measured MAINPLL_D12 and AXI at 125125000 Hz before
+and after; a 32 kHz long-window measurement saturates and is not used
+as frequency evidence. These observations qualify register sequencing
+and recovery, not measured analog sleep current.
+
+Normal deep and connected-gadget retained fallback also passed with the
+control off. Total suspend success/fail was 5/1, including an alarmtimer
+pre-entry cancellation followed by a successful retry. Four CPU0 cold/L2
+returns completed with no WFI abort. The 16 MiB RAM hash matched; 52 MHz
+eMMC direct writes and two direct reads matched with zero hardware error
+counts. Mali pixel readback was correct, RDMA underflow/abnormal counts
+were zero and all four CPUs returned. Clock consistency checks passed,
+with about 2.001/2.005/8.487 seconds of sleep in the three qualification
+rounds. No new kernel WARNING/Oops was seen. Controls, RTC alarm and
+temporary wake references were cleared; Android returned to Asleep with
+the display blocker released and normal connected USB still responsive.
+
+Standard boot/kernel artifacts are boot-mainpll-power.img and
+kernel-mainpll-power (#114), retaining the first-stage fsck ramdisk.
+Evidence under out/a1260-runtime-pm is mainpll-114-check.txt,
+mainpll-114-clocks.json, mainpll-114-meter-before.txt,
+mainpll-114-meter-after.txt, mainpll-114-resume.txt,
+mainpll-114-dmesg.txt and mainpll-114-final.txt. Physical insertion/key
+wake with MAINPLL off must be checked before enabling this transaction
+for automatic deep. Suspend voltage ownership and current measurement
+remain the following work items.

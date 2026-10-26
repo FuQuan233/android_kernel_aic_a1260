@@ -10,6 +10,7 @@
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/panic.h>
 #include <linux/smp.h>
 #include <linux/soc/mediatek/mt6580-pwrap.h>
 #include <linux/soc/mediatek/mt6580-uart.h>
@@ -130,6 +131,7 @@ struct mt6580_pcm_wake {
 	bool ddrphy_requested;
 	bool infra_requested;
 	bool axi26_requested;
+	bool mainpll_requested;
 };
 
 struct mt6580_spm {
@@ -156,6 +158,7 @@ struct mt6580_spm {
 	bool ddrphy_control;
 	bool infra_control;
 	bool axi_26m_control;
+	bool mainpll_control;
 	struct mt6580_axi_context axi;
 	bool sleep_clock_ready;
 	suspend_state_t last_state;
@@ -473,7 +476,10 @@ static int mt6580_pcm_run(struct mt6580_spm *spm, enum mt6580_pcm_profile profil
 	spm->wake.ddrphy_requested = qualify ? READ_ONCE(spm->ddrphy_control) : deep;
 	spm->wake.infra_requested = qualify ? READ_ONCE(spm->infra_control) : deep;
 	spm->wake.axi26_requested = qualify && READ_ONCE(spm->axi_26m_control);
+	spm->wake.mainpll_requested = qualify && READ_ONCE(spm->mainpll_control);
 	if (spm->wake.axi26_requested && (mode != 2 || !spm->wake.r0_requested))
+		return -EINVAL;
+	if (spm->wake.mainpll_requested && !spm->wake.axi26_requested)
 		return -EINVAL;
 	if (deep && !spm->sleep_clock_ready)
 		return -ENODEV;
@@ -608,6 +614,7 @@ static int mt6580_pcm_run(struct mt6580_spm *spm, enum mt6580_pcm_profile profil
 	    readl(spm->base + PCM_SRC_REQ) != spm->wake.src_expected)
 		return -EIO;
 	if (spm->wake.axi26_requested) {
+		spm->axi.mainpll_requested = spm->wake.mainpll_requested;
 		ret = mt6580_axi_sleep_prepare(spm->clock_ctl[0], spm->clock_ctl[1],
 					      &spm->axi);
 		if (ret)
@@ -632,6 +639,12 @@ static int mt6580_pcm_run(struct mt6580_spm *spm, enum mt6580_pcm_profile profil
 		if (!ret)
 			ret = spm->axi.error;
 	}
+	/* A PLL still owned/off cannot be treated as a recoverable suspend
+	 * failure: device resume and CPU DVFS may immediately consume it.
+	 * Keep AXI on 26M and stop before the normal device-resume path.
+	 */
+	if (spm->axi.mainpll_off)
+		panic("MT6580: MAINPLL recovery failed (%d), AXI retained at 26M", ret);
 	mt6580_pcm_account_time(spm);
 	if (ret)
 		return ret;
@@ -724,6 +737,11 @@ static int mt6580_spm_enter(suspend_state_t state)
 	    num_online_cpus() != 1 ||
 	    smp_processor_id())
 		return -EINVAL;
+	/* An incomplete qualification owns the parked source until recovery. */
+	if (spm->axi.parked || spm->axi.mainpll_off) {
+		ret = -EBUSY;
+		goto out;
+	}
 	spm->last_state = state;
 	spm->deep_fallback = false;
 	spm->fallback_source = 0;
@@ -786,7 +804,9 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 {
 	struct mt6580_spm *spm = dev_get_drvdata(dev);
 
-	return sysfs_emit(buf, "mode=retained-run pcm_words=%zu dma=%pad\n"
+	ssize_t len;
+
+	len = sysfs_emit(buf, "mode=retained-run pcm_words=%zu dma=%pad\n"
 			 "entry state=%u cpu0_mode=%u fallback=%u deep_requests=%u deep_fallbacks=%u\n"
 			 "fallback source=%08x r0=%08x infra=%08x\n"
 			 "axi26 requested=%u prepared=%u parked=%u entries=%u resumes=%u error=%d\n"
@@ -876,6 +896,18 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 spm->cpu0.l2ctlr_after, spm->cpu0.cache_config, spm->cpu0.cache_after,
 			 spm->cpu0.wdt_before, spm->cpu0.wdt_armed, spm->cpu0.wdt_after,
 			 spm->cpu0.wdt_length);
+	return len + sysfs_emit_at(buf, len,
+			 "mainpll requested=%u off=%u power_downs=%u power_ups=%u\n"
+			 "mainpll_restore automatic=%u software_enable=%u\n"
+			 "mainpll_off=%08x/%08x/%08x/%08x/%08x\n"
+			 "mainpll_wake=%08x/%08x/%08x/%08x/%08x\n",
+			 spm->wake.mainpll_requested, spm->axi.mainpll_off,
+			 spm->axi.power_downs, spm->axi.power_ups,
+			 spm->axi.mainpll_auto_restored, spm->axi.mainpll_enable_written,
+			 spm->axi.pll_off[0], spm->axi.pll_off[1], spm->axi.pll_off[2],
+			 spm->axi.pll_off[3], spm->axi.pll_off[4],
+			 spm->axi.pll_wake[0], spm->axi.pll_wake[1], spm->axi.pll_wake[2],
+			 spm->axi.pll_wake[3], spm->axi.pll_wake[4]);
 }
 static DEVICE_ATTR_RO(state);
 
@@ -1054,6 +1086,30 @@ static ssize_t axi_26m_control_store(struct device *dev, struct device_attribute
 }
 static DEVICE_ATTR_RW(axi_26m_control);
 
+static ssize_t mainpll_control_show(struct device *dev, struct device_attribute *attr,
+				   char *buf)
+{
+	struct mt6580_spm *spm = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(spm->mainpll_control));
+}
+
+static ssize_t mainpll_control_store(struct device *dev, struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct mt6580_spm *spm = dev_get_drvdata(dev);
+	bool enable;
+	int ret = kstrtobool(buf, &enable);
+
+	if (ret)
+		return ret;
+	if (enable && (!spm->clock_ctl[0] || !spm->clock_ctl[1]))
+		return -ENODEV;
+	WRITE_ONCE(spm->mainpll_control, enable);
+	return count;
+}
+static DEVICE_ATTR_RW(mainpll_control);
+
 static struct attribute *mt6580_spm_attrs[] = {
 	&dev_attr_state.attr,
 	&dev_attr_pcm_timer_ms.attr,
@@ -1064,6 +1120,7 @@ static struct attribute *mt6580_spm_attrs[] = {
 	&dev_attr_ddrphy_control.attr,
 	&dev_attr_infra_control.attr,
 	&dev_attr_axi_26m_control.attr,
+	&dev_attr_mainpll_control.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(mt6580_spm);

@@ -242,3 +242,28 @@ Description:
 		Automatic mem/deep ignores this qualification switch. This qualifies
 		AXI parking as a prerequisite for later PLL ownership work; it does
 		not implement or establish MAINPLL analog power-down.
+
+What:		/sys/devices/platform/10006000.power-controller/*suspend/mainpll_control
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Boolean, default false, applying only to explicit standby qualification.
+		Requires axi_26m_control=1 and all its CPU0/R0/supplier guards. The
+		finisher first parks AXI at 26 MHz, then follows the BSP MAINPLL
+		reset/enable/isolation/power-off sequence. On PCM_RETURN it powers
+		the PLL back on, waits the BSP 1/1/20 us intervals and verifies the
+		original configuration before reconnecting AXI and recovering L2.
+		PCW/posdiv, AP_PLL selectors, divider enables and memory PLLs are
+		never programmed. Unknown power bits are preserved in each RMW;
+		only owned power bits are checked while off, with full baseline
+		comparison after recovery. CON1[31] is a PCW trigger and is excluded
+		from configuration comparison. An incomplete recovery keeps AXI
+		at 26 MHz with ownership/error retained. If PLL power recovery is
+		still incomplete after abort cleanup, the qualification panics before
+		normal device resume rather than running consumers with no clock.
+		State adds MAINPLL requested/off, verified power_downs/power_ups,
+		off/wake register snapshots and automatic/software_enable recovery
+		flags. Automatic means the original powered-on state was already
+		present before any software enable; power_ups includes that case.
+		Automatic mem/deep ignores this control. Register readback and
+		resumed frequency do not measure analog sleep current.

@@ -891,8 +891,11 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 #define MT6580_CPU_MUX_MASK	GENMASK(3, 2)
 #define MT6580_CPU_ARMPLL		BIT(2)
 #define MT6580_MAINPLL_CON0	0x120
+#define MT6580_MAINPLL_PWR_CON	0x130
 #define MT6580_MAINPLL_EN		BIT(0)
+#define MT6580_MAINPLL_SDM	BIT(4)
 #define MT6580_MAINPLL_RSTB	BIT(27)
+#define MT6580_MAINPLL_PCW_CHG	BIT(31)
 #define MT6580_PLL_PWR_ON		BIT(0)
 #define MT6580_PLL_ISO_EN		BIT(1)
 
@@ -937,7 +940,7 @@ static bool mt6580_mainpll_ready(const u32 values[5])
 	u32 enabled = MT6580_MAINPLL_EN | MT6580_MAINPLL_RSTB;
 	u32 power = MT6580_PLL_PWR_ON | MT6580_PLL_ISO_EN;
 
-	/* Preserve every other bit, including the observed PWR_CON0[2]. */
+	/* The BSP defines only these power bits; other bits may be status. */
 	return (values[0] & enabled) == enabled &&
 		(values[4] & power) == MT6580_PLL_PWR_ON;
 }
@@ -946,9 +949,34 @@ static bool mt6580_mainpll_matches(const u32 left[5], const u32 right[5])
 {
 	unsigned int i;
 
-	for (i = 0; i < 5; i++)
-		if (left[i] != right[i])
+	for (i = 0; i < 5; i++) {
+		/* CON1[31] is the BSP's PCW-change strobe, not configuration. */
+		u32 mask = i == 1 ? ~MT6580_MAINPLL_PCW_CHG : ~0U;
+
+		if ((left[i] ^ right[i]) & mask)
 			return false;
+	}
+	return true;
+}
+
+static bool mt6580_mainpll_config_matches(const u32 values[5], const u32 before[5])
+{
+	unsigned int i;
+
+	/* Intermediate PWR state has no BSP-defined semantics above bit 1.
+	 * Do not compare unknown status against its powered-on baseline here;
+	 * the caller checks owned power bits, and final matches stays strict.
+	 */
+	for (i = 0; i < 4; i++) {
+		u32 mask = ~0U;
+
+		if (!i)
+			mask &= ~(MT6580_MAINPLL_EN | MT6580_MAINPLL_SDM | MT6580_MAINPLL_RSTB);
+		else if (i == 1)
+			mask &= ~MT6580_MAINPLL_PCW_CHG;
+		if ((values[i] ^ before[i]) & mask)
+			return false;
+	}
 	return true;
 }
 
@@ -988,6 +1016,104 @@ static u32 mt6580_axi_keep_26m(struct mt6580_clk_provider *top)
 	return mt6580_axi_write_mux(top, (mux & ~MT6580_AXI_MUX_MASK) | MT6580_AXI_26M);
 }
 
+static int mt6580_mainpll_update(struct mt6580_clk_provider *pll, u32 offset,
+				u32 clear, u32 set)
+{
+	u32 value = (readl(pll->base + offset) & ~clear) | set;
+	u32 after;
+
+	mt6580_axi_sync();
+	writel(value, pll->base + offset);
+	after = readl(pll->base + offset);
+	mt6580_axi_sync();
+	return ((after ^ value) & (clear | set)) ? -EIO : 0;
+}
+
+static int mt6580_mainpll_power_down(struct mt6580_clk_provider *pll,
+				   struct mt6580_axi_context *ctx)
+{
+	u32 enable = MT6580_MAINPLL_EN | MT6580_MAINPLL_RSTB;
+	u32 power = MT6580_PLL_PWR_ON | MT6580_PLL_ISO_EN;
+	int ret;
+
+	/* Set ownership before the first write, so a partial down sequence can
+	 * be recovered by the same pre-L2 abort/resume path. AXI is already 26M.
+	 */
+	ctx->mainpll_off = true;
+	ret = mt6580_mainpll_update(pll, MT6580_MAINPLL_CON0, MT6580_MAINPLL_RSTB, 0);
+	if (!ret)
+		ret = mt6580_mainpll_update(pll, MT6580_MAINPLL_CON0, MT6580_MAINPLL_EN, 0);
+	if (!ret)
+		ret = mt6580_mainpll_update(pll, MT6580_MAINPLL_PWR_CON, 0, MT6580_PLL_ISO_EN);
+	if (!ret)
+		ret = mt6580_mainpll_update(pll, MT6580_MAINPLL_PWR_CON, MT6580_PLL_PWR_ON, 0);
+	mt6580_mainpll_snapshot(pll, ctx->pll_off);
+	if (!ret && ((ctx->pll_off[0] & enable) ||
+		     (ctx->pll_off[4] & power) != MT6580_PLL_ISO_EN ||
+		     !mt6580_mainpll_config_matches(ctx->pll_off, ctx->pll_before)))
+		ret = -EIO;
+	if (!ret)
+		ctx->power_downs++;
+	return ret;
+}
+
+static int mt6580_mainpll_power_up(struct mt6580_clk_provider *top,
+				 struct mt6580_clk_provider *pll,
+				 struct mt6580_axi_context *ctx)
+{
+	u32 enable = MT6580_MAINPLL_EN | MT6580_MAINPLL_SDM;
+	unsigned int i;
+	int ret = 0;
+
+	mt6580_mainpll_snapshot(pll, ctx->pll_wake);
+	if (mt6580_mainpll_ready(ctx->pll_wake) &&
+	    mt6580_mainpll_matches(ctx->pll_wake, ctx->pll_before)) {
+		/* Preserve evidence if hardware recovered the PLL before software.
+		 * A retry after an earlier software enable is not an automatic wake.
+		 */
+		ctx->mainpll_auto_restored = !ctx->mainpll_enable_written;
+		for (i = 0; i < ARRAY_SIZE(ctx->pll_after); i++)
+			ctx->pll_after[i] = ctx->pll_wake[i];
+		goto recovered;
+	}
+	if (!mt6580_mainpll_config_matches(ctx->pll_wake, ctx->pll_before) ||
+	    (ctx->cpu_mux_after & MT6580_CPU_MUX_MASK) != MT6580_CPU_ARMPLL) {
+		ret = -EIO;
+		goto snapshot;
+	}
+	/* Never issue a power sequence while AXI selects the unverified PLL. */
+	if ((readl(top->base) & MT6580_AXI_MUX_MASK) != MT6580_AXI_26M &&
+	    (mt6580_axi_keep_26m(top) & MT6580_AXI_MUX_MASK) != MT6580_AXI_26M) {
+		ret = -EIO;
+		goto snapshot;
+	}
+	ctx->mainpll_enable_written = true;
+	ret = mt6580_mainpll_update(pll, MT6580_MAINPLL_PWR_CON, 0, MT6580_PLL_PWR_ON);
+	if (ret)
+		goto snapshot;
+	udelay(1);
+	ret = mt6580_mainpll_update(pll, MT6580_MAINPLL_PWR_CON, MT6580_PLL_ISO_EN, 0);
+	if (ret)
+		goto snapshot;
+	udelay(1);
+	ret = mt6580_mainpll_update(pll, MT6580_MAINPLL_CON0, 0, enable);
+	if (ret)
+		goto snapshot;
+	udelay(20);
+	ret = mt6580_mainpll_update(pll, MT6580_MAINPLL_CON0, 0, MT6580_MAINPLL_RSTB);
+snapshot:
+	mt6580_mainpll_snapshot(pll, ctx->pll_after);
+	if (ret)
+		return ret;
+	if (!mt6580_mainpll_ready(ctx->pll_after) ||
+	    !mt6580_mainpll_matches(ctx->pll_after, ctx->pll_before))
+		return -EIO;
+recovered:
+	ctx->mainpll_off = false;
+	ctx->power_ups++;
+	return 0;
+}
+
 int mt6580_axi_sleep_prepare(struct device *top, struct device *pll,
 			     struct mt6580_axi_context *ctx)
 {
@@ -997,7 +1123,7 @@ int mt6580_axi_sleep_prepare(struct device *top, struct device *pll,
 
 	if (!ctx)
 		return -EINVAL;
-	if (ctx->prepared || ctx->parked)
+	if (ctx->prepared || ctx->parked || ctx->mainpll_off)
 		return mt6580_axi_error(ctx, -EBUSY);
 	ctx->error = 0;
 	if (!mt6580_axi_atomic_context())
@@ -1012,11 +1138,17 @@ int mt6580_axi_sleep_prepare(struct device *top, struct device *pll,
 	ctx->mux_wake = 0;
 	ctx->mux_after = 0;
 	ctx->cpu_mux_after = 0;
-	for (i = 0; i < ARRAY_SIZE(ctx->pll_after); i++)
+	ctx->mainpll_auto_restored = false;
+	ctx->mainpll_enable_written = false;
+	for (i = 0; i < ARRAY_SIZE(ctx->pll_after); i++) {
 		ctx->pll_after[i] = 0;
+		ctx->pll_off[i] = 0;
+		ctx->pll_wake[i] = 0;
+	}
 	if ((ctx->mux_before & MT6580_AXI_MUX_MASK) != MT6580_AXI_MPLL_D12 ||
 	    (ctx->cpu_mux_before & MT6580_CPU_MUX_MASK) != MT6580_CPU_ARMPLL ||
-	    !mt6580_mainpll_ready(ctx->pll_before))
+	    !mt6580_mainpll_ready(ctx->pll_before) ||
+	    (ctx->mainpll_requested && !(ctx->pll_before[0] & MT6580_MAINPLL_SDM)))
 		return mt6580_axi_error(ctx, -EBUSY);
 	ctx->prepared = true;
 	return 0;
@@ -1032,7 +1164,7 @@ int mt6580_axi_sleep_enter(struct device *top, struct device *pll,
 
 	if (!ctx)
 		return -EINVAL;
-	if (!ctx->prepared || ctx->parked || !mt6580_axi_atomic_context())
+	if (!ctx->prepared || ctx->parked || ctx->mainpll_off || !mt6580_axi_atomic_context())
 		return mt6580_axi_error(ctx, -EINVAL);
 	ret = mt6580_axi_get_providers(top, pll, &top_data, &pll_data);
 	if (ret)
@@ -1044,7 +1176,8 @@ int mt6580_axi_sleep_enter(struct device *top, struct device *pll,
 		return mt6580_axi_error(ctx, -EBUSY);
 	/* The finisher has left coherency. No CCF or spin lock is usable here;
 	 * one online CPU with IRQs disabled owns this bounded mux transaction.
-	 * Keep PLLs, divider enables, audio and all unrelated mux bits intact.
+	 * Keep divider enables, audio and all unrelated mux bits intact.
+	 * PLL power is touched only by the separately requested sequence below.
 	 */
 	parked = (ctx->mux_before & ~MT6580_AXI_MUX_MASK) | MT6580_AXI_26M;
 	ctx->parked = true;
@@ -1053,6 +1186,11 @@ int mt6580_axi_sleep_enter(struct device *top, struct device *pll,
 	if (ctx->mux_parked != parked) {
 		ctx->mux_parked = mt6580_axi_keep_26m(top_data);
 		return mt6580_axi_error(ctx, -EIO);
+	}
+	if (ctx->mainpll_requested) {
+		ret = mt6580_mainpll_power_down(pll_data, ctx);
+		if (ret)
+			return mt6580_axi_error(ctx, ret);
 	}
 	return 0;
 }
@@ -1068,7 +1206,7 @@ int mt6580_axi_sleep_resume(struct device *top, struct device *pll,
 	if (!ctx)
 		return -EINVAL;
 	/* Also used for aborted preparation and idempotent post-return cleanup. */
-	if (!ctx->parked) {
+	if (!ctx->parked && !ctx->mainpll_off) {
 		ctx->prepared = false;
 		return 0;
 	}
@@ -1079,7 +1217,13 @@ int mt6580_axi_sleep_resume(struct device *top, struct device *pll,
 		return mt6580_axi_error(ctx, ret);
 	ctx->mux_wake = readl(top_data->base);
 	ctx->cpu_mux_after = readl(pll_data->infra);
-	mt6580_mainpll_snapshot(pll_data, ctx->pll_after);
+	if (ctx->mainpll_off) {
+		ret = mt6580_mainpll_power_up(top_data, pll_data, ctx);
+		if (ret)
+			goto keep_26m;
+	} else {
+		mt6580_mainpll_snapshot(pll_data, ctx->pll_after);
+	}
 	select = ctx->mux_wake & MT6580_AXI_MUX_MASK;
 	if (!mt6580_mainpll_ready(ctx->pll_after) ||
 	    !mt6580_mainpll_matches(ctx->pll_after, ctx->pll_before) ||
