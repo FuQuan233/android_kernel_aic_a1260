@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/mediatek/mediatek,mt6580-spm-suspend.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: MediaTek MT6580 SPM suspend controller
+
+maintainers:
+  - FuQuan <i@fuquan.moe>
+
+description: |
+  Child of the MT6580 SCPSYS power controller. Shares the parent's SPM
+  register resource for PCM instruction loading and sleep sequencing;
+  MTCMOS power domains remain owned by SCPSYS. The PMIC wrapper supplies
+  the autonomous suspend command slots. Retained-state standby does not
+  require a separate SPM interrupt or turn off CPU0, infra or DDR.
+
+properties:
+  compatible:
+    const: mediatek,mt6580-spm-suspend
+
+  mediatek,pwrap:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: MT6580 PMIC wrapper providing the MT6350 suspend command slots
+
+required:
+  - compatible
+  - mediatek,pwrap
+
+additionalProperties: false
+
+examples:
+  - |
+    suspend {
+        compatible = "mediatek,mt6580-spm-suspend";
+        mediatek,pwrap = <&pwrap>;
+    };

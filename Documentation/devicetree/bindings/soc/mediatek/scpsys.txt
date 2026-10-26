@@ -61,6 +61,10 @@ Optional properties:
 - mfg_2d-supply: Power supply for the mfg_2d power domain
 - mfg-supply: Power supply for the mfg power domain
 
+MT6580 may also contain a suspend child as documented in
+mediatek,mt6580-spm-suspend.yaml. It shares the parent's PCM register block;
+MTCMOS domain control stays with SCPSYS.
+
 Example:
 
 	scpsys: scpsys@10006000 {
