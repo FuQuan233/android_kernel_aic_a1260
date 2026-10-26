@@ -108,6 +108,10 @@ properties:
     $ref: /schemas/iio/adc/mediatek,mt6359-auxadc.yaml#
     unevaluatedProperties: false
 
+  usb:
+    type: object
+    $ref: /schemas/extcon/mediatek,mt6350-usb.yaml#
+
   audio-codec:
     type: object
     description:

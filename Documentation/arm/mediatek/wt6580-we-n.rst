@@ -2258,8 +2258,9 @@ SYSIRQ polarity PM prerequisite
 MT6580 SYSIRQ now saves its seven polarity words in syscore suspend and
 restores changed words before global IRQ enable. Other SYSIRQ SoCs keep
 their previous PM behavior. CIRQ is registered after its SYSIRQ parent,
-so reverse syscore resume order replays CIRQ then restores polarity,
-matching the BSP flush-before-IRQ-restore order. Cached debugfs snapshots
+so syscore resume restores SYSIRQ polarity before CIRQ replay; both
+complete before global IRQ enable. Syscore suspends in reverse registration
+order and resumes in registration order. Cached debugfs snapshots
 at mt6580_sysirq show saved/resume/restored values and cumulative counts.
 
 Kernel #98 completed the DDRPHY/clock qualification matrix and both normal
@@ -2348,3 +2349,38 @@ Android still defaults to s2idle: unbounded production deep sleep requires
 replacing the 30-second qualification guard, finer sleep accounting and
 physical USB plug/wake handling. No whole-device power measurement is
 claimed.
+
+Physical USB insertion wakeup
+-----------------------------
+
+A controlled cable cycle confirmed the board wiring before adding IRQ
+handling. Plugged CHR_CON0/CHRSTATUS were 0x006b/0x00d2; unplugged they
+were 0x0001/0x00c2. Both RGS_CHRDET[5] and PCHR_CHRDET[4] followed the
+cable and the external BQ24296 online status. The MFD previously created
+no consumer for CHRDET hwirq 10, leaving no physical insertion wake source.
+
+The MT6350 USB extcon child now reports physical VBUS, handles CHRDET and
+arms it before the MFD parent's late wake-mask programming. Each IRQ
+requests a bounded five-second wake window for enumeration/supply updates.
+Current/voltage policy, BQ polling and MUSB FIFO/data handling are unchanged.
+The A1260 device fragment enables CONFIG_EXTCON_MT6350=y and DT opts into
+wakeup-source. Cached state records IRQ counts, raw values and wake arming.
+
+Kernel #104 physically slept with its screen off for an RTC-accounted
+18.492 seconds after unplugging. Insertion resumed through IRQ47
+(mt6397-pmic); CHRDET Linux IRQ59 recorded two events and online returned
+1 with no error. The user confirmed automatic wake and Windows USB
+recognition without pressing the power key, then reattached USB to WSL;
+ADB recovered. No temporary wake lock was held during this test.
+
+The subsequent infra/DDRPHY/clock qualification matrix passed another five
+entries; cumulative success/fail was 7/0. UART context remained paired,
+with 21 reset fields restored and zero errors. RAM, 52 MHz eMMC direct I/O,
+Mali pixel readback and zero-underflow display recovered without a kernel
+WARNING/Oops. Controls/timers/tracing and reconnect wake references were
+cleared. Standard images are boot-chrdet-wake.img and kernel-chrdet-wake
+(#104). Evidence under out/a1260-runtime-pm is chrdet-103-physical.txt,
+chrdet-104-plug-wake.txt, chrdet-104-plug-trace.txt, chrdet-104-infra.txt,
+chrdet-104-infra-trace.txt, chrdet-104-resume.txt, chrdet-104-final.txt and
+chrdet-104-dmesg.txt. Host bus remote-resume and bound-gadget PHY gating
+remain separate work; USB bulk debugging stays deferred.

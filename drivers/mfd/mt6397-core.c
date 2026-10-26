@@ -159,6 +159,10 @@ static const struct resource mt6350_rtc_resources[] = {
 	DEFINE_RES_IRQ(MT6350_IRQ_RTC),
 };
 
+static const struct resource mt6350_usb_resources[] = {
+	DEFINE_RES_IRQ_NAMED(MT6350_IRQ_CHRDET, "charger-detect"),
+};
+
 static const struct mfd_cell mt6350_devs[] = {
 	{
 		.name = "mt6350-keys",
@@ -173,6 +177,11 @@ static const struct mfd_cell mt6350_devs[] = {
 		.of_compatible = "mediatek,mt6350-rtc",
 		.resources = mt6350_rtc_resources,
 		.num_resources = ARRAY_SIZE(mt6350_rtc_resources),
+	}, {
+		.name = "mt6350-usb",
+		.of_compatible = "mediatek,mt6350-usb",
+		.resources = mt6350_usb_resources,
+		.num_resources = ARRAY_SIZE(mt6350_usb_resources),
 	},
 };
 

@@ -1,0 +1,15 @@
+What:		/sys/bus/platform/devices/mt6350-usb/state
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Read-only cached physical USB VBUS detector state. irq is the Linux
+		mapping for MT6350 CHRDET hwirq 10; events counts interrupt callbacks.
+		online uses CHRSTATUS[4], valid records a successful sample, and error
+		is the last regmap/extcon errno. con0 and chrstatus retain raw 16-bit
+		status words for diagnostics. No PMIC access is made by this attribute.
+		wake_armed means this suspend armed CHRDET in the parent's wake mask;
+		it returns to zero on resume. power/wakeup controls board wake policy.
+		EXTCON_USB reports VBUS presence, not USB speed, data connection or
+		charger classification. Interrupts request a bounded 5-second wake
+		window for USB enumeration and charger status updates. Charging current
+		and battery policy remain owned by the existing supply drivers.

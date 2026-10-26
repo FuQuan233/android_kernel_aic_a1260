@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/extcon/mediatek,mt6350-usb.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: MediaTek MT6350 USB VBUS detector
+
+maintainers:
+  - FuQuan <i@fuquan.moe>
+
+description:
+  Child of the MT6350 PMIC. Reports physical VBUS presence through extcon
+  and uses the PMIC CHRDET interrupt to wake the system on cable changes.
+  The parent MFD supplies the interrupt resource. This block does not
+  implement charger current, voltage or USB data-role policy.
+
+properties:
+  compatible:
+    const: mediatek,mt6350-usb
+
+  wakeup-source: true
+
+required:
+  - compatible
+
+additionalProperties: false
+
+examples:
+  - |
+    usb {
+        compatible = "mediatek,mt6350-usb";
+        wakeup-source;
+    };

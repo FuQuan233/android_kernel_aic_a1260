@@ -147,6 +147,14 @@ config EXTCON_MAX14526
 	  common inputs (USB, UART, Microphone, Stereo Audio and
 	  Composite Video) on a single micro/mini USB connector.
 
+config EXTCON_MT6350
+	tristate "MediaTek MT6350 USB VBUS detection"
+	depends on MFD_MT6397 && OF
+	help
+	  Report the MT6350 PMIC's physical USB VBUS detector and use its
+	  CHRDET interrupt to wake the system on cable changes. Charging
+	  policy remains owned by the separate charger driver.
+
 config EXTCON_PALMAS
 	tristate "Palmas USB EXTCON support"
 	depends on MFD_PALMAS

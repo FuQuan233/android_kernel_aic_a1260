@@ -618,6 +618,11 @@
 				compatible = "mediatek,mt6350-rtc";
 				wakeup-source;
 			};
+
+			usb_vbus: usb {
+				compatible = "mediatek,mt6350-usb";
+				wakeup-source;
+			};
 		};
 	};
 
