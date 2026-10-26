@@ -48,6 +48,13 @@ properties:
   phys:
     maxItems: 1
 
+  extcon:
+    maxItems: 1
+    description:
+      MT6580 physical VBUS detector with an independent, wake-capable
+      MT6350 CHRDET interrupt. Allows an offline peripheral gadget to
+      suspend its PHY while retaining cable-insertion wakeup.
+
   usb-role-switch:
     $ref: /schemas/types.yaml#/definitions/flag
     description: Support role switch. See usb/generic.txt

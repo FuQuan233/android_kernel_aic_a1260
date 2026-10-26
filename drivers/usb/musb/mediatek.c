@@ -9,6 +9,7 @@
 
 #include <linux/clk.h>
 #include <linux/dma-mapping.h>
+#include <linux/mfd/mt6350/usb.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
@@ -56,11 +57,13 @@ struct mtk_glue {
 	struct clk_bulk_data clks[MTK_MUSB_CLKS_NUM];
 	enum usb_role role;
 	struct usb_role_switch *role_sw;
+	struct device *vbus_detector;
 	bool mt6580;
 	struct wakeup_source *enumeration_ws;
 	bool clocks_gated, phy_suspended, pm_masked;
 	u32 pm_l1_mask, pm_sleeps, pm_resumes, pm_skips;
 	u32 pm_bound, pm_speed;
+	bool pm_vbus_ready;
 	int pm_error;
 };
 
@@ -517,6 +520,43 @@ static void mtk_musb_unregister_enumeration_ws(void *data)
 	wakeup_source_unregister(data);
 }
 
+static void mtk_musb_put_vbus_detector(void *data)
+{
+	put_device(data);
+}
+
+static int mtk_musb_get_vbus_detector(struct mtk_glue *glue)
+{
+	struct device *dev = glue->dev;
+	struct platform_device *pdev;
+	struct device_node *node;
+	int ret;
+
+	if (!glue->mt6580 || !of_property_present(dev->of_node, "extcon"))
+		return 0;
+	node = of_parse_phandle(dev->of_node, "extcon", 0);
+	if (!of_device_is_compatible(node, "mediatek,mt6350-usb") ||
+	    !of_device_is_available(node)) {
+		of_node_put(node);
+		return -EINVAL;
+	}
+	pdev = of_find_device_by_node(node);
+	of_node_put(node);
+	if (!pdev)
+		return -EPROBE_DEFER;
+	if (!device_is_bound(&pdev->dev)) {
+		put_device(&pdev->dev);
+		return -EPROBE_DEFER;
+	}
+	ret = devm_add_action_or_reset(dev, mtk_musb_put_vbus_detector, &pdev->dev);
+	if (ret)
+		return ret;
+	if (!device_link_add(dev, &pdev->dev, DL_FLAG_AUTOREMOVE_CONSUMER))
+		return -EINVAL;
+	glue->vbus_detector = &pdev->dev;
+	return 0;
+}
+
 static int mtk_musb_probe(struct platform_device *pdev)
 {
 	struct musb_hdrc_platform_data *pdata;
@@ -545,6 +585,9 @@ static int mtk_musb_probe(struct platform_device *pdev)
 		return ret;
 
 	glue->mt6580 = of_device_is_compatible(np, "mediatek,mt6580-musb");
+	ret = mtk_musb_get_vbus_detector(glue);
+	if (ret)
+		return dev_err_probe(dev, ret, "VBUS wake detector unavailable\n");
 	if (glue->mt6580) {
 		pdata->config = &mt6580_musb_hdrc_config;
 		dev_info(dev, "MT6580 8 KiB FIFO: bulk EP1 double buffered\n");
@@ -666,17 +709,19 @@ static int mtk_musb_suspend_late(struct device *dev)
 		return 0;
 	glue->pm_error = 0;
 	spin_lock_irqsave(&musb->lock, flags);
-	/* Keep a bound gadget listening even before enumeration: a root-adbd
-	 * handoff can outlast its bounded wake reference. Until a real VBUS
-	 * wake path is available, only an explicitly unbound gadget may lose
-	 * its PHY clocks. Active links still use their existing wake source.
+	/* A bound gadget may lose its PHY only with verified absent VBUS and
+	 * an armed, independent PMIC insertion IRQ. Errors, an online cable
+	 * or a missing/disabled detector retain the listening PHY. Active links
+	 * still use their existing wake source.
 	 */
 	glue->pm_bound = !!musb->gadget_driver;
 	glue->pm_speed = musb->g.speed;
+	glue->pm_vbus_ready = glue->vbus_detector &&
+		mt6350_usb_suspend_ready(glue->vbus_detector);
 	/* MUSB stop clears gadget_driver but can retain the old negotiated
 	 * speed. That stale speed does not represent a link after unbind.
 	 */
-	if (glue->pm_bound) {
+	if (glue->pm_bound && !glue->pm_vbus_ready) {
 		glue->pm_skips++;
 		spin_unlock_irqrestore(&musb->lock, flags);
 		return 0;
@@ -743,10 +788,10 @@ static ssize_t pm_state_show(struct device *dev, struct device_attribute *attr, 
 	/* Cached: reading this attribute never wakes or touches the USB core. */
 	return sysfs_emit(buf,
 		"gated=%u masked=%u sleeps=%u resumes=%u skips=%u error=%d "
-		"l1_mask=%08x phy_off=%u bound=%u speed=%u\n",
+		"l1_mask=%08x phy_off=%u bound=%u speed=%u vbus_ready=%u\n",
 		glue->clocks_gated, glue->pm_masked, glue->pm_sleeps,
 		glue->pm_resumes, glue->pm_skips, glue->pm_error, glue->pm_l1_mask,
-		glue->phy_suspended, glue->pm_bound, glue->pm_speed);
+		glue->phy_suspended, glue->pm_bound, glue->pm_speed, glue->pm_vbus_ready);
 }
 static DEVICE_ATTR_RO(pm_state);
 

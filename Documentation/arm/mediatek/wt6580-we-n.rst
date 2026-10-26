@@ -2452,3 +2452,32 @@ WARNING/Oops. Temporary controls, alarms, tracing and wake references
 were cleared. Evidence is out/a1260-runtime-pm/long-sleep-106-{check,
 repeat,trace,resume,dmesg,final}.txt. This qualifies long explicit standby;
 Android's automatic deep-suspend policy is still separate work.
+
+Bound offline USB PHY clock gating
+-----------------------------------
+
+The optional MT6580 MUSB extcon phandle now links the MT6350 detector as a
+PM supplier. Before late USB suspend, the detector refreshes its cached
+VBUS sample and arms CHRDET. A non-sleeping provider query permits a bound
+gadget to gate PHY/parent clocks only when VBUS is absent, the read
+succeeded, wakeup is enabled and the independent IRQ is armed. Missing,
+online, disabled or failed detection keeps the listening PHY. This does
+not infer physical cable state from gadget speed, which can be stale.
+No role, FIFO, bulk-transfer or charger-current policy is changed.
+
+Kernel #107 passed the five-entry infra matrix: unbound PHY gates and
+restores four times, while a bound gadget on the connected host skips
+power-off. RAM, eMMC/GPU/display checks passed. During physical unplug the
+gadget stayed bound and the provider qualified absent VBUS/wake arming.
+Automatic s2idle then gated/restored PHY and parent clocks once, raising
+sleeps/resumes to 5/5 with vbus_ready=1 and error=0. Insertion woke through
+PMIC IRQ47 after 31.899853 seconds of suspended time. CHRDET counted two
+events and returned online=1 with no error. The user confirmed automatic
+wake and USB recognition, then reattached to WSL; ADB recovered. Total
+success/fail was 6/1, with one pre-sleep pending event, not a resume error.
+Host bus-resume with VBUS continuously present remains unqualified.
+
+Evidence is out/a1260-runtime-pm/vbus-phy-107-{infra,infra-trace,resume,
+physical,physical-trace,after-plug,final,dmesg}.txt. The physical cycle
+used ordinary s2idle, not automatic CPU0/infra deep power-down. That
+production suspend entry remains the next step.

@@ -903,6 +903,7 @@
 			 <&apmixedsys CLK_MT6580_APMIXED_UNIV48M>;
 		clock-names = "main", "mcu", "univpll";
 		phys = <&usbphy>;
+		extcon = <&usb_vbus>;
 		dr_mode = "peripheral";
 	};
 };

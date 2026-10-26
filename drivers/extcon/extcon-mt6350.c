@@ -3,6 +3,7 @@
 #include <linux/extcon-provider.h>
 #include <linux/interrupt.h>
 #include <linux/mfd/mt6350/registers.h>
+#include <linux/mfd/mt6350/usb.h>
 #include <linux/mfd/mt6397/core.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -50,11 +51,11 @@ static int mt6350_usb_sample(struct mt6350_usb *usb, bool irq_event)
 		ret = extcon_set_state_sync(usb->edev, EXTCON_USB, online);
 		if (ret)
 			goto out;
-		usb->online = online;
-		usb->valid = true;
+		WRITE_ONCE(usb->online, online);
+		WRITE_ONCE(usb->valid, true);
 	}
 out:
-	usb->error = ret;
+	WRITE_ONCE(usb->error, ret);
 	mutex_unlock(&usb->lock);
 	return ret;
 }
@@ -143,12 +144,15 @@ static int mt6350_usb_suspend(struct device *dev)
 	struct mt6350_usb *usb = dev_get_drvdata(dev);
 	int ret;
 
+	ret = mt6350_usb_sample(usb, false);
+	if (ret)
+		return ret;
 	if (!device_may_wakeup(dev))
 		return 0;
 	/* Arm before the MFD parent's late callback installs its wake mask. */
 	ret = enable_irq_wake(usb->irq);
 	if (!ret)
-		usb->wake_armed = true;
+		WRITE_ONCE(usb->wake_armed, true);
 	return ret;
 }
 
@@ -161,7 +165,7 @@ static int mt6350_usb_resume(struct device *dev)
 		ret = disable_irq_wake(usb->irq);
 		if (ret)
 			return ret;
-		usb->wake_armed = false;
+		WRITE_ONCE(usb->wake_armed, false);
 	}
 	return mt6350_usb_sample(usb, false);
 }
@@ -183,6 +187,19 @@ static struct platform_driver mt6350_usb_driver = {
 		.dev_groups = mt6350_usb_groups,
 	},
 };
+
+bool mt6350_usb_suspend_ready(struct device *dev)
+{
+	struct mt6350_usb *usb;
+
+	if (dev->driver != &mt6350_usb_driver.driver || !device_may_wakeup(dev))
+		return false;
+	usb = dev_get_drvdata(dev);
+	return READ_ONCE(usb->valid) && !READ_ONCE(usb->online) &&
+		!READ_ONCE(usb->error) && READ_ONCE(usb->wake_armed);
+}
+EXPORT_SYMBOL_GPL(mt6350_usb_suspend_ready);
+
 module_platform_driver(mt6350_usb_driver);
 
 MODULE_DESCRIPTION("MT6350 USB VBUS detection and wakeup");
