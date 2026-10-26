@@ -221,3 +221,24 @@ Description:
 		After physical insertion wake across CPU0/infra/DDRPHY power-down
 		and clock stop passed, the device selects mem_sleep_default=deep.
 		MAINPLL and suspend-voltage policy remain retained.
+
+What:		/sys/devices/platform/10006000.power-controller/*suspend/axi_26m_control
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Boolean, default false, applying only to explicit standby qualification.
+		Requires cpu0_mode=2, r0_control=1 and their UART/domain/source guards.
+		TOPCKGEN and APMIXED suppliers must be bound through the optional
+		mediatek,clock-controllers phandles. CPU must use ARMPLL, AXI must
+		use the board's MAINPLL_D12 selection, and MAINPLL must be enabled,
+		unisolated and powered with its reset released.
+		Immediately before PCM_KICK, the single-CPU/IRQs-off finisher switches
+		AXI[7:4] from 4 (MAINPLL_D12) to 1 (26 MHz). Selection zero is not
+		used. After PCM_RETURN, AXI is restored before sibling-core/L2 recovery.
+		The helper preserves all other mux bits and PLL configuration/power.
+		Cached state adds axi26 requested/prepared/parked/counts/error,
+		AXI before/parked/wake/restored and CPU mux snapshots, plus MAINPLL
+		CON0/1/2/3 and PWR_CON0 before/after. PWR_CON0 is offset 0x130.
+		Automatic mem/deep ignores this qualification switch. This qualifies
+		AXI parking as a prerequisite for later PLL ownership work; it does
+		not implement or establish MAINPLL analog power-down.

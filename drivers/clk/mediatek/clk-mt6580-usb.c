@@ -4,16 +4,35 @@
 #include <linux/clk-provider.h>
 #include <linux/delay.h>
 #include <linux/io.h>
+#include <linux/irqflags.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
+#include <linux/smp.h>
+#include <linux/soc/mediatek/mt6580-mainpll.h>
+
+#include <asm/barrier.h>
 #include "clk-gate.h"
 #include "clk-mtk.h"
 
 #include <dt-bindings/clock/mt6580-clk.h>
 
 static DEFINE_SPINLOCK(mt6580_usb_clk_lock);
+
+struct mt6580_clk_provider {
+	void __iomem *base;
+	void __iomem *infra;
+	struct clk_hw_onecell_data *hws;
+	bool top, apmixed;
+};
+
+static struct platform_driver mt6580_usb_clk_driver;
+/* MFGCFG shares this driver but uses mtk_clk_simple's private data. Only
+ * these probe-validated bank identities may expose mt6580_clk_provider.
+ */
+static struct device *mt6580_top_device;
+static struct device *mt6580_pll_device;
 
 struct mt6580_cpu_clk {
 	struct clk_hw hw;
@@ -110,7 +129,7 @@ static const struct clk_ops mt6580_cpu_ops = {
 };
 
 static struct clk_hw *mt6580_register_cpu_clk(struct platform_device *pdev,
-					    void __iomem *base)
+					    void __iomem *base, void __iomem *infra)
 {
 	struct device *dev = &pdev->dev;
 	struct mt6580_cpu_clk *cpu;
@@ -125,9 +144,7 @@ static struct clk_hw *mt6580_register_cpu_clk(struct platform_device *pdev,
 	if (!cpu)
 		return ERR_PTR(-ENOMEM);
 	cpu->pll = base;
-	cpu->infra = devm_platform_ioremap_resource(pdev, 1);
-	if (IS_ERR(cpu->infra))
-		return ERR_CAST(cpu->infra);
+	cpu->infra = infra;
 	cpu->hw.init = &init;
 	ret = devm_clk_hw_register(dev, &cpu->hw);
 	return ret ? ERR_PTR(ret) : &cpu->hw;
@@ -721,6 +738,7 @@ static unsigned long mt6580_uart_clk_flags(void __iomem *base, unsigned int id)
 static int mt6580_usb_clk_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	struct mt6580_clk_provider *provider;
 	struct clk_hw_onecell_data *data;
 	struct clk_hw *source;
 	void __iomem *base;
@@ -737,10 +755,22 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
 		return PTR_ERR(base);
+	provider = devm_kzalloc(dev, sizeof(*provider), GFP_KERNEL);
+	if (!provider)
+		return -ENOMEM;
+	provider->base = base;
+	provider->top = top;
+	provider->apmixed = of_device_is_compatible(dev->of_node, "mediatek,mt6580-apmixedsys");
+	if (!top) {
+		provider->infra = devm_platform_ioremap_resource(pdev, 1);
+		if (IS_ERR(provider->infra))
+			return PTR_ERR(provider->infra);
+	}
 	data = devm_kzalloc(dev, struct_size(data, hws, count), GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
 	data->num = count;
+	provider->hws = data;
 
 	if (top) {
 		struct clk *parent;
@@ -826,7 +856,8 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 			mt6580_register_pll(dev, base + 0x140, "mt6580_upll", true);
 		if (IS_ERR(data->hws[CLK_MT6580_APMIXED_UNIVPLL]))
 			return PTR_ERR(data->hws[CLK_MT6580_APMIXED_UNIVPLL]);
-		data->hws[CLK_MT6580_APMIXED_CPU] = mt6580_register_cpu_clk(pdev, base);
+		data->hws[CLK_MT6580_APMIXED_CPU] =
+			mt6580_register_cpu_clk(pdev, base, provider->infra);
 		source = devm_clk_hw_register_fixed_factor(dev, "mt6580_usb_48m_src",
 						         "mt6580_upll", 0, 1, 26);
 		if (IS_ERR(source))
@@ -843,8 +874,237 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 		if (IS_ERR(data->hws[i]))
 			return PTR_ERR(data->hws[i]);
 
-	return devm_of_clk_add_hw_provider(dev, of_clk_hw_onecell_get, data);
+	ret = devm_of_clk_add_hw_provider(dev, of_clk_hw_onecell_get, data);
+	if (ret)
+		return ret;
+	platform_set_drvdata(pdev, provider);
+	if (provider->top)
+		WRITE_ONCE(mt6580_top_device, dev);
+	if (provider->apmixed)
+		WRITE_ONCE(mt6580_pll_device, dev);
+	return 0;
 }
+
+#define MT6580_AXI_MUX_MASK	GENMASK(7, 4)
+#define MT6580_AXI_26M		BIT(4)
+#define MT6580_AXI_MPLL_D12	BIT(6)
+#define MT6580_CPU_MUX_MASK	GENMASK(3, 2)
+#define MT6580_CPU_ARMPLL		BIT(2)
+#define MT6580_MAINPLL_CON0	0x120
+#define MT6580_MAINPLL_EN		BIT(0)
+#define MT6580_MAINPLL_RSTB	BIT(27)
+#define MT6580_PLL_PWR_ON		BIT(0)
+#define MT6580_PLL_ISO_EN		BIT(1)
+
+static int mt6580_axi_get_providers(struct device *top, struct device *pll,
+				   struct mt6580_clk_provider **top_data,
+				   struct mt6580_clk_provider **pll_data)
+{
+	if (!top || !pll || top->driver != &mt6580_usb_clk_driver.driver ||
+	    pll->driver != &mt6580_usb_clk_driver.driver ||
+	    top != READ_ONCE(mt6580_top_device) || pll != READ_ONCE(mt6580_pll_device))
+		return -ENODEV;
+	/* Compatible roles were checked at probe. Do not call OF helpers in
+	 * the coherency-off finisher: their devtree lock is not usable there.
+	 * The caller owns bound suppliers through device links; only inspect
+	 * private data after validating the driver and probe-published identity.
+	 */
+	*top_data = dev_get_drvdata(top);
+	*pll_data = dev_get_drvdata(pll);
+	if (!*top_data || !*pll_data || !(*top_data)->top || !(*pll_data)->apmixed ||
+	    !(*top_data)->base || !(*top_data)->hws ||
+	    !(*pll_data)->base || !(*pll_data)->infra || !(*pll_data)->hws)
+		return -ENODEV;
+	return 0;
+}
+
+static bool mt6580_axi_atomic_context(void)
+{
+	return irqs_disabled() && num_online_cpus() == 1 && !smp_processor_id();
+}
+
+static void mt6580_mainpll_snapshot(struct mt6580_clk_provider *pll, u32 values[5])
+{
+	unsigned int i;
+
+	/* CON0/CON1/CON2/CON3/PWR_CON0: the power word is +0x130. */
+	for (i = 0; i < 5; i++)
+		values[i] = readl(pll->base + MT6580_MAINPLL_CON0 + i * 4);
+}
+
+static bool mt6580_mainpll_ready(const u32 values[5])
+{
+	u32 enabled = MT6580_MAINPLL_EN | MT6580_MAINPLL_RSTB;
+	u32 power = MT6580_PLL_PWR_ON | MT6580_PLL_ISO_EN;
+
+	/* Preserve every other bit, including the observed PWR_CON0[2]. */
+	return (values[0] & enabled) == enabled &&
+		(values[4] & power) == MT6580_PLL_PWR_ON;
+}
+
+static bool mt6580_mainpll_matches(const u32 left[5], const u32 right[5])
+{
+	unsigned int i;
+
+	for (i = 0; i < 5; i++)
+		if (left[i] != right[i])
+			return false;
+	return true;
+}
+
+static int mt6580_axi_error(struct mt6580_axi_context *ctx, int error)
+{
+	if (!ctx->error)
+		ctx->error = error;
+	return error;
+}
+
+static void mt6580_axi_sync(void)
+{
+#if defined(CONFIG_ARM) || defined(CONFIG_ARM64)
+	/* Keep the finisher independent of outer-cache locking. */
+	dsb(sy);
+	isb();
+#else
+	/* This driver can also be selected by COMPILE_TEST. */
+	mb();
+#endif
+}
+
+static u32 mt6580_axi_write_mux(struct mt6580_clk_provider *top, u32 mux)
+{
+	mt6580_axi_sync();
+	writel(mux, top->base);
+	mux = readl(top->base);
+	mt6580_axi_sync();
+	return mux;
+}
+
+static u32 mt6580_axi_keep_26m(struct mt6580_clk_provider *top)
+{
+	u32 mux = readl(top->base);
+
+	/* The BSP's AXI 26 MHz encoding is 1, not the unmapped value 0. */
+	return mt6580_axi_write_mux(top, (mux & ~MT6580_AXI_MUX_MASK) | MT6580_AXI_26M);
+}
+
+int mt6580_axi_sleep_prepare(struct device *top, struct device *pll,
+			     struct mt6580_axi_context *ctx)
+{
+	struct mt6580_clk_provider *top_data, *pll_data;
+	unsigned int i;
+	int ret;
+
+	if (!ctx)
+		return -EINVAL;
+	if (ctx->prepared || ctx->parked)
+		return mt6580_axi_error(ctx, -EBUSY);
+	ctx->error = 0;
+	if (!mt6580_axi_atomic_context())
+		return mt6580_axi_error(ctx, -EINVAL);
+	ret = mt6580_axi_get_providers(top, pll, &top_data, &pll_data);
+	if (ret)
+		return mt6580_axi_error(ctx, ret);
+	ctx->mux_before = readl(top_data->base);
+	ctx->cpu_mux_before = readl(pll_data->infra);
+	mt6580_mainpll_snapshot(pll_data, ctx->pll_before);
+	ctx->mux_parked = 0;
+	ctx->mux_wake = 0;
+	ctx->mux_after = 0;
+	ctx->cpu_mux_after = 0;
+	for (i = 0; i < ARRAY_SIZE(ctx->pll_after); i++)
+		ctx->pll_after[i] = 0;
+	if ((ctx->mux_before & MT6580_AXI_MUX_MASK) != MT6580_AXI_MPLL_D12 ||
+	    (ctx->cpu_mux_before & MT6580_CPU_MUX_MASK) != MT6580_CPU_ARMPLL ||
+	    !mt6580_mainpll_ready(ctx->pll_before))
+		return mt6580_axi_error(ctx, -EBUSY);
+	ctx->prepared = true;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mt6580_axi_sleep_prepare);
+
+int mt6580_axi_sleep_enter(struct device *top, struct device *pll,
+			   struct mt6580_axi_context *ctx)
+{
+	struct mt6580_clk_provider *top_data, *pll_data;
+	u32 mainpll[5], parked;
+	int ret;
+
+	if (!ctx)
+		return -EINVAL;
+	if (!ctx->prepared || ctx->parked || !mt6580_axi_atomic_context())
+		return mt6580_axi_error(ctx, -EINVAL);
+	ret = mt6580_axi_get_providers(top, pll, &top_data, &pll_data);
+	if (ret)
+		return mt6580_axi_error(ctx, ret);
+	mt6580_mainpll_snapshot(pll_data, mainpll);
+	if (readl(top_data->base) != ctx->mux_before ||
+	    readl(pll_data->infra) != ctx->cpu_mux_before ||
+	    !mt6580_mainpll_matches(mainpll, ctx->pll_before))
+		return mt6580_axi_error(ctx, -EBUSY);
+	/* The finisher has left coherency. No CCF or spin lock is usable here;
+	 * one online CPU with IRQs disabled owns this bounded mux transaction.
+	 * Keep PLLs, divider enables, audio and all unrelated mux bits intact.
+	 */
+	parked = (ctx->mux_before & ~MT6580_AXI_MUX_MASK) | MT6580_AXI_26M;
+	ctx->parked = true;
+	ctx->entries++;
+	ctx->mux_parked = mt6580_axi_write_mux(top_data, parked);
+	if (ctx->mux_parked != parked) {
+		ctx->mux_parked = mt6580_axi_keep_26m(top_data);
+		return mt6580_axi_error(ctx, -EIO);
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mt6580_axi_sleep_enter);
+
+int mt6580_axi_sleep_resume(struct device *top, struct device *pll,
+			    struct mt6580_axi_context *ctx)
+{
+	struct mt6580_clk_provider *top_data, *pll_data;
+	u32 select;
+	int ret;
+
+	if (!ctx)
+		return -EINVAL;
+	/* Also used for aborted preparation and idempotent post-return cleanup. */
+	if (!ctx->parked) {
+		ctx->prepared = false;
+		return 0;
+	}
+	if (!ctx->prepared || !mt6580_axi_atomic_context())
+		return mt6580_axi_error(ctx, -EINVAL);
+	ret = mt6580_axi_get_providers(top, pll, &top_data, &pll_data);
+	if (ret)
+		return mt6580_axi_error(ctx, ret);
+	ctx->mux_wake = readl(top_data->base);
+	ctx->cpu_mux_after = readl(pll_data->infra);
+	mt6580_mainpll_snapshot(pll_data, ctx->pll_after);
+	select = ctx->mux_wake & MT6580_AXI_MUX_MASK;
+	if (!mt6580_mainpll_ready(ctx->pll_after) ||
+	    !mt6580_mainpll_matches(ctx->pll_after, ctx->pll_before) ||
+	    ctx->cpu_mux_after != ctx->cpu_mux_before ||
+	    (ctx->cpu_mux_after & MT6580_CPU_MUX_MASK) != MT6580_CPU_ARMPLL ||
+	    (ctx->mux_wake & ~MT6580_AXI_MUX_MASK) !=
+		(ctx->mux_before & ~MT6580_AXI_MUX_MASK) ||
+	    (select != MT6580_AXI_26M && select != MT6580_AXI_MPLL_D12))
+		goto keep_26m;
+	ctx->mux_after = mt6580_axi_write_mux(top_data, ctx->mux_before);
+	if (ctx->mux_after != ctx->mux_before)
+		goto keep_26m;
+	ctx->parked = false;
+	ctx->prepared = false;
+	ctx->resumes++;
+	return ctx->error;
+
+keep_26m:
+	/* Never reconnect AXI to a PLL with unverified state. Keep ownership
+	 * and the original snapshot for a later abort cleanup or diagnosis.
+	 */
+	ctx->mux_after = mt6580_axi_keep_26m(top_data);
+	return mt6580_axi_error(ctx, -EIO);
+}
+EXPORT_SYMBOL_GPL(mt6580_axi_sleep_resume);
 
 static const struct of_device_id mt6580_usb_clk_match[] = {
 	{ .compatible = "mediatek,mt6580-topckgen" },
@@ -856,6 +1116,10 @@ MODULE_DEVICE_TABLE(of, mt6580_usb_clk_match);
 
 static void mt6580_usb_clk_remove(struct platform_device *pdev)
 {
+	if (&pdev->dev == READ_ONCE(mt6580_top_device))
+		WRITE_ONCE(mt6580_top_device, NULL);
+	if (&pdev->dev == READ_ONCE(mt6580_pll_device))
+		WRITE_ONCE(mt6580_pll_device, NULL);
 	if (of_device_is_compatible(pdev->dev.of_node, "mediatek,mt6580-mfgcfg"))
 		mtk_clk_simple_remove(pdev);
 }

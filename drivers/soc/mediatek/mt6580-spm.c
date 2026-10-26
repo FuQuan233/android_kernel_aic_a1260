@@ -17,6 +17,7 @@
 #include <linux/soc/mediatek/mt6580-cpu-pm.h>
 #include <linux/soc/mediatek/mt6580-ddr.h>
 #include <linux/soc/mediatek/mt6580-irq.h>
+#include <linux/soc/mediatek/mt6580-mainpll.h>
 #include <linux/suspend.h>
 
 #include <asm/arch_timer.h>
@@ -120,7 +121,7 @@ struct mt6580_pcm_wake {
 	u32 ifr_before, ifr_after, ifrsram_before, ifrsram_after, infra_blockers;
 	u32 time_ticks_start, time_ticks_end;
 	u64 time_counter_start, time_counter_end, stopped_ns;
-	bool time_started;
+	bool time_started, pcm_started;
 	int ddr_check_before, ddr_check_after;
 	bool irq_pending, forced_exit;
 	bool r0_requested, settle_changed;
@@ -128,12 +129,15 @@ struct mt6580_pcm_wake {
 	bool f26m_requested;
 	bool ddrphy_requested;
 	bool infra_requested;
+	bool axi26_requested;
 };
 
 struct mt6580_spm {
 	struct device *dev;
 	struct device *pwrap;
 	struct device *ddr;
+	/* TOPCKGEN followed by APMIXED, both owned by the clock provider. */
+	struct device *clock_ctl[2];
 	struct device *uarts[2];
 	unsigned int num_uarts;
 	struct device *usbs[1];
@@ -151,6 +155,8 @@ struct mt6580_spm {
 	bool f26m_control;
 	bool ddrphy_control;
 	bool infra_control;
+	bool axi_26m_control;
+	struct mt6580_axi_context axi;
 	bool sleep_clock_ready;
 	suspend_state_t last_state;
 	unsigned int deep_requests, deep_fallbacks;
@@ -353,6 +359,7 @@ static int mt6580_pcm_wait_finish(unsigned long arg)
 {
 	struct mt6580_spm *spm = (void *)arg;
 	u32 val;
+	int ret;
 
 	/* PCM must have finished its CPU/TOP sequencing before the BSP's
 	 * sibling-core L2 recovery is allowed to access those power registers.
@@ -362,17 +369,32 @@ static int mt6580_pcm_wait_finish(unsigned long arg)
 		spm->wake.forced_exit = true;
 		writel(1, spm->base + SPM_CPU_WAKE);
 	}
-	return readl_poll_timeout_atomic(spm->base + SPM_ISR_STATUS, val,
-					val & PCM_RETURN, 1, 100000);
+	ret = readl_poll_timeout_atomic(spm->base + SPM_ISR_STATUS, val,
+				       val & PCM_RETURN, 1, 100000);
+	/* Run on the parked AXI source until PCM has restored the domains.
+	 * Restore before sibling-core/L2 recovery; report a mux error after
+	 * that required recovery, without confusing it with a PCM timeout.
+	 */
+	if (!ret && spm->wake.axi26_requested)
+		mt6580_axi_sleep_resume(spm->clock_ctl[0], spm->clock_ctl[1], &spm->axi);
+	return ret;
 }
 
 static int mt6580_pcm_idle_finish(unsigned long arg)
 {
 	struct mt6580_spm *spm = (void *)arg;
 	u32 con0 = readl(spm->base + PCM_CON0) & ~(PCM_KICK | PCM_IM_KICK);
+	int ret;
 
+	if (spm->wake.axi26_requested) {
+		ret = mt6580_axi_sleep_enter(spm->clock_ctl[0], spm->clock_ctl[1],
+					    &spm->axi);
+		if (ret)
+			return ret;
+	}
 	writel(PCM_KEY | con0 | PCM_KICK, spm->base + PCM_CON0);
 	writel(PCM_KEY | con0, spm->base + PCM_CON0);
+	spm->wake.pcm_started = true;
 	if (spm->sleep_clock_ready) {
 		spm->wake.time_counter_start = __arch_counter_get_cntpct();
 		spm->wake.time_ticks_start = readl(spm->base + PCM_TIMER_OUT);
@@ -442,7 +464,7 @@ static int mt6580_pcm_run(struct mt6580_spm *spm, enum mt6580_pcm_profile profil
 	bool deep = profile == MT6580_PCM_DEEP;
 	u32 con1, ticks = qualify ? READ_ONCE(spm->timer_ms) * 32768 / 1000 : 0;
 	unsigned int mode = qualify ? READ_ONCE(spm->cpu0_mode) : (deep ? 2 : 0);
-	int i, ret, capture;
+	int i, ret, capture, restore;
 
 	spm->wake.cpu0_mode = mode;
 	spm->wake.r0_requested = qualify ? READ_ONCE(spm->r0_control) : deep;
@@ -450,6 +472,9 @@ static int mt6580_pcm_run(struct mt6580_spm *spm, enum mt6580_pcm_profile profil
 	spm->wake.f26m_requested = qualify ? READ_ONCE(spm->f26m_control) : deep;
 	spm->wake.ddrphy_requested = qualify ? READ_ONCE(spm->ddrphy_control) : deep;
 	spm->wake.infra_requested = qualify ? READ_ONCE(spm->infra_control) : deep;
+	spm->wake.axi26_requested = qualify && READ_ONCE(spm->axi_26m_control);
+	if (spm->wake.axi26_requested && (mode != 2 || !spm->wake.r0_requested))
+		return -EINVAL;
 	if (deep && !spm->sleep_clock_ready)
 		return -ENODEV;
 	spm->wake.dpy_before = readl(spm->base + SPM_DPY_PWR_CON);
@@ -582,12 +607,31 @@ static int mt6580_pcm_run(struct mt6580_spm *spm, enum mt6580_pcm_profile profil
 	if (readl(spm->base + PCM_FLAGS) != spm->wake.flags_expected ||
 	    readl(spm->base + PCM_SRC_REQ) != spm->wake.src_expected)
 		return -EIO;
+	if (spm->wake.axi26_requested) {
+		ret = mt6580_axi_sleep_prepare(spm->clock_ctl[0], spm->clock_ctl[1],
+					      &spm->axi);
+		if (ret)
+			return ret;
+	}
 	writel(spm->wake.pwr_io_expected, spm->base + PCM_PWR_IO_EN);
 	if (mode)
 		ret = mt6580_cpu0_suspend(&spm->cpu0, mode, mt6580_pcm_idle_finish,
 					 mt6580_pcm_wait_finish, (unsigned long)spm);
 	else
 		ret = mt6580_pcm_idle_finish((unsigned long)spm);
+	/* Also clean up a notifier/finisher abort before wait_finish ran. */
+	if (spm->wake.axi26_requested) {
+		if (!spm->wake.pcm_started ||
+		    (readl(spm->base + SPM_ISR_STATUS) & PCM_RETURN))
+			restore = mt6580_axi_sleep_resume(spm->clock_ctl[0],
+							 spm->clock_ctl[1], &spm->axi);
+		else
+			restore = -ETIMEDOUT;
+		if (!ret)
+			ret = restore;
+		if (!ret)
+			ret = spm->axi.error;
+	}
 	mt6580_pcm_account_time(spm);
 	if (ret)
 		return ret;
@@ -745,6 +789,10 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 	return sysfs_emit(buf, "mode=retained-run pcm_words=%zu dma=%pad\n"
 			 "entry state=%u cpu0_mode=%u fallback=%u deep_requests=%u deep_fallbacks=%u\n"
 			 "fallback source=%08x r0=%08x infra=%08x\n"
+			 "axi26 requested=%u prepared=%u parked=%u entries=%u resumes=%u error=%d\n"
+			 "axi_mux=%08x/%08x/%08x/%08x cpu_mux=%08x/%08x\n"
+			 "mainpll con0=%08x/%08x con1=%08x/%08x con2=%08x/%08x\n"
+			 "mainpll con3=%08x/%08x power=%08x/%08x\n"
 			 "loads=%u last_error=%d loaded_fsm=%08x restored_fsm=%08x\n"
 			 "fsm=%08x con0=%08x con1=%08x pwr_io=%08x\n"
 			 "runs=%u irqs=%u irq=%d irq_status=%08x pending=%u forced_exit=%u timer_ms=%u\n"
@@ -771,6 +819,16 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 spm->last_state, spm->wake.cpu0_mode, spm->deep_fallback,
 			 spm->deep_requests, spm->deep_fallbacks,
 			 spm->fallback_source, spm->fallback_r0, spm->fallback_infra,
+			 spm->wake.axi26_requested, spm->axi.prepared, spm->axi.parked,
+			 spm->axi.entries, spm->axi.resumes, spm->axi.error,
+			 spm->axi.mux_before, spm->axi.mux_parked,
+			 spm->axi.mux_wake, spm->axi.mux_after,
+			 spm->axi.cpu_mux_before, spm->axi.cpu_mux_after,
+			 spm->axi.pll_before[0], spm->axi.pll_after[0],
+			 spm->axi.pll_before[1], spm->axi.pll_after[1],
+			 spm->axi.pll_before[2], spm->axi.pll_after[2],
+			 spm->axi.pll_before[3], spm->axi.pll_after[3],
+			 spm->axi.pll_before[4], spm->axi.pll_after[4],
 			 spm->loads, spm->last_error, spm->loaded_fsm, spm->restored_fsm,
 			 readl(spm->base + PCM_FSM_STA), readl(spm->base + PCM_CON0),
 			 readl(spm->base + PCM_CON1), readl(spm->base + PCM_PWR_IO_EN),
@@ -972,6 +1030,30 @@ static ssize_t infra_control_store(struct device *dev, struct device_attribute *
 }
 static DEVICE_ATTR_RW(infra_control);
 
+static ssize_t axi_26m_control_show(struct device *dev, struct device_attribute *attr,
+				  char *buf)
+{
+	struct mt6580_spm *spm = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(spm->axi_26m_control));
+}
+
+static ssize_t axi_26m_control_store(struct device *dev, struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct mt6580_spm *spm = dev_get_drvdata(dev);
+	bool enable;
+	int ret = kstrtobool(buf, &enable);
+
+	if (ret)
+		return ret;
+	if (enable && (!spm->clock_ctl[0] || !spm->clock_ctl[1]))
+		return -ENODEV;
+	WRITE_ONCE(spm->axi_26m_control, enable);
+	return count;
+}
+static DEVICE_ATTR_RW(axi_26m_control);
+
 static struct attribute *mt6580_spm_attrs[] = {
 	&dev_attr_state.attr,
 	&dev_attr_pcm_timer_ms.attr,
@@ -981,6 +1063,7 @@ static struct attribute *mt6580_spm_attrs[] = {
 	&dev_attr_f26m_control.attr,
 	&dev_attr_ddrphy_control.attr,
 	&dev_attr_infra_control.attr,
+	&dev_attr_axi_26m_control.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(mt6580_spm);
@@ -988,6 +1071,46 @@ ATTRIBUTE_GROUPS(mt6580_spm);
 static void mt6580_spm_put_device(void *data)
 {
 	put_device(data);
+}
+
+static int mt6580_spm_get_clock_controllers(struct mt6580_spm *spm)
+{
+	static const char * const compatible[] = {
+		"mediatek,mt6580-topckgen", "mediatek,mt6580-apmixedsys",
+	};
+	struct device *dev = spm->dev;
+	struct platform_device *controller;
+	struct device_node *node;
+	int i, ret;
+
+	if (!of_property_present(dev->of_node, "mediatek,clock-controllers"))
+		return 0;
+	ret = of_count_phandle_with_args(dev->of_node, "mediatek,clock-controllers", NULL);
+	if (ret != ARRAY_SIZE(spm->clock_ctl))
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(spm->clock_ctl); i++) {
+		node = of_parse_phandle(dev->of_node, "mediatek,clock-controllers", i);
+		if (!of_device_is_compatible(node, compatible[i]) ||
+		    !of_device_is_available(node)) {
+			of_node_put(node);
+			return -EINVAL;
+		}
+		controller = of_find_device_by_node(node);
+		of_node_put(node);
+		if (!controller)
+			return -EPROBE_DEFER;
+		if (!device_is_bound(&controller->dev)) {
+			put_device(&controller->dev);
+			return -EPROBE_DEFER;
+		}
+		ret = devm_add_action_or_reset(dev, mt6580_spm_put_device, &controller->dev);
+		if (ret)
+			return ret;
+		if (!device_link_add(dev, &controller->dev, DL_FLAG_AUTOREMOVE_CONSUMER))
+			return -EINVAL;
+		spm->clock_ctl[i] = &controller->dev;
+	}
+	return 0;
 }
 
 static void mt6580_spm_unmap(void *data)
@@ -1042,6 +1165,9 @@ static int mt6580_spm_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	spm->dev = dev;
 	spm->pwrap = &pwrap->dev;
+	ret = mt6580_spm_get_clock_controllers(spm);
+	if (ret)
+		return ret;
 	node = of_parse_phandle(dev->of_node, "mediatek,ddr", 0);
 	if (!of_device_is_compatible(node, "mediatek,mt6580-ddrphy-clock") ||
 	    !of_device_is_available(node)) {

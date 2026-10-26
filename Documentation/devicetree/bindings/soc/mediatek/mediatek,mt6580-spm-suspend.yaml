@@ -14,7 +14,9 @@ description: |
   register resource for PCM instruction loading and sleep sequencing;
   MTCMOS power domains remain owned by SCPSYS. The PMIC wrapper supplies
   the autonomous suspend command slots. The PCM return interrupt provides
-  timer wakeup. Retained-state standby keeps CPU0, infra and DDR powered.
+  timer wakeup. Standby supports staged qualification; automatic deep
+  selects the qualified CPU0/infra/DDRPHY and clock handoff profile, with
+  retention fallback when prerequisites are busy before hardware entry.
 
 properties:
   compatible:
@@ -27,6 +29,16 @@ properties:
   mediatek,ddr:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: Read-only DDR clock provider auditing BSP SPM prerequisites
+
+  mediatek,clock-controllers:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 2
+    maxItems: 2
+    items:
+      maxItems: 1
+    description:
+      TOPCKGEN followed by APMIXED providers for optional guarded AXI
+      source parking during explicit CPU0 standby qualification.
 
   mediatek,uarts:
     $ref: /schemas/types.yaml#/definitions/phandle-array
@@ -78,6 +90,7 @@ examples:
         mediatek,ddr = <&ddrclk>;
         mediatek,uarts = <&uart0>;
         mediatek,usbs = <&usb>;
+        mediatek,clock-controllers = <&topckgen>, <&apmixedsys>;
         interrupts = <GIC_SPI 88 IRQ_TYPE_LEVEL_LOW>;
         clocks = <&topckgen CLK_MT6580_TOP_SPM>;
         clock-names = "spm";

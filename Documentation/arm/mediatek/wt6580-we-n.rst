@@ -2591,3 +2591,56 @@ was absent, but the check result was captured in kmsg and verified from
 the superblock. Evidence under out/a1260-runtime-pm is
 build-e2fsck-ramdisk.log, default-deep-fsck-110-dmesg.txt,
 metadata-after-fsck-summary.json and default-deep-fsck-110-final.txt.
+
+MAINPLL prerequisite audit and AXI parking
+-----------------------------------------
+
+The BSP flag declaration alone does not implement MAINPLL power-down. The
+exact 725-word PCM (SHA256 381b6f47fda7d90842eb3a11909119ee7b359d3ae9a4bac891d5752484e2fc83)
+was inspected against cyrozap/ghidra-pcm's SLEIGH model at commit
+70740b96a3aad64990abb14f243e46b03ea8e11d. Its 567 instructions cover all
+725 words and all 62 call/jump targets land at decoded instruction starts.
+R6 loads PCM_FLAGS at word 515; the observed bit tests use only bits
+0/1/2/18/19, with R1 loaded as constant one at word 512. There is no
+software bit-8 MAINPLL test, nor bit-3/9 voltage test. This is a static
+model-based finding, not native REA decompilation or proof of hardware
+power state: the existing REA engines did not support this PCM target.
+The model itself documents incomplete hardware validation. Other PCM
+versions may behave differently. Evidence and model identity are retained
+in out/a1260-runtime-pm/mainpll-pcm-isa/finding.json.
+
+CPU uses ARMPLL, but its DVFS handover uses MAINPLL_D2 and AXI currently
+uses MAINPLL_D12 at 125125000 Hz. Ordinary device suspend must not simply
+turn off that root. The clock provider now supports explicit, initially
+disabled AXI parking: after nonboot CPUs and devices are quiesced, the
+coherency-off finisher changes AXI[7:4] from 4 to 1 (26 MHz); zero is not
+the BSP 26 MHz encoding. After PCM_RETURN, it validates the supplier/PLL
+state and restores the mux before sibling-core/L2 recovery. No OF/CCF
+query or explicit lock runs in that finisher. An unsuccessful or uncertain
+restore keeps 26 MHz and the error state. PLL configuration/power, audio,
+D14, divider enables and memory clocks remain unmodified in this stage.
+The two PCM TOPCKGEN RMW operations change only bit 1 and preserve AXI.
+
+TOPCKGEN/APMIXED suppliers are explicit optional phandles and device links.
+The clock driver caches probe-validated device identity, including protection
+against unrelated MFGCFG private data under the shared platform driver.
+axi_26m_control requires explicit standby, CPU0 mode 2 and the R0 guards;
+automatic mem/deep ignores it.
+
+Kernel #113 completed three parking/restoration cycles: R0 with F26M/DDR
+retained, full infra/DDRPHY/F26M handoff with a PCM timer, and external wake.
+AXI was 0x27613c46 -> 0x27613c16 -> 0x27613c16 -> 0x27613c46 each time;
+CPU mux stayed 4, MAINPLL CON0/1/2/3 and PWR_CON0 matched exactly (power
+0x5), entries/resumes=3/3, error=0. Normal default deep and connected-gadget
+retention fallback also passed with the experiment disabled. Total success/
+fail was 5/1: an Android alarm cancelled one entry before sleep, whose
+retry passed. Four CPU0 cold/L2 returns completed, without WFI aborts.
+16 MiB RAM hashes, 52 MHz eMMC direct I/O, Mali pixel readback and display
+recovery passed; no new kernel WARNING/Oops or MMC error was recorded.
+The AXI rate returned to 125125000 Hz. All temporary controls, alarms and
+wake references were cleared; default deep and the current PLL policy
+remain unchanged. This validates a prerequisite, not MAINPLL analog
+power-down or measured sleep current. Standard images are boot-axi-park.img
+and kernel-axi-park (#113). Evidence under out/a1260-runtime-pm is
+axi-113-check.txt, axi-113-clocks.json, axi-113-resume.txt,
+axi-113-dmesg.txt and axi-113-final.txt.
