@@ -29,6 +29,7 @@
 #define PCM_MAS_PAUSE_MASK	0x354
 #define PCM_TIMER_VAL		0x35c
 #define PCM_TIMER_OUT		0x360
+#define PCM_REG0		0x380
 #define PCM_REG11		0x3ac
 #define PCM_REG12		0x3b0
 #define PCM_REG13		0x3b4
@@ -62,6 +63,7 @@
 #define PCM_IM_STATE_MASK	GENMASK(9, 7)
 #define PCM_IM_READY		BIT(9)
 #define PCM_TIMER_EN		BIT(5)
+#define PCM_R0_OUTPUT		BIT(0)
 #define PCM_R7_OUTPUT		BIT(7)
 #define PCM_RETURN		BIT(3)
 #define PCM_SW_INT0		BIT(4)
@@ -94,9 +96,11 @@ struct mt6580_pcm_wake {
 	u32 timer_con_start, timer_val_start, timer_con_wake, timer_val_wake;
 	u32 timer_at_wake, sleep_sta, fsm_at_wake;
 	u32 pwr_io, flags, src_req, flags_expected;
+	u32 pwr_io_expected, r0, r0_blockers;
 	u32 src_before, src_expected, src_blockers, r13_before, usb_ready;
 	u32 poweron0, poweron1, clk_con, standby, mmddr;
 	bool irq_pending, forced_exit;
+	bool r0_requested;
 };
 
 struct mt6580_spm {
@@ -114,6 +118,7 @@ struct mt6580_spm {
 	unsigned int loads;
 	unsigned int runs, irqs, timer_ms;
 	unsigned int cpu0_mode;
+	bool r0_control;
 	struct mt6580_cpu0_context cpu0;
 	u32 irq_status;
 	int irq;
@@ -214,6 +219,7 @@ static int mt6580_pcm_capture(struct mt6580_spm *spm)
 {
 	struct mt6580_pcm_wake *wake = &spm->wake;
 
+	wake->r0 = readl(spm->base + PCM_REG0);
 	wake->r11 = readl(spm->base + PCM_REG11);
 	wake->r12 = readl(spm->base + PCM_REG12);
 	wake->r13 = readl(spm->base + PCM_REG13);
@@ -317,6 +323,8 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 	int i, ret, capture;
 
 	memset(&spm->wake, 0, sizeof(spm->wake));
+	spm->wake.r0_requested = READ_ONCE(spm->r0_control);
+	spm->wake.pwr_io_expected = PCM_R7_OUTPUT;
 	if (mode && ticks > 20 * 32768)
 		return -ERANGE;
 	spm->wake.flags_expected = PCM_RETAIN_FLAGS;
@@ -324,8 +332,8 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 		spm->wake.flags_expected &= ~BIT(0);
 	spm->wake.power_before = readl(spm->base + SPM_PWR_STATUS);
 	spm->wake.power2_before = readl(spm->base + SPM_PWR_STATUS2);
-	/* Synchronize internal registers before connecting R7 control. R0
-	 * stays disconnected, retaining the bootloader's crystal control.
+	/* Synchronize internal registers before connecting power control.
+	 * R0 is normally disconnected, retaining firmware crystal control.
 	 */
 	writel(readl(spm->base + 0x010), spm->base + PCM_DATA_INI);
 	writel(BIT(16), spm->base + PCM_PWR_IO_EN);
@@ -338,6 +346,25 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 	writel(spm->wake.flags_expected, spm->base + PCM_FLAGS);
 	writel(0, spm->base + 0xb00);
 	mt6580_pcm_source_requests(spm);
+	if (spm->wake.r0_requested) {
+		if (mode != 2)
+			spm->wake.r0_blockers |= BIT(0);
+		if (spm->wake.src_blockers)
+			spm->wake.r0_blockers |= BIT(1);
+		if ((spm->wake.power_before | spm->wake.power2_before) &
+		    (BIT(0) | BIT(1) | BIT(3) | BIT(4) | BIT(5)))
+			spm->wake.r0_blockers |= BIT(2);
+		if (spm->wake.r13_before & (GENMASK(4, 0) | BIT(14) | BIT(15)))
+			spm->wake.r0_blockers |= BIT(3);
+		if (spm->wake.r0_blockers)
+			return -EBUSY;
+		/* First qualify the R0 wiring while forcing F26M and APSRC.
+		 * Physical crystal stop and DDR transitions stay disabled.
+		 */
+		spm->wake.src_expected |= PCM_F26M_REQ;
+		writel(spm->wake.src_expected, spm->base + PCM_SRC_REQ);
+		spm->wake.pwr_io_expected |= PCM_R0_OUTPUT;
+	}
 	if (mode == 2 && spm->wake.src_blockers)
 		return -EBUSY;
 	writel(readl(spm->base + SPM_CLK_CON) | BIT(5), spm->base + SPM_CLK_CON);
@@ -361,7 +388,7 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 	if (readl(spm->base + PCM_FLAGS) != spm->wake.flags_expected ||
 	    readl(spm->base + PCM_SRC_REQ) != spm->wake.src_expected)
 		return -EIO;
-	writel(PCM_R7_OUTPUT, spm->base + PCM_PWR_IO_EN);
+	writel(spm->wake.pwr_io_expected, spm->base + PCM_PWR_IO_EN);
 	if (mode)
 		ret = mt6580_cpu0_suspend(&spm->cpu0, mode, mt6580_pcm_idle_finish,
 					 mt6580_pcm_wait_finish, (unsigned long)spm);
@@ -378,9 +405,10 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 	if (!ret && (spm->wake.assert_pc || spm->wake.r11 != 0x55aa55aa ||
 		     spm->wake.power_before != spm->wake.power_after ||
 		     spm->wake.power2_before != spm->wake.power2_after ||
-		     spm->wake.pwr_io != PCM_R7_OUTPUT ||
+		     spm->wake.pwr_io != spm->wake.pwr_io_expected ||
 		     spm->wake.flags != spm->wake.flags_expected ||
-		     spm->wake.src_req != spm->wake.src_expected))
+		     spm->wake.src_req != spm->wake.src_expected ||
+		     (spm->wake.r0_requested && spm->wake.r0 != spm->wake.poweron0)))
 		ret = -EIO;
 	return ret;
 }
@@ -443,7 +471,8 @@ static int mt6580_spm_enter(suspend_state_t state)
 	if (ret)
 		goto out;
 	/* Genpd/device suspend and secondary CPU power-off have completed.
-	 * Only R7 is connected; retained flags/requests keep system power on.
+	 * Retained flags/requests keep system power on; R0 qualification also
+	 * holds F26M while connecting the crystal control output.
 	 */
 	for (i = 0; i < ARRAY_SIZE(pcm_saved_regs); i++)
 		spm->saved[i] = readl(spm->base + pcm_saved_regs[i]);
@@ -485,6 +514,7 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 "wake_pwr_io=%08x flags=%08x src_req=%08x\n"
 			 "source before=%08x applied=%08x blockers=%08x r13_before=%08x usb_ready=%08x\n"
 			 "source poweron=%08x/%08x clk_con=%08x standby=%08x mmddr=%08x\n"
+			 "r0 requested=%u value=%08x baseline=%08x blockers=%08x\n"
 			 "cpu0 mode=%u resumes=%u result=%d vector=%08x/%08x/%08x\n"
 			 "cpu0 timer_ctrl=%08x/%08x counter=%llu/%llu\n"
 			 "cpu0 cold=%u aborts=%u errata=%u l2=%08x/%08x cache=%08x/%08x\n"
@@ -508,6 +538,8 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 spm->wake.r13_before, spm->wake.usb_ready,
 			 spm->wake.poweron0, spm->wake.poweron1,
 			 spm->wake.clk_con, spm->wake.standby, spm->wake.mmddr,
+			 spm->wake.r0_requested, spm->wake.r0, spm->wake.poweron0,
+			 spm->wake.r0_blockers,
 			 READ_ONCE(spm->cpu0_mode), spm->cpu0.resumes, spm->cpu0.result,
 			 spm->cpu0.boot_before, spm->cpu0.boot_resume, spm->cpu0.boot_after,
 			 spm->cpu0.timer_ctrl, spm->cpu0.timer_ctrl_after,
@@ -565,10 +597,32 @@ static ssize_t cpu0_mode_store(struct device *dev, struct device_attribute *attr
 }
 static DEVICE_ATTR_RW(cpu0_mode);
 
+static ssize_t r0_control_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct mt6580_spm *spm = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(spm->r0_control));
+}
+
+static ssize_t r0_control_store(struct device *dev, struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct mt6580_spm *spm = dev_get_drvdata(dev);
+	bool enable;
+	int ret = kstrtobool(buf, &enable);
+
+	if (ret)
+		return ret;
+	WRITE_ONCE(spm->r0_control, enable);
+	return count;
+}
+static DEVICE_ATTR_RW(r0_control);
+
 static struct attribute *mt6580_spm_attrs[] = {
 	&dev_attr_state.attr,
 	&dev_attr_pcm_timer_ms.attr,
 	&dev_attr_cpu0_mode.attr,
+	&dev_attr_r0_control.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(mt6580_spm);

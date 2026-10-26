@@ -2108,3 +2108,25 @@ tracing and reconnect wake reference were cleared. Evidence under
 the clock fixture and analyzer are clock-snapshot.c and
 analyze-suspend-clocks.py. Physical clock stop and finer always-on timing
 remain unqualified.
+
+R0 output qualification with clocks retained
+-------------------------------------------
+
+The default-off r0_control option connects PCM R0 alongside R7 only with
+CPU0/L2 cold recovery selected, completed UART/USB handoff, idle peripheral
+power domains and no external/modem clock requests. It explicitly forces
+both F26M and APSRC. This qualifies the control connection and restored R0
+value, not physical crystal stop or DDR self-refresh.
+
+Kernel #91 completed three cold entries (two PCM timers and one RTC wake),
+default s2idle and bound-gadget retained-CPU standby: success/fail 5/0.
+The cold entries captured PWR_IO=0x81, SRC_REQ=0x0f, flags=0x3be and R0=0,
+matching POWER_ON_VAL0. Cold/erratum counts were 3/3 with zero WFI aborts.
+Cleanup disconnected outputs and restored SRC_REQ=0x0c and USB clock
+references. The 16 MiB RAM hash matched; 52 MHz eMMC direct I/O, Mali pixel
+readback, four online CPUs and zero-underflow RDMA recovered. No new kernel
+WARNING/Oops was captured. Mode, timers, tracing and reconnect wake
+references were cleared. Standard product boot/kernel use boot-r0-control.img
+and kernel-r0-control. Evidence is out/a1260-runtime-pm/r0-91- plus check.txt,
+trace.txt, dmesg.txt, resume.txt and final.txt. SYSCLK settle and DDR clock
+sequencing still need preparation before removing the forced clock request.

@@ -79,6 +79,21 @@ Description:
 		arms a 32.768 kHz PCM timer for the next standby entry. It neither
 		changes Android's default s2idle policy nor enables power gating.
 
+What:		/sys/devices/platform/10006000.power-controller/*suspend/r0_control
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Boolean, default false. Qualify the PCM R0 power-control connection
+		during explicit CPU0-reset standby (cpu0_mode=2). Requires UART/USB
+		clock handoff, qualified firmware baseline, MD1/CONN/DISP/MFG/ISP
+		domains off and external/MD1/CONN clock requests clear. F26M and
+		APSRC are explicitly forced on throughout this qualification;
+		it does not permit physical crystal stop or DDR power changes.
+		R0 must return to POWER_ON_VAL0 before disconnecting PCM output.
+		State adds r0 requested/value/baseline/blockers. Blocker bits are
+		wrong CPU mode (0), ordinary source handoff failure (1), powered
+		non-CPU domain (2), or hardware source-clock request (3).
+
 What:		/sys/devices/platform/1000f000.pmic-wrap/spm_phase
 Date:		October 2026
 Contact:	FuQuan <i@fuquan.moe>
