@@ -62,6 +62,7 @@
 		suspend {
 			compatible = "mediatek,mt6580-spm-suspend";
 			mediatek,pwrap = <&pwrap>;
+			mediatek,ddr = <&ddrclk>;
 			mediatek,uarts = <&uart0>;
 			mediatek,usbs = <&usb>;
 			interrupts = <GIC_SPI 88 IRQ_TYPE_LEVEL_LOW>;

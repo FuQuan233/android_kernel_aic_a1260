@@ -5,11 +5,38 @@
 #include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/soc/mediatek/mt6580-ddr.h>
 
 struct mt6580_ddr_clk {
 	struct clk_hw hw;
 	void __iomem *base[3];
 };
+
+static struct platform_driver mt6580_ddr_clk_driver;
+
+int mt6580_ddr_sleep_snapshot(struct device *dev, u32 values[4])
+{
+	/* MT6580 BSP spm_golden_setting_cmp(): DDRPHY, not the ORed mirrors. */
+	static const u32 golden[] = { 0x063c0000, 0, 0x0000fc10, 0x40101000 };
+	struct mt6580_ddr_clk *ddr;
+	int i, ret = 0;
+
+	if (dev->driver != &mt6580_ddr_clk_driver.driver)
+		return -ENODEV;
+	ddr = dev_get_drvdata(dev);
+	for (i = 0; i < ARRAY_SIZE(golden); i++) {
+		u32 mask = i == 3 ? ~BIT(31) : ~0U;
+
+		values[i] = readl(ddr->base[0] + 0x5c0 + i * 4);
+		/* The BSP PCM clears/sets 0x5cc[31] in its APSRC routines.
+		 * Keep that transition visible, checking all other bits exactly.
+		 */
+		if ((values[i] & mask) != golden[i])
+			ret = -EINVAL;
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(mt6580_ddr_sleep_snapshot);
 
 static u32 mt6580_ddr_read(struct mt6580_ddr_clk *ddr, u32 offset)
 {
@@ -70,6 +97,7 @@ static int mt6580_ddr_clk_probe(struct platform_device *pdev)
 	}
 	if (!mt6580_ddr_recalc_rate(&ddr->hw, 26000000))
 		return dev_err_probe(dev, -EINVAL, "Invalid firmware memory PLL setup\n");
+	platform_set_drvdata(pdev, ddr);
 	ddr->hw.init = &init;
 	ret = devm_clk_hw_register(dev, &ddr->hw);
 	if (ret)

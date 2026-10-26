@@ -14,6 +14,7 @@
 #include <linux/soc/mediatek/mt6580-uart.h>
 #include <linux/soc/mediatek/mt6580-usb.h>
 #include <linux/soc/mediatek/mt6580-cpu-pm.h>
+#include <linux/soc/mediatek/mt6580-ddr.h>
 #include <linux/suspend.h>
 
 #include <asm/proc-fns.h>
@@ -104,13 +105,17 @@ struct mt6580_pcm_wake {
 	u32 poweron0, poweron1, clk_con, standby, mmddr;
 	u32 settle_before, settle_md, settle_programmed, settle_applied;
 	u32 settle_wake, settle_restored;
+	u32 ddr_before[4], ddr_after[4];
+	int ddr_check_before, ddr_check_after;
 	bool irq_pending, forced_exit;
 	bool r0_requested, settle_changed;
+	bool apsrc_requested;
 };
 
 struct mt6580_spm {
 	struct device *dev;
 	struct device *pwrap;
+	struct device *ddr;
 	struct device *uarts[2];
 	unsigned int num_uarts;
 	struct device *usbs[1];
@@ -124,6 +129,7 @@ struct mt6580_spm {
 	unsigned int runs, irqs, timer_ms;
 	unsigned int cpu0_mode;
 	bool r0_control;
+	bool apsrc_control;
 	struct mt6580_cpu0_context cpu0;
 	u32 irq_status;
 	int irq;
@@ -369,7 +375,10 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 	int i, ret, capture;
 
 	spm->wake.r0_requested = READ_ONCE(spm->r0_control);
+	spm->wake.apsrc_requested = READ_ONCE(spm->apsrc_control);
 	spm->wake.pwr_io_expected = PCM_R7_OUTPUT;
+	if (spm->wake.apsrc_requested && !spm->wake.r0_requested)
+		return -EINVAL;
 	if (mode && ticks > 20 * 32768)
 		return -ERANGE;
 	spm->wake.flags_expected = PCM_RETAIN_FLAGS;
@@ -403,14 +412,25 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 			spm->wake.r0_blockers |= BIT(3);
 		if (spm->wake.r0_blockers)
 			return -EBUSY;
-		/* First qualify the R0 wiring while forcing F26M and APSRC.
-		 * Physical crystal stop and DDR transitions stay disabled.
+		/* Qualify R0 with F26M forced. APSRC is also forced unless its
+		 * separate DDR-prerequisite-checked qualification is requested.
 		 */
 		spm->wake.src_expected |= PCM_F26M_REQ;
 		writel(spm->wake.src_expected, spm->base + PCM_SRC_REQ);
 		ret = mt6580_pcm_sysclk_settle(spm);
 		if (ret)
 			return ret;
+		if (spm->wake.apsrc_requested) {
+			spm->wake.ddr_check_before = mt6580_ddr_sleep_snapshot(spm->ddr,
+							spm->wake.ddr_before);
+			if (spm->wake.ddr_check_before)
+				return spm->wake.ddr_check_before;
+			/* Hand APSRC to hardware with DDRPHY/infra power retained.
+			 * F26M remains forced throughout this separate qualification.
+			 */
+			spm->wake.src_expected &= ~PCM_APSRC_REQ;
+			writel(spm->wake.src_expected, spm->base + PCM_SRC_REQ);
+		}
 		spm->wake.pwr_io_expected |= PCM_R0_OUTPUT;
 	}
 	if (mode == 2 && spm->wake.src_blockers)
@@ -446,6 +466,12 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 		return ret;
 	ret = mt6580_pcm_wait_finish((unsigned long)spm);
 	capture = mt6580_pcm_capture(spm);
+	if (spm->wake.apsrc_requested) {
+		spm->wake.ddr_check_after = mt6580_ddr_sleep_snapshot(spm->ddr,
+							spm->wake.ddr_after);
+		if (!ret)
+			ret = spm->wake.ddr_check_after;
+	}
 	if (!ret)
 		ret = capture;
 	if (spm->wake.irq_pending && !spm->wake.forced_exit)
@@ -568,6 +594,8 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 "source poweron=%08x/%08x clk_con=%08x standby=%08x mmddr=%08x\n"
 			 "r0 requested=%u value=%08x baseline=%08x blockers=%08x\n"
 			 "sysclk_settle before=%u md=%u programmed=%08x applied=%u wake=%u restored=%u\n"
+			 "apsrc requested=%u ddr_check=%d/%d\n"
+			 "ddr before=%08x/%08x/%08x/%08x after=%08x/%08x/%08x/%08x\n"
 			 "cpu0 mode=%u resumes=%u result=%d vector=%08x/%08x/%08x\n"
 			 "cpu0 timer_ctrl=%08x/%08x counter=%llu/%llu\n"
 			 "cpu0 cold=%u aborts=%u errata=%u l2=%08x/%08x cache=%08x/%08x\n"
@@ -596,6 +624,12 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 spm->wake.settle_before, spm->wake.settle_md, spm->wake.settle_programmed,
 			 spm->wake.settle_applied, spm->wake.settle_wake,
 			 spm->wake.settle_restored,
+			 spm->wake.apsrc_requested, spm->wake.ddr_check_before,
+			 spm->wake.ddr_check_after,
+			 spm->wake.ddr_before[0], spm->wake.ddr_before[1],
+			 spm->wake.ddr_before[2], spm->wake.ddr_before[3],
+			 spm->wake.ddr_after[0], spm->wake.ddr_after[1],
+			 spm->wake.ddr_after[2], spm->wake.ddr_after[3],
 			 READ_ONCE(spm->cpu0_mode), spm->cpu0.resumes, spm->cpu0.result,
 			 spm->cpu0.boot_before, spm->cpu0.boot_resume, spm->cpu0.boot_after,
 			 spm->cpu0.timer_ctrl, spm->cpu0.timer_ctrl_after,
@@ -674,11 +708,33 @@ static ssize_t r0_control_store(struct device *dev, struct device_attribute *att
 }
 static DEVICE_ATTR_RW(r0_control);
 
+static ssize_t apsrc_control_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct mt6580_spm *spm = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(spm->apsrc_control));
+}
+
+static ssize_t apsrc_control_store(struct device *dev, struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct mt6580_spm *spm = dev_get_drvdata(dev);
+	bool enable;
+	int ret = kstrtobool(buf, &enable);
+
+	if (ret)
+		return ret;
+	WRITE_ONCE(spm->apsrc_control, enable);
+	return count;
+}
+static DEVICE_ATTR_RW(apsrc_control);
+
 static struct attribute *mt6580_spm_attrs[] = {
 	&dev_attr_state.attr,
 	&dev_attr_pcm_timer_ms.attr,
 	&dev_attr_cpu0_mode.attr,
 	&dev_attr_r0_control.attr,
+	&dev_attr_apsrc_control.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(mt6580_spm);
@@ -703,6 +759,7 @@ static int mt6580_spm_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct platform_device *pwrap;
+	struct platform_device *ddr;
 	struct platform_device *uart;
 	struct platform_device *usb;
 	struct device_node *node;
@@ -739,6 +796,26 @@ static int mt6580_spm_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	spm->dev = dev;
 	spm->pwrap = &pwrap->dev;
+	node = of_parse_phandle(dev->of_node, "mediatek,ddr", 0);
+	if (!of_device_is_compatible(node, "mediatek,mt6580-ddrphy-clock") ||
+	    !of_device_is_available(node)) {
+		of_node_put(node);
+		return -EINVAL;
+	}
+	ddr = of_find_device_by_node(node);
+	of_node_put(node);
+	if (!ddr)
+		return -EPROBE_DEFER;
+	if (!device_is_bound(&ddr->dev)) {
+		put_device(&ddr->dev);
+		return -EPROBE_DEFER;
+	}
+	ret = devm_add_action_or_reset(dev, mt6580_spm_put_device, &ddr->dev);
+	if (ret)
+		return ret;
+	if (!device_link_add(dev, &ddr->dev, DL_FLAG_AUTOREMOVE_CONSUMER))
+		return -EINVAL;
+	spm->ddr = &ddr->dev;
 	ret = of_count_phandle_with_args(dev->of_node, "mediatek,uarts", NULL);
 	if (ret < 1 || ret > ARRAY_SIZE(spm->uarts))
 		return -EINVAL;

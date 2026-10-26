@@ -5,8 +5,8 @@ Description:
 		Read-only diagnostic snapshot of the MT6580 PCM suspend provider.
 		mode=load-only identifies the initial instruction-fetch stage;
 		mode=retained-run executes PCM with retention flags and clock/memory
-		requests held. R7 is connected for timer/control sequencing; R0
-		crystal control remains disconnected.
+		requests held by default. R7 is connected for timer/control sequencing;
+		R0 defaults to disconnected, with optional qualification below.
 		pcm_words and dma identify the coherent instruction buffer. loads
 		counts completed instruction fetches, not PCM sleep executions.
 		last_error is the last loader/handoff errno; loaded_fsm and
@@ -24,7 +24,7 @@ Description:
 		after WFI, before any forced PCM exit. wake_pwr_io/flags/src_req
 		record the applied R7 connection and retention constraints.
 		source before/applied record the original and selected SRC_REQ;
-		CCIF event masks are preserved, APSRC bit 0 stays asserted, and
+		CCIF event masks are preserved, APSRC bit 0 defaults to asserted, and
 		software F26M bit 1 is omitted only if all configured UARTs completed
 		their sleep handshake, USB PHY/clocks are shut down and DISP/MFG
 		are off. blockers bits retain
@@ -34,8 +34,8 @@ Description:
 		of configured USB controllers with completed late-suspend handoff.
 		Source snapshots also include pre-run R13, POWER_ON_VAL0/1,
 		CLK_CON, AP_STANDBY and MMDDR_MASK. These show request ownership;
-		they do not establish that 26 MHz physically stopped. R0 output
-		remains disconnected and APSRC retained in either policy.
+		they do not establish that 26 MHz physically stopped. r0_control
+		and apsrc_control explicitly override their respective defaults.
 		cpu0 mode/resumes/result record CPU0 resume-entry qualification.
 		vector contains the original/programmed/restored shared boot
 		address; timer_ctrl and counter contain before/after physical
@@ -86,8 +86,8 @@ Description:
 		Boolean, default false. Qualify the PCM R0 power-control connection
 		during explicit CPU0-reset standby (cpu0_mode=2). Requires UART/USB
 		clock handoff, qualified firmware baseline, MD1/CONN/DISP/MFG/ISP
-		domains off and external/MD1/CONN clock requests clear. F26M and
-		APSRC are explicitly forced on throughout this qualification;
+		domains off and external/MD1/CONN clock requests clear. F26M is forced
+		throughout; APSRC is also forced unless apsrc_control is enabled;
 		it does not permit physical crystal stop or DDR power changes.
 		R0 must return to POWER_ON_VAL0 before disconnecting PCM output.
 		The BSP SYSCLK settle selector and 99-tick (about 3 ms) budget are
@@ -100,6 +100,22 @@ Description:
 		State adds r0 requested/value/baseline/blockers. Blocker bits are
 		wrong CPU mode (0), ordinary source handoff failure (1), powered
 		non-CPU domain (2), or hardware source-clock request (3).
+
+What:		/sys/devices/platform/10006000.power-controller/*suspend/apsrc_control
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Boolean, default false. Release the APSRC software override during
+		explicit standby with cpu0_mode=2 and r0_control=1. All R0 guards
+		apply. Requires a bound DDR supplier and the four MT6580 BSP
+		DDRPHY SPM prerequisite fields to match before entry and on resume.
+		Offset 0x5cc bit 31 may be clear or set as in the BSP PCM APSRC
+		routines; all other bits must match. Snapshots retain the complete value.
+		F26M, DDRPHY/infra power, voltage and memory PLL policy are retained.
+		This hands APSRC to hardware without proving DDR self-refresh duration.
+		State adds apsrc requested/ddr_check and DDRPHY before/after snapshots
+		for offsets 0x5c0, 0x5c4, 0x5c8 and 0x5cc. Failed prerequisites abort
+		before connecting outputs; all control registers are restored on exit.
 
 What:		/sys/devices/platform/1000f000.pmic-wrap/spm_phase
 Date:		October 2026

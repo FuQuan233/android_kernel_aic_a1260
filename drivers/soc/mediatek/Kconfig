@@ -70,17 +70,19 @@ config MTK_MT6580_SPM
 	depends on MTK_SCPSYS && MTK_MT6580_PMIC_WRAP=y
 	depends on SERIAL_8250_MT6577=y
 	depends on USB_MUSB_MEDIATEK=y
+	depends on COMMON_CLK_MT6580_USB=y
 	depends on CPU_PM && ARM_CPU_SUSPEND
 	help
 	  Execute the BSP PCM program with retained power during explicit
 	  standby, with SPM timer/external wakeup and MT6350 command slots.
-	  R7 provides timer/control sequencing; R0 stays disconnected and
+	  R7 provides timer/control sequencing; R0 defaults to disconnected and
 	  CPU0 normally uses retained power. Explicit qualification modes
 	  can exercise MMU-off resume or CPU0/TOP/L2 reset, including GIC,
 	  banked-register and L2 recovery. Infra and DDR stay retained, and
 	  Android keeps using s2idle. UART handshake and USB clock/PHY
-	  shutdown gate the software 26 MHz override; APSRC and crystal
-	  control remain retained.
+	  shutdown gate the software 26 MHz override. Optional R0 and APSRC
+	  handoff qualification retains the crystal and DDRPHY/infra power;
+	  the DDR supplier audits BSP prerequisites without changing timings.
 	  Firmware-initialized MT6350 PWRAP and CIRQ are required.
 
 config MTK_MT6580_MODEM_OFF

@@ -2154,3 +2154,35 @@ qualification, so actual oscillator restart timing is not yet qualified.
 Evidence is out/a1260-runtime-pm/sysclk-93- plus check.txt, trace.txt,
 dmesg.txt, resume.txt and final.txt. Standard images use
 boot-sysclk-settle-fixed.img and kernel-sysclk-settle-fixed (#93).
+
+APSRC handoff with DDRPHY power retained
+---------------------------------------
+
+The explicit apsrc_control option requires CPU0 cold recovery, R0 control
+and all its clock/domain guards. The bound read-only DDR supplier audits
+DDRPHY offsets 0x5c0/4/8/c against MT6580 BSP prerequisites. In 0x5cc only
+bit 31 may vary: the BSP PCM APSRC routines explicitly clear/set it.
+All other bits must match exactly. Full snapshots remain visible, and the
+clock driver never normalizes this bit or writes live memory configuration.
+Device links keep the supplier bound and order PM; Kconfig requires its
+built-in clock driver. With qualification selected SRC_REQ is 0x0e:
+F26M stays forced, while APSRC is handed to hardware. Infra/DDRPHY power,
+voltages and existing PLL policy are retained. Self-refresh duration is
+not directly measured by these snapshots.
+
+Initial #94 completed one CPU0/L2 reset but its strict full-register check
+rejected 0x5cc=0xc0101000 versus initial 0x40101000. The fixed #95 accepted
+that PCM transition and completed three cold entries, s2idle and bound
+standby with success/fail 5/0, cold/erratum 3/3 and zero WFI aborts. The
+16 MiB RAM hash matched across all entries, EMI source remained 266499673
+Hz, and 52 MHz direct eMMC I/O, Mali pixel readback, four CPUs and
+zero-underflow display recovered. Clocks did not reverse; the retained
+physical counter measured 2.000447/2.000464/3.808688 seconds for the cold
+entries. The external wake included EINT and PMIC sources, not just a
+fixed nine-second RTC interval. No kernel WARNING/Oops was captured.
+Temporary control modes, alarms, tracing and reconnect wake reference
+were cleared. Standard boot/kernel are boot-apsrc-handoff-fixed.img and
+kernel-apsrc-handoff-fixed (#95). Evidence under out/a1260-runtime-pm is
+apsrc-95- plus check.txt, trace.txt, dmesg.txt, analysis.json, resume.txt and
+final.txt; apsrc-94-* records the initial overstrict check. Actual 26 MHz
+stop and infra power loss remain unqualified.

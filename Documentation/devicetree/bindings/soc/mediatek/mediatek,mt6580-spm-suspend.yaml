@@ -24,6 +24,10 @@ properties:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: MT6580 PMIC wrapper providing the MT6350 suspend command slots
 
+  mediatek,ddr:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Read-only DDR clock provider auditing BSP SPM prerequisites
+
   mediatek,uarts:
     $ref: /schemas/types.yaml#/definitions/phandle-array
     minItems: 1
@@ -53,6 +57,7 @@ properties:
 required:
   - compatible
   - mediatek,pwrap
+  - mediatek,ddr
   - mediatek,uarts
   - mediatek,usbs
   - interrupts
@@ -70,6 +75,7 @@ examples:
     suspend {
         compatible = "mediatek,mt6580-spm-suspend";
         mediatek,pwrap = <&pwrap>;
+        mediatek,ddr = <&ddrclk>;
         mediatek,uarts = <&uart0>;
         mediatek,usbs = <&usb>;
         interrupts = <GIC_SPI 88 IRQ_TYPE_LEVEL_LOW>;
