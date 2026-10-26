@@ -150,6 +150,23 @@ Description:
 		30-second reset watchdog and bounded/external wake restrictions apply.
 		Off/on snapshots alone do not measure the time spent powered down.
 
+What:		/sys/devices/platform/10006000.power-controller/*suspend/infra_control
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Boolean, default false. Allow the BSP PCM infra-power-down branch
+		by clearing INFRA_PDN_DIS. Requires all CPU0/R0/APSRC/F26M/DDRPHY
+		qualification controls and their existing checks. Additional guards
+		require saved native UART context, a prepared seven-word MT6580
+		SYSIRQ snapshot, active CIRQ v1 covering SPI32..157, prepared PWRAP
+		commands with WACS2 initialized/idle, and powered-on IFR control bits.
+		infra requested/blockers/power/sram snapshots retain entry/result.
+		Blockers: missing controls (0), IFR baseline (1), UART context (2),
+		SYSIRQ context (3), CIRQ (4), PWRAP (5). Failure aborts before output
+		handoff. On return the generic power status and IFR on-state must
+		match. Voltage and MAINPLL policy stay retained. Existing 30-second
+		CPU0 reset-guard restrictions apply; Android s2idle is unchanged.
+
 What:		/sys/devices/platform/1000f000.pmic-wrap/spm_phase
 Date:		October 2026
 Contact:	FuQuan <i@fuquan.moe>

@@ -39,8 +39,10 @@
 #define MT6580_UART_SLEEP_REQ	0xb4
 #define MT6580_UART_SLEEP_ACK	0xb8
 #define MT6580_UART_SLEEP_BIT	BIT(0)
-/* Extra MT6580 context not rebuilt by the serial core/set_termios path. */
-static const u16 mt6580_uart_context_regs[] = { 0x3c, 0xb0, 0x34 };
+/* GUARD/RX_SEL/RATE_FIX, baud/sample fields and escape controls. */
+static const u16 mt6580_uart_context_regs[] = {
+	0x3c, 0xb0, 0x34, 0x24, 0x28, 0x2c, 0x54, 0x58, 0x44, 0x40,
+};
 #define MTK_UART_IER_XOFFI	0x20	/* Enable XOFF character interrupt */
 #define MTK_UART_IER_RTSI	0x40	/* Enable RTS Modem status interrupt */
 #define MTK_UART_IER_CTSI	0x80	/* Enable CTS Modem status interrupt */
@@ -89,8 +91,10 @@ struct mtk8250_data {
 	u32			saved_sleep_en, saved_sleep_req;
 	u32			sleep_ack, wake_ack;
 	unsigned int		sleep_requests, sleep_restores, sleep_skips;
+	unsigned int		wake_recoveries;
 	int			sleep_error;
-	u32 context_saved[3], context_before[3], context_restored[3];
+	u32 context_saved[10], context_before[10], context_restored[10];
+	u32 bank_saved[7], bank_before[7], bank_restored[7];
 	unsigned int context_saves, context_restores, context_lost, context_errors;
 };
 
@@ -655,36 +659,97 @@ static int __maybe_unused mtk8250_resume(struct device *dev)
 	return 0;
 }
 
+/* Caller holds the port lock; RX/TX and the console are suspended. */
+static void mt6580_uart_read_bank(struct uart_8250_port *up, u32 values[7])
+{
+	values[0] = serial_in(up, UART_LCR);
+	serial_out(up, UART_LCR, UART_LCR_CONF_MODE_B);
+	values[1] = serial_in(up, UART_EFR);
+	serial_out(up, UART_LCR, values[0]);
+	values[2] = readl(up->port.membase + 0x5c); /* BSP FCR readback. */
+	values[5] = serial_in(up, UART_MCR);
+	values[6] = serial_in(up, UART_IER);
+	serial_out(up, UART_LCR, values[0] | UART_LCR_DLAB);
+	values[3] = serial_in(up, UART_DLL);
+	values[4] = serial_in(up, UART_DLM);
+	serial_out(up, UART_LCR, values[0]);
+}
+
+static int mt6580_uart_restore_context(struct mtk8250_data *data,
+				      struct uart_8250_port *up)
+{
+	unsigned long flags;
+	int i, ret = 0;
+
+	uart_port_lock_irqsave(&up->port, &flags);
+	mt6580_uart_read_bank(up, data->bank_before);
+	for (i = 0; i < ARRAY_SIZE(data->bank_saved); i++)
+		if (data->bank_before[i] != data->bank_saved[i])
+			data->context_lost++;
+	/* BSP restores this before request_uart_to_wakeup(), rather than
+	 * waiting for serial8250_resume_port() after the wake handshake.
+	 */
+	serial_out(up, UART_LCR, UART_LCR_CONF_MODE_B);
+	serial_out(up, UART_EFR, data->bank_saved[1]);
+	serial_out(up, UART_LCR, data->bank_saved[0]);
+	serial_out(up, UART_FCR, data->bank_saved[2]);
+	for (i = 0; i < ARRAY_SIZE(mt6580_uart_context_regs); i++) {
+		void __iomem *reg = up->port.membase + mt6580_uart_context_regs[i];
+
+		data->context_before[i] = readl(reg);
+		if (data->context_before[i] != data->context_saved[i])
+			data->context_lost++;
+		writel(data->context_saved[i], reg);
+		data->context_restored[i] = readl(reg);
+		if (data->context_restored[i] != data->context_saved[i]) {
+			data->context_errors++;
+			ret = -EIO;
+		}
+	}
+	serial_out(up, UART_LCR, data->bank_saved[0] | UART_LCR_DLAB);
+	serial_out(up, UART_DLL, data->bank_saved[3]);
+	serial_out(up, UART_DLM, data->bank_saved[4]);
+	serial_out(up, UART_LCR, data->bank_saved[0]);
+	serial_out(up, UART_MCR, data->bank_saved[5]);
+	serial_out(up, UART_IER, data->bank_saved[6]);
+	mt6580_uart_read_bank(up, data->bank_restored);
+	for (i = 0; i < ARRAY_SIZE(data->bank_saved); i++) {
+		u32 mask = i == 2 ? ~(UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT) : ~0U;
+
+		if ((data->bank_restored[i] & mask) != (data->bank_saved[i] & mask)) {
+			data->context_errors++;
+			ret = -EIO;
+		}
+	}
+	uart_port_unlock_irqrestore(&up->port, flags);
+	return ret;
+}
+
 static int mtk8250_restore_sleep(struct mtk8250_data *data,
 				struct uart_8250_port *up)
 {
 	void __iomem *base = up->port.membase;
-	int i, ret;
+	int ret = mt6580_uart_restore_context(data, up);
 
-	/* Baud, FIFO, EFR and standard 8250 state are rebuilt by resume_port.
-	 * Restore the remaining native fields before the sleep/wake handshake.
-	 * Clocks are held and serial-core RX/TX/console are still suspended.
-	 */
-	for (i = 0; i < ARRAY_SIZE(mt6580_uart_context_regs); i++) {
-		void __iomem *reg = base + mt6580_uart_context_regs[i];
-
-		data->context_before[i] = readl(reg);
-		if (data->context_before[i] != data->context_saved[i]) {
-			data->context_lost++;
-			writel(data->context_saved[i], reg);
-		}
-		data->context_restored[i] = readl(reg);
-		if (data->context_restored[i] != data->context_saved[i]) {
-			data->context_errors++;
-			data->sleep_error = -EIO;
-			return -EIO;
-		}
+	if (ret) {
+		data->sleep_error = ret;
+		return ret;
 	}
 
 	writel(data->saved_sleep_req, base + MT6580_UART_SLEEP_REQ);
 	ret = readl_poll_timeout(base + MT6580_UART_SLEEP_ACK, data->wake_ack,
 				!(data->wake_ack & MT6580_UART_SLEEP_BIT), 10, 1000);
 	writel(data->saved_sleep_en, base + MT6580_UART_SLEEP_EN);
+	if (ret) {
+		/* After infra cycling, restoring SLEEP_EN can complete the wake
+		 * transition. Check the final state after both original controls
+		 * are restored instead of retaining a stale timeout and clock ref.
+		 */
+		ret = readl_poll_timeout(base + MT6580_UART_SLEEP_ACK, data->wake_ack,
+					!(data->wake_ack & MT6580_UART_SLEEP_BIT), 10, 1000);
+		if (!ret)
+			data->wake_recoveries++;
+	}
 	if (ret) {
 		/* Retain the register clocks if wake acknowledgment is stuck. */
 		data->sleep_error = ret;
@@ -693,6 +758,7 @@ static int mtk8250_restore_sleep(struct mtk8250_data *data,
 	clk_disable_unprepare(data->uart_clk);
 	clk_disable_unprepare(data->bus_clk);
 	data->sleep_prepared = false;
+	data->sleep_error = 0;
 	data->sleep_restores++;
 	data->context_restores++;
 	return 0;
@@ -703,6 +769,7 @@ static int __maybe_unused mtk8250_suspend_late(struct device *dev)
 	struct mtk8250_data *data = dev_get_drvdata(dev);
 	struct uart_8250_port *up = serial8250_get_port(data->line);
 	void __iomem *base = up->port.membase;
+	unsigned long flags;
 	u32 val;
 	int i, ret;
 
@@ -738,8 +805,15 @@ static int __maybe_unused mtk8250_suspend_late(struct device *dev)
 				val & UART_LSR_TEMT, 10, 10000);
 	if (ret)
 		goto clocks;
+	uart_port_lock_irqsave(&up->port, &flags);
+	mt6580_uart_read_bank(up, data->bank_saved);
 	for (i = 0; i < ARRAY_SIZE(mt6580_uart_context_regs); i++)
 		data->context_saved[i] = readl(base + mt6580_uart_context_regs[i]);
+	uart_port_unlock_irqrestore(&up->port, flags);
+	if (data->bank_saved[0] & UART_LCR_DLAB) {
+		ret = -EINVAL;
+		goto clocks;
+	}
 	data->context_saves++;
 	data->sleep_prepared = true;
 	writel(data->saved_sleep_en | MT6580_UART_SLEEP_BIT,
@@ -779,16 +853,33 @@ static ssize_t sleep_state_show(struct device *dev, struct device_attribute *att
 	/* Cached snapshots only: never touch an unclocked UART from sysfs. */
 	return sysfs_emit(buf, "prepared=%u requests=%u restores=%u skips=%u error=%d\n"
 			 "saved_en=%08x saved_req=%08x sleep_ack=%08x wake_ack=%08x\n"
+			 "wake_recoveries=%u\n"
 			 "context saves=%u restores=%u changed_fields=%u errors=%u\n"
-			 "context saved=%08x/%08x/%08x before=%08x/%08x/%08x restored=%08x/%08x/%08x\n",
+			 "context saved=%08x/%08x/%08x before=%08x/%08x/%08x restored=%08x/%08x/%08x\n"
+			 "bank saved=%08x/%08x/%08x/%08x/%08x/%08x/%08x before=%08x/%08x/%08x/%08x/%08x/%08x/%08x restored=%08x/%08x/%08x/%08x/%08x/%08x/%08x\n"
+			 "baud saved=%08x/%08x/%08x/%08x/%08x before=%08x/%08x/%08x/%08x/%08x restored=%08x/%08x/%08x/%08x/%08x\n",
 			 data->sleep_prepared, data->sleep_requests, data->sleep_restores,
 			 data->sleep_skips, data->sleep_error, data->saved_sleep_en,
 			 data->saved_sleep_req, data->sleep_ack, data->wake_ack,
+			 data->wake_recoveries,
 			 data->context_saves, data->context_restores,
 			 data->context_lost, data->context_errors,
 			 data->context_saved[0], data->context_saved[1], data->context_saved[2],
 			 data->context_before[0], data->context_before[1], data->context_before[2],
-			 data->context_restored[0], data->context_restored[1], data->context_restored[2]);
+			 data->context_restored[0], data->context_restored[1], data->context_restored[2],
+			 data->bank_saved[0], data->bank_saved[1], data->bank_saved[2],
+			 data->bank_saved[3], data->bank_saved[4], data->bank_saved[5], data->bank_saved[6],
+			 data->bank_before[0], data->bank_before[1], data->bank_before[2],
+			 data->bank_before[3], data->bank_before[4], data->bank_before[5], data->bank_before[6],
+			 data->bank_restored[0], data->bank_restored[1], data->bank_restored[2],
+			 data->bank_restored[3], data->bank_restored[4],
+			 data->bank_restored[5], data->bank_restored[6],
+			 data->context_saved[3], data->context_saved[4], data->context_saved[5],
+			 data->context_saved[6], data->context_saved[7],
+			 data->context_before[3], data->context_before[4], data->context_before[5],
+			 data->context_before[6], data->context_before[7],
+			 data->context_restored[3], data->context_restored[4], data->context_restored[5],
+			 data->context_restored[6], data->context_restored[7]);
 }
 static DEVICE_ATTR_RO(sleep_state);
 

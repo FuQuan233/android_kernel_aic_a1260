@@ -17,6 +17,8 @@
 #include <linux/init.h>
 #include <linux/seq_file.h>
 #include <linux/syscore_ops.h>
+#include <linux/export.h>
+#include <linux/soc/mediatek/mt6580-irq.h>
 
 struct mtk_sysirq_chip_data {
 	raw_spinlock_t lock;
@@ -33,6 +35,16 @@ struct mtk_sysirq_chip_data {
 
 /* MT6580 has one SYSIRQ instance. Keep other SoCs' PM policy unchanged. */
 static struct mtk_sysirq_chip_data *mt6580_sysirq_pm;
+
+bool mt6580_sysirq_suspend_ready(void)
+{
+	struct mtk_sysirq_chip_data *data = mt6580_sysirq_pm;
+
+	return data && data->nr_intpol_bases == 1 && data->nr_saved_words == 7 &&
+		READ_ONCE(data->prepared) && !READ_ONCE(data->errors) &&
+		READ_ONCE(data->saves) == READ_ONCE(data->restores) + 1;
+}
+EXPORT_SYMBOL_GPL(mt6580_sysirq_suspend_ready);
 
 static int mt6580_sysirq_suspend(void)
 {

@@ -2294,3 +2294,57 @@ recovered without new kernel WARNING/Oops. Standard images are
 boot-uart-context.img and kernel-uart-context (#99). Controls/timers/
 tracing/wake references were cleared. Evidence under out/a1260-runtime-pm
 is uart-99- plus check.txt, trace.txt, dmesg.txt, resume.txt and final.txt.
+
+Infra power branch and early UART restoration
+---------------------------------------------
+
+The default-off infra_control option additionally requires all previous
+CPU0/R0/APSRC/F26M/DDRPHY controls, saved native UART context, prepared
+seven-word SYSIRQ context, enabled CIRQ v1 over SPI32..157, initialized/idle
+PWRAP WACS2 with suspend commands staged, and powered-on IFR control bits.
+Queries are atomic; missing prerequisites abort before output handoff.
+Only BSP INFRA_PDN_DIS is additionally cleared (flags=0x3b8). Voltage and
+MAINPLL policy stay retained. Existing qualification watchdog limits apply.
+
+Initial #100 returned through CPU0 cold resume with IFR power/SRAM and
+DDR restored, but UART wake ACK timed out. It retained its temporary clock
+references/prepared state rather than claiming success. The earlier UART
+code restored only three native fields and deferred standard/baud setup
+to serial core, which happens after the early wake handshake. The BSP
+instead restores full UART context before request_uart_to_wakeup().
+
+Corrected #103 replays banked LCR/EFR/FCR/DLL/DLM/MCR/IER plus native baud,
+sample, fractional and escape controls while RX/TX/console are quiesced.
+FCR self-clearing flush bits are excluded from readback comparison. Final
+UART startup remains serial-core-owned. ACK is also rechecked after both
+original sleep controls are restored if the first poll timed out; this
+bounded fallback was reviewed but not exercised (wake_recoveries=0).
+
+Three infra cold entries completed with flags=0x3b8, SRC_REQ=0x0c,
+IFR_PWR_CON=0x00f0000d and SRAMROM=0x0000ff00 before/after, and matched
+power status/DDR snapshots. Each entry reset seven UART fields: LCR 0x13
+and EFR 1 became zero; HIGHSPEED 3, SAMPLE_COUNT 0x1b, SAMPLE_POINT 0x0c,
+FRACDIV_L 5 and escape data were restored from their reset values. UART
+changed_fields reached 21 with zero readback errors; saves/restores 5/5
+including normal s2idle and bound standby. SYSIRQ stayed 4/4 with no
+polarity loss/error. This captures actual UART register loss/recovery,
+not just a software flag change.
+
+Total suspend success/fail was 5/0; CPU0 cold/erratum counts were 3/3 with
+zero WFI aborts. The stopped physical counter advanced about 0.910 ms
+per cold entry. Default s2idle recovered; bound standby woke early through
+MUSB (PCM timer=7665), so it does not qualify a full two-second bound sleep.
+RTC second granularity clamped its short-sleep compensation near zero.
+All four sampled clocks remained monotonic. The 16 MiB RAM hash matched,
+EMI source stayed 266499673 Hz, 52 MHz eMMC direct I/O and Mali pixel
+readback passed, RDMA underflow/abnormal counts stayed zero, and no new
+kernel WARNING/Oops was captured. Controls/timers/tracing/wake references
+were cleared. Standard boot/kernel are boot-infra-uart-wake-fixed.img and
+kernel-infra-uart-wake-fixed (#103). Evidence under out/a1260-runtime-pm is
+infra-103- plus check.txt, trace.txt, dmesg.txt, analysis.json, resume.txt
+and final.txt. infra-100-first.txt, infra-100-trace.txt,
+infra-100-dmesg.txt and infra-100-uart-stuck.txt retain the initial failure.
+Android still defaults to s2idle: unbounded production deep sleep requires
+replacing the 30-second qualification guard, finer sleep accounting and
+physical USB plug/wake handling. No whole-device power measurement is
+claimed.

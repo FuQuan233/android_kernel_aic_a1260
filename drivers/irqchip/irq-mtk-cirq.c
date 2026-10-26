@@ -14,6 +14,8 @@
 #include <linux/of_address.h>
 #include <linux/slab.h>
 #include <linux/syscore_ops.h>
+#include <linux/export.h>
+#include <linux/soc/mediatek/mt6580-irq.h>
 
 enum mtk_cirq_regoffs_index {
 	CIRQ_STA,
@@ -70,6 +72,15 @@ static void __iomem *mtk_cirq_reg(struct mtk_cirq_chip_data *chip_data,
 {
 	return chip_data->base + chip_data->offsets[idx];
 }
+
+bool mt6580_cirq_suspend_ready(void)
+{
+	return cirq_data && cirq_data->offsets == mtk_cirq_regoffs_v1 &&
+		cirq_data->ext_irq_start == 32 && cirq_data->ext_irq_end == 157 &&
+		(readl(mtk_cirq_reg(cirq_data, CIRQ_CONTROL)) & (CIRQ_EN | CIRQ_EDGE)) ==
+		(CIRQ_EN | CIRQ_EDGE);
+}
+EXPORT_SYMBOL_GPL(mt6580_cirq_suspend_ready);
 
 static void __iomem *mtk_cirq_irq_reg(struct mtk_cirq_chip_data *chip_data,
 				      enum mtk_cirq_regoffs_index idx,

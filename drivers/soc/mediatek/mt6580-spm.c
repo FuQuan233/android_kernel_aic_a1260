@@ -15,6 +15,7 @@
 #include <linux/soc/mediatek/mt6580-usb.h>
 #include <linux/soc/mediatek/mt6580-cpu-pm.h>
 #include <linux/soc/mediatek/mt6580-ddr.h>
+#include <linux/soc/mediatek/mt6580-irq.h>
 #include <linux/suspend.h>
 
 #include <asm/proc-fns.h>
@@ -50,6 +51,8 @@
 #define SPM_PWR_STATUS		0x60c
 #define SPM_PWR_STATUS2		0x610
 #define SPM_DPY_PWR_CON		0x240
+#define SPM_IFR_PWR_CON		0x234
+#define SPM_IFR_SRAMROM_CON	0x294
 #define SPM_WAKE_MASK		0x810
 #define SPM_CPU_WAKE		0x814
 #define SPM_ISR_MASK		0x900
@@ -111,12 +114,14 @@ struct mt6580_pcm_wake {
 	u32 ddr_before[4], ddr_after[4];
 	u32 clk_expected, clk_wake, clk_restored;
 	u32 dpy_before, dpy_after;
+	u32 ifr_before, ifr_after, ifrsram_before, ifrsram_after, infra_blockers;
 	int ddr_check_before, ddr_check_after;
 	bool irq_pending, forced_exit;
 	bool r0_requested, settle_changed;
 	bool apsrc_requested;
 	bool f26m_requested;
 	bool ddrphy_requested;
+	bool infra_requested;
 };
 
 struct mt6580_spm {
@@ -139,6 +144,7 @@ struct mt6580_spm {
 	bool apsrc_control;
 	bool f26m_control;
 	bool ddrphy_control;
+	bool infra_control;
 	struct mt6580_cpu0_context cpu0;
 	u32 irq_status;
 	int irq;
@@ -264,6 +270,8 @@ static int mt6580_pcm_capture(struct mt6580_spm *spm)
 	wake->settle_wake = readl(spm->base + SPM_CLK_SETTLE);
 	wake->clk_wake = readl(spm->base + SPM_CLK_CON);
 	wake->dpy_after = readl(spm->base + SPM_DPY_PWR_CON);
+	wake->ifr_after = readl(spm->base + SPM_IFR_PWR_CON);
+	wake->ifrsram_after = readl(spm->base + SPM_IFR_SRAMROM_CON);
 	wake->r11 = readl(spm->base + PCM_REG11);
 	wake->r12 = readl(spm->base + PCM_REG12);
 	wake->r13 = readl(spm->base + PCM_REG13);
@@ -392,7 +400,10 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 	spm->wake.apsrc_requested = READ_ONCE(spm->apsrc_control);
 	spm->wake.f26m_requested = READ_ONCE(spm->f26m_control);
 	spm->wake.ddrphy_requested = READ_ONCE(spm->ddrphy_control);
+	spm->wake.infra_requested = READ_ONCE(spm->infra_control);
 	spm->wake.dpy_before = readl(spm->base + SPM_DPY_PWR_CON);
+	spm->wake.ifr_before = readl(spm->base + SPM_IFR_PWR_CON);
+	spm->wake.ifrsram_before = readl(spm->base + SPM_IFR_SRAMROM_CON);
 	spm->wake.pwr_io_expected = PCM_R7_OUTPUT;
 	if (spm->wake.apsrc_requested && !spm->wake.r0_requested)
 		return -EINVAL;
@@ -405,6 +416,23 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 	 */
 	if (spm->wake.ddrphy_requested && spm->wake.dpy_before != 0x0d)
 		return -EBUSY;
+	if (spm->wake.infra_requested) {
+		if (!spm->wake.ddrphy_requested || !spm->wake.f26m_requested)
+			spm->wake.infra_blockers |= BIT(0);
+		if ((spm->wake.ifr_before & GENMASK(4, 0)) != 0x0d)
+			spm->wake.infra_blockers |= BIT(1);
+		for (i = 0; i < spm->num_uarts; i++)
+			if (!mt6580_uart_infra_ready(spm->uarts[i]))
+				spm->wake.infra_blockers |= BIT(2);
+		if (!mt6580_sysirq_suspend_ready())
+			spm->wake.infra_blockers |= BIT(3);
+		if (!mt6580_cirq_suspend_ready())
+			spm->wake.infra_blockers |= BIT(4);
+		if (!mt6580_pwrap_infra_ready(spm->pwrap))
+			spm->wake.infra_blockers |= BIT(5);
+		if (spm->wake.infra_blockers)
+			return -EBUSY;
+	}
 	if (mode && ticks > 20 * 32768)
 		return -ERANGE;
 	spm->wake.flags_expected = PCM_RETAIN_FLAGS;
@@ -412,6 +440,8 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 		spm->wake.flags_expected &= ~BIT(0);
 	if (spm->wake.ddrphy_requested)
 		spm->wake.flags_expected &= ~BIT(2); /* BSP DDRPHY_PDN_DIS. */
+	if (spm->wake.infra_requested)
+		spm->wake.flags_expected &= ~BIT(1); /* BSP INFRA_PDN_DIS. */
 	spm->wake.power_before = readl(spm->base + SPM_PWR_STATUS);
 	spm->wake.power2_before = readl(spm->base + SPM_PWR_STATUS2);
 	/* Synchronize internal registers before connecting power control.
@@ -525,6 +555,8 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 		     spm->wake.clk_wake != spm->wake.clk_expected ||
 		     (spm->wake.ddrphy_requested &&
 		      spm->wake.dpy_after != spm->wake.dpy_before) ||
+		     (spm->wake.infra_requested &&
+		      (spm->wake.ifr_after & GENMASK(4, 0)) != 0x0d) ||
 		     (spm->wake.r0_requested &&
 		      (spm->wake.r0 != spm->wake.poweron0 ||
 		       spm->wake.settle_wake != spm->wake.settle_applied))))
@@ -640,6 +672,7 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 "apsrc requested=%u ddr_check=%d/%d\n"
 			 "f26m requested=%u clk_con expected=%08x wake=%08x restored=%08x\n"
 			 "ddrphy requested=%u power=%08x/%08x\n"
+			 "infra requested=%u blockers=%08x power=%08x/%08x sram=%08x/%08x\n"
 			 "ddr before=%08x/%08x/%08x/%08x after=%08x/%08x/%08x/%08x\n"
 			 "cpu0 mode=%u resumes=%u result=%d vector=%08x/%08x/%08x\n"
 			 "cpu0 timer_ctrl=%08x/%08x counter=%llu/%llu\n"
@@ -674,6 +707,9 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 spm->wake.f26m_requested, spm->wake.clk_expected,
 			 spm->wake.clk_wake, spm->wake.clk_restored,
 			 spm->wake.ddrphy_requested, spm->wake.dpy_before, spm->wake.dpy_after,
+			 spm->wake.infra_requested, spm->wake.infra_blockers,
+			 spm->wake.ifr_before, spm->wake.ifr_after,
+			 spm->wake.ifrsram_before, spm->wake.ifrsram_after,
 			 spm->wake.ddr_before[0], spm->wake.ddr_before[1],
 			 spm->wake.ddr_before[2], spm->wake.ddr_before[3],
 			 spm->wake.ddr_after[0], spm->wake.ddr_after[1],
@@ -819,6 +855,27 @@ static ssize_t ddrphy_control_store(struct device *dev, struct device_attribute 
 }
 static DEVICE_ATTR_RW(ddrphy_control);
 
+static ssize_t infra_control_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct mt6580_spm *spm = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(spm->infra_control));
+}
+
+static ssize_t infra_control_store(struct device *dev, struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct mt6580_spm *spm = dev_get_drvdata(dev);
+	bool enable;
+	int ret = kstrtobool(buf, &enable);
+
+	if (ret)
+		return ret;
+	WRITE_ONCE(spm->infra_control, enable);
+	return count;
+}
+static DEVICE_ATTR_RW(infra_control);
+
 static struct attribute *mt6580_spm_attrs[] = {
 	&dev_attr_state.attr,
 	&dev_attr_pcm_timer_ms.attr,
@@ -827,6 +884,7 @@ static struct attribute *mt6580_spm_attrs[] = {
 	&dev_attr_apsrc_control.attr,
 	&dev_attr_f26m_control.attr,
 	&dev_attr_ddrphy_control.attr,
+	&dev_attr_infra_control.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(mt6580_spm);

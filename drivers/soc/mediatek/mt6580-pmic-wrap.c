@@ -252,6 +252,20 @@ static struct platform_driver mt6580_pwrap_driver = {
 		.dev_groups = mt6580_pwrap_groups,
 	},
 };
+
+bool mt6580_pwrap_infra_ready(struct device *dev)
+{
+	struct mt6580_pwrap *wrp;
+	u32 status;
+
+	if (dev->driver != &mt6580_pwrap_driver.driver)
+		return false;
+	wrp = dev_get_drvdata(dev);
+	status = readl(wrp->base + WACS2_RDATA);
+	return READ_ONCE(wrp->suspend_phase) && (status & WACS_INIT_DONE) &&
+		FIELD_GET(WACS_FSM, status) == WACS_IDLE;
+}
+EXPORT_SYMBOL_GPL(mt6580_pwrap_infra_ready);
 module_platform_driver(mt6580_pwrap_driver);
 MODULE_DESCRIPTION("MT6580 firmware-initialized PMIC wrapper");
 MODULE_LICENSE("GPL");
