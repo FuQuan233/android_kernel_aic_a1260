@@ -220,7 +220,10 @@ Description:
 		A1260 initially used mem_sleep_default=s2idle during qualification.
 		After physical insertion wake across CPU0/infra/DDRPHY power-down
 		and clock stop passed, the device selects mem_sleep_default=deep.
-		MAINPLL and suspend-voltage policy remain retained.
+		Deep also parks AXI at 26 MHz and power-cycles MAINPLL using the
+		verified software sequence before/after PCM execution. Missing PLL
+		suppliers reject entry with -EBUSY before changes, allowing retained
+		fallback. Suspend-voltage bank policy remains unchanged.
 
 What:		/sys/devices/platform/10006000.power-controller/*suspend/axi_26m_control
 Date:		October 2026
@@ -239,9 +242,9 @@ Description:
 		Cached state adds axi26 requested/prepared/parked/counts/error,
 		AXI before/parked/wake/restored and CPU mux snapshots, plus MAINPLL
 		CON0/1/2/3 and PWR_CON0 before/after. PWR_CON0 is offset 0x130.
-		Automatic mem/deep ignores this qualification switch. This qualifies
-		AXI parking as a prerequisite for later PLL ownership work; it does
-		not implement or establish MAINPLL analog power-down.
+		Automatic mem/deep ignores this qualification switch and uses AXI
+		parking with the MAINPLL transaction below. AXI parking alone does
+		not change PLL power; mainpll_control selects it for explicit standby.
 
 What:		/sys/devices/platform/10006000.power-controller/*suspend/mainpll_control
 Date:		October 2026
@@ -259,11 +262,27 @@ Description:
 		comparison after recovery. CON1[31] is a PCW trigger and is excluded
 		from configuration comparison. An incomplete recovery keeps AXI
 		at 26 MHz with ownership/error retained. If PLL power recovery is
-		still incomplete after abort cleanup, the qualification panics before
+		still incomplete after abort cleanup, the driver panics before
 		normal device resume rather than running consumers with no clock.
 		State adds MAINPLL requested/off, verified power_downs/power_ups,
 		off/wake register snapshots and automatic/software_enable recovery
 		flags. Automatic means the original powered-on state was already
 		present before any software enable; power_ups includes that case.
-		Automatic mem/deep ignores this control. Register readback and
-		resumed frequency do not measure analog sleep current.
+		Automatic mem/deep ignores this control and enables the transaction
+		on every successful deep entry. Retained fallback keeps MAINPLL on.
+		Register readback and resumed frequency do not measure sleep current.
+
+What:		/sys/devices/platform/1000f000.pmic-wrap/sleep_voltage
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Read-only VPROC snapshots at platform prepare_late and finish,
+		after CPUFreq suspend and before CPUFreq resume, respectively.
+		Errors are retained separately for each snapshot; a failed optional
+		observation does not alter the established AUXADC/slot handoff.
+		Registers in order are 0x216 control, 0x21e software selector,
+		0x220 on selector, 0x222 sleep selector, 0x224 actual selector and
+		0x230 sleep/transition control. Selector low 7 bits encode
+		700000 + value * 6250 microvolts. No voltage/bank write is provided.
+		The before/resume values do not sample the rail while CPU is off
+		and must not be presented as a measurement of retention voltage.

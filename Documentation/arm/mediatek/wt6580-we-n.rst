@@ -2702,3 +2702,90 @@ mainpll-114-dmesg.txt and mainpll-114-final.txt. Physical insertion/key
 wake with MAINPLL off must be checked before enabling this transaction
 for automatic deep. Suspend voltage ownership and current measurement
 remain the following work items.
+
+MAINPLL physical wake and automatic deep
+----------------------------------------
+
+With #114's explicit full standby profile, physical cable insertion and
+power-key wake were checked separately. In the insertion case CHRDET
+advanced 0 -> 1 (unplug) -> 2 (plug), the PMIC parent woke the system
+after 15.061 seconds, USB PHY/clock restore advanced 4/4 -> 5/5 and
+MAINPLL power-down/up advanced 3/3 -> 4/4. In the key case CHRDET stayed
+at the unplug event count through wake, the PMIC parent woke the system
+after 23.326 seconds and PLL counts advanced to 5/5. Each had a new
+CPU0 cold/L2 return, matching 16 MiB RAM hashes and no mux/PLL error.
+The user confirmed insertion wakes and lights the screen, and the
+separate key wake restores the screen and touch. Both retained the
+bound gadget while offline and restored it after physical reattachment.
+Evidence is mainpll-114-plug.txt and mainpll-114-key.txt.
+
+Deep now automatically selects AXI parking and the verified MAINPLL
+power transaction, without reading the explicit standby controls. The
+retained fallback never requests either operation. DTs without the two
+PLL suppliers reject deep before changing outputs and can use that
+fallback. #115 exercised both automatic paths successfully at the
+hardware level; its host helper then failed a check because a watchdog
+variable overwrote a PLL count. This was a helper error, not marked as
+a complete regression. #116's corrected helper includes the voltage
+observations below and completes both paths and RAM checking.
+
+VPROC suspend-voltage audit
+--------------------------
+
+The MT6580 BSP's suspend PWRAP slots 4/5 only pulse AUXADC START. The
+deep-idle table separately toggles VPROC control bit 1, and the PMIC init
+source configures software/on/sleep selectors and sleep transition
+control. The current board's live setup differs: VPROC control 0x216=0
+and transition/sleep control 0x230=0, with ON/SLEEP selectors both 0x48.
+Changing hardware bank ownership or using the BSP's 0x18 retention value
+cannot be justified by clearing unused PCM flags or copying another
+SoC's slot table. CPU/GPU share this supply and the supported active
+OPPs have a 1.15 V floor.
+
+The existing CPU opp-suspend entry already selects 604.5 MHz at 1.15 V
+through cpufreq-dt. No duplicate voltage policy or selector writes were
+added. PWRAP now retains six read-only register snapshots in sleep_voltage
+at platform prepare_late and finish, after CPUFreq suspend and before
+CPUFreq resume. Observation errors are exposed separately and do not
+change the established AUXADC command handoff. Partial snapshots are
+cleared before each attempt. These are entry/recovery samples, not
+measurements of the rail while the CPU is powered off.
+
+On #116, a temporary performance governor kept the awake CPU at 1.3 GHz
+before and after the check. Both actual deep and connected-gadget
+retained fallback recorded before/resume values
+0000/0048/0048/0048/0048/0000 for registers
+0216/021e/0220/0222/0224/0230, with errors=0/0. The actual selector 0x48
+corresponds to 1.15 V. CPU frequency limits remained 604500..1300000 kHz
+and the original schedutil governor was restored. The corrected helper
+completed with identical 16 MiB RAM hashes, PLL counts 1/1 and error=0;
+retained fallback left those counts unchanged. The sleep-voltage bank
+policy remains software-controlled at the qualified active OPP floor;
+lower hardware retention voltage and analog current remain unverified.
+Evidence is pmic-voltage-114-baseline.txt, deep-mainpll-115-check.txt,
+deep-voltage-116-check.txt and deep-voltage-116-clocks.json.
+
+The final #116 Android automatic-deep physical insertion cycle passed:
+CHRDET events 0 -> 2, one new cold/L2 return, MAINPLL down/up 1/1 -> 2/2,
+USB off/on 1/1 -> 2/2 while the gadget remained bound, and error=0.
+PCM accounting reported 31.801957795 seconds with the physical counter
+stopped. Wake was attributed to PMIC IRQ 47 and SPM IRQ 74. The 16 MiB
+RAM hash matched and voltage snapshots again showed actual selector
+0x48 before/resume. The user confirmed automatic screen-on, normal
+picture and touch. Total suspend success/fail was 3/2: the earlier alarm
+pre-entry cancellation and a freeze cancellation from pending NETLINK/
+CHRDET activity immediately after unplug; the later cold entry passed
+and there were no resume-stage failures. Evidence is
+deep-voltage-116-plug.txt and deep-voltage-116-plug-trace.txt.
+
+After the physical cycle, 52 MHz eMMC direct I/O matched on both reads
+with zero hardware errors; Mali returned the expected green pixel and
+RDMA underflow/abnormal counters stayed zero. MAINPLL_D12/AXI measured
+125125000 Hz and the reference measured 26000000 Hz. No new kernel
+WARNING/Oops/panic was found. Temporary governors, wake references,
+alarms and tracing were cleared, CPU0..3 were online and Android was
+Asleep with display/system blockers released while ADB remained
+responsive. Standard product boot/kernel now use boot-deep-voltage.img
+and kernel-deep-voltage (#116). Additional evidence is
+deep-voltage-116-resume.txt, deep-voltage-116-meter.txt,
+deep-voltage-116-dmesg.txt and deep-voltage-116-final.txt.

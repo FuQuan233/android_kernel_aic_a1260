@@ -30,6 +30,11 @@ static const u16 suspend_slot_regs[] = {
 	DVFS_ADR4, DVFS_WDATA4, DVFS_ADR5, DVFS_WDATA5,
 };
 
+/* BSP VPROC: control, software/on/sleep selectors, actual selector,
+ * and hardware sleep/transition control. Snapshot only; never change policy.
+ */
+static const u16 vproc_snapshot_regs[] = { 0x216, 0x21e, 0x220, 0x222, 0x224, 0x230 };
+
 struct mt6580_pwrap {
 	void __iomem *base;
 	struct regmap *regmap;
@@ -38,8 +43,23 @@ struct mt6580_pwrap {
 	u32 suspend_slots[ARRAY_SIZE(suspend_slot_regs)];
 	unsigned int saved_auxadc, resume_auxadc, restored_auxadc;
 	unsigned int prepared, restored;
+	unsigned int vproc_before[ARRAY_SIZE(vproc_snapshot_regs)];
+	unsigned int vproc_resume[ARRAY_SIZE(vproc_snapshot_regs)];
+	int vproc_before_error, vproc_resume_error;
 	bool suspend_phase;
 };
+
+static int mt6580_pwrap_snapshot_vproc(struct mt6580_pwrap *wrp, unsigned int *values)
+{
+	int i, ret;
+
+	for (i = 0; i < ARRAY_SIZE(vproc_snapshot_regs); i++) {
+		ret = regmap_read(wrp->regmap, vproc_snapshot_regs[i], &values[i]);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
 
 static int mt6580_pwrap_restore_slots(struct mt6580_pwrap *wrp)
 {
@@ -72,6 +92,13 @@ int mt6580_pwrap_prepare_suspend(struct device *dev)
 		ret = -EBUSY;
 		goto out;
 	}
+	/* CPUFreq has already selected its suspend OPP. Observe the actual
+	 * selector here without switching voltage banks or adding PMIC writes.
+	 */
+	memset(wrp->vproc_before, 0, sizeof(wrp->vproc_before));
+	memset(wrp->vproc_resume, 0, sizeof(wrp->vproc_resume));
+	wrp->vproc_resume_error = -ENODATA;
+	wrp->vproc_before_error = mt6580_pwrap_snapshot_vproc(wrp, wrp->vproc_before);
 	ret = regmap_read(wrp->regmap, MT6350_STRUP_CON10, &value);
 	if (ret)
 		goto out;
@@ -106,6 +133,8 @@ int mt6580_pwrap_finish_suspend(struct device *dev)
 
 	mutex_lock(&wrp->phase_lock);
 	if (wrp->suspend_phase) {
+		/* Platform finish still precedes CPUFreq governor/device resume. */
+		wrp->vproc_resume_error = mt6580_pwrap_snapshot_vproc(wrp, wrp->vproc_resume);
 		ret = regmap_read(wrp->regmap, MT6350_STRUP_CON10, &wrp->resume_auxadc);
 		if (ret)
 			goto restore_slots;
@@ -150,8 +179,30 @@ static ssize_t spm_phase_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(spm_phase);
 
+static ssize_t sleep_voltage_show(struct device *dev, struct device_attribute *attr,
+				 char *buf)
+{
+	struct mt6580_pwrap *wrp = dev_get_drvdata(dev);
+	ssize_t len;
+
+	mutex_lock(&wrp->phase_lock);
+	len = sysfs_emit(buf, "errors=%d/%d (before/resume)\n"
+			 "regs=0216/021e/0220/0222/0224/0230\n"
+			 "before=%04x/%04x/%04x/%04x/%04x/%04x\n"
+			 "resume=%04x/%04x/%04x/%04x/%04x/%04x\n",
+			 wrp->vproc_before_error, wrp->vproc_resume_error,
+			 wrp->vproc_before[0], wrp->vproc_before[1], wrp->vproc_before[2],
+			 wrp->vproc_before[3], wrp->vproc_before[4], wrp->vproc_before[5],
+			 wrp->vproc_resume[0], wrp->vproc_resume[1], wrp->vproc_resume[2],
+			 wrp->vproc_resume[3], wrp->vproc_resume[4], wrp->vproc_resume[5]);
+	mutex_unlock(&wrp->phase_lock);
+	return len;
+}
+static DEVICE_ATTR_RO(sleep_voltage);
+
 static struct attribute *mt6580_pwrap_attrs[] = {
 	&dev_attr_spm_phase.attr,
+	&dev_attr_sleep_voltage.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(mt6580_pwrap);

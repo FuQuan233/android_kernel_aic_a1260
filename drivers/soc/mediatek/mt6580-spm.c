@@ -475,14 +475,19 @@ static int mt6580_pcm_run(struct mt6580_spm *spm, enum mt6580_pcm_profile profil
 	spm->wake.f26m_requested = qualify ? READ_ONCE(spm->f26m_control) : deep;
 	spm->wake.ddrphy_requested = qualify ? READ_ONCE(spm->ddrphy_control) : deep;
 	spm->wake.infra_requested = qualify ? READ_ONCE(spm->infra_control) : deep;
-	spm->wake.axi26_requested = qualify && READ_ONCE(spm->axi_26m_control);
-	spm->wake.mainpll_requested = qualify && READ_ONCE(spm->mainpll_control);
+	spm->wake.axi26_requested = qualify ? READ_ONCE(spm->axi_26m_control) : deep;
+	spm->wake.mainpll_requested = qualify ? READ_ONCE(spm->mainpll_control) : deep;
 	if (spm->wake.axi26_requested && (mode != 2 || !spm->wake.r0_requested))
 		return -EINVAL;
 	if (spm->wake.mainpll_requested && !spm->wake.axi26_requested)
 		return -EINVAL;
 	if (deep && !spm->sleep_clock_ready)
 		return -ENODEV;
+	/* Legacy DTs can still use the retained profile without PLL suppliers.
+	 * Reject before any output or clock change so automatic mem can fall back.
+	 */
+	if (deep && (!spm->clock_ctl[0] || !spm->clock_ctl[1]))
+		return -EBUSY;
 	spm->wake.dpy_before = readl(spm->base + SPM_DPY_PWR_CON);
 	spm->wake.ifr_before = readl(spm->base + SPM_IFR_PWR_CON);
 	spm->wake.ifrsram_before = readl(spm->base + SPM_IFR_SRAMROM_CON);
@@ -737,7 +742,7 @@ static int mt6580_spm_enter(suspend_state_t state)
 	    num_online_cpus() != 1 ||
 	    smp_processor_id())
 		return -EINVAL;
-	/* An incomplete qualification owns the parked source until recovery. */
+	/* An incomplete transaction owns the parked source until recovery. */
 	if (spm->axi.parked || spm->axi.mainpll_off) {
 		ret = -EBUSY;
 		goto out;
