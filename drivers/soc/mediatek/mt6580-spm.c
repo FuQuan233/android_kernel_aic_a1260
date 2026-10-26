@@ -6,6 +6,7 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/irq.h>
+#include <linux/math64.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
@@ -18,6 +19,7 @@
 #include <linux/soc/mediatek/mt6580-irq.h>
 #include <linux/suspend.h>
 
+#include <asm/arch_timer.h>
 #include <asm/proc-fns.h>
 
 #include "mt6580-spm-pcm.h"
@@ -115,6 +117,9 @@ struct mt6580_pcm_wake {
 	u32 clk_expected, clk_wake, clk_restored;
 	u32 dpy_before, dpy_after;
 	u32 ifr_before, ifr_after, ifrsram_before, ifrsram_after, infra_blockers;
+	u32 time_ticks_start, time_ticks_end;
+	u64 time_counter_start, time_counter_end, stopped_ns;
+	bool time_started;
 	int ddr_check_before, ddr_check_after;
 	bool irq_pending, forced_exit;
 	bool r0_requested, settle_changed;
@@ -145,6 +150,7 @@ struct mt6580_spm {
 	bool f26m_control;
 	bool ddrphy_control;
 	bool infra_control;
+	bool sleep_clock_ready;
 	struct mt6580_cpu0_context cpu0;
 	u32 irq_status;
 	int irq;
@@ -362,10 +368,39 @@ static int mt6580_pcm_idle_finish(unsigned long arg)
 
 	writel(PCM_KEY | con0 | PCM_KICK, spm->base + PCM_CON0);
 	writel(PCM_KEY | con0, spm->base + PCM_CON0);
+	if (spm->sleep_clock_ready) {
+		spm->wake.time_counter_start = __arch_counter_get_cntpct();
+		spm->wake.time_ticks_start = readl(spm->base + PCM_TIMER_OUT);
+		spm->wake.time_started = true;
+	}
 	spm->runs++;
 	cpu_do_idle();
 	mt6580_pcm_wake_snapshot(spm);
 	return 0;
+}
+
+static void mt6580_pcm_account_time(struct mt6580_spm *spm)
+{
+	struct mt6580_pcm_wake *wake = &spm->wake;
+	u64 pcm_ns, active_ns;
+	u32 ticks;
+
+	if (!wake->time_started)
+		return;
+	wake->time_ticks_end = readl(spm->base + PCM_TIMER_OUT);
+	wake->time_counter_end = __arch_counter_get_cntpct();
+	if (!wake->f26m_requested)
+		return; /* Physical counter already includes the entire interval. */
+	ticks = wake->time_ticks_end - wake->time_ticks_start;
+	pcm_ns = div_u64((u64)ticks * NSEC_PER_SEC, 32768);
+	active_ns = mul_u64_u32_div(wake->time_counter_end - wake->time_counter_start,
+				   NSEC_PER_SEC, arch_timer_get_rate());
+	/* Exclude the active entry/exit tails already counted by CNT. Clamp
+	 * sub-tick cancellation to zero on an immediate or aborted entry.
+	 */
+	if (pcm_ns > active_ns)
+		wake->stopped_ns = pcm_ns - active_ns;
+	mt6580_suspend_clock_add(wake->stopped_ns);
 }
 
 static int mt6580_pcm_sysclk_settle(struct mt6580_spm *spm)
@@ -433,8 +468,13 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 		if (spm->wake.infra_blockers)
 			return -EBUSY;
 	}
-	if (mode && ticks > 20 * 32768)
+	if (mode && READ_ONCE(spm->timer_ms) > 20000)
 		return -ERANGE;
+	/* Keep a 32 kHz time base for external wakes too. The maximum timer
+	 * supplies a rollover wake after about 36 hours, not a short timeout.
+	 */
+	if (spm->sleep_clock_ready && !ticks)
+		ticks = U32_MAX;
 	spm->wake.flags_expected = PCM_RETAIN_FLAGS;
 	if (mode == 2)
 		spm->wake.flags_expected &= ~BIT(0);
@@ -532,6 +572,7 @@ static int mt6580_pcm_run(struct mt6580_spm *spm)
 					 mt6580_pcm_wait_finish, (unsigned long)spm);
 	else
 		ret = mt6580_pcm_idle_finish((unsigned long)spm);
+	mt6580_pcm_account_time(spm);
 	if (ret)
 		return ret;
 	ret = mt6580_pcm_wait_finish((unsigned long)spm);
@@ -584,6 +625,9 @@ static int mt6580_spm_prepare_late(void)
 	struct mt6580_spm *spm = mt6580_spm;
 	int ret = mt6580_pcm_idle(spm);
 
+	spm->sleep_clock_ready = !mt6580_suspend_clock_prepare();
+	if (!ret && !spm->sleep_clock_ready && READ_ONCE(spm->f26m_control))
+		ret = -ENODEV;
 	if (!ret)
 		ret = mt6580_pwrap_prepare_suspend(spm->pwrap);
 	if (!ret) {
@@ -673,6 +717,7 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 "f26m requested=%u clk_con expected=%08x wake=%08x restored=%08x\n"
 			 "ddrphy requested=%u power=%08x/%08x\n"
 			 "infra requested=%u blockers=%08x power=%08x/%08x sram=%08x/%08x\n"
+			 "sleep_clock ready=%u ticks=%u/%u counter=%llu/%llu stopped_ns=%llu\n"
 			 "ddr before=%08x/%08x/%08x/%08x after=%08x/%08x/%08x/%08x\n"
 			 "cpu0 mode=%u resumes=%u result=%d vector=%08x/%08x/%08x\n"
 			 "cpu0 timer_ctrl=%08x/%08x counter=%llu/%llu\n"
@@ -710,6 +755,10 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 spm->wake.infra_requested, spm->wake.infra_blockers,
 			 spm->wake.ifr_before, spm->wake.ifr_after,
 			 spm->wake.ifrsram_before, spm->wake.ifrsram_after,
+			 spm->sleep_clock_ready,
+			 spm->wake.time_ticks_start, spm->wake.time_ticks_end,
+			 spm->wake.time_counter_start, spm->wake.time_counter_end,
+			 spm->wake.stopped_ns,
 			 spm->wake.ddr_before[0], spm->wake.ddr_before[1],
 			 spm->wake.ddr_before[2], spm->wake.ddr_before[3],
 			 spm->wake.ddr_after[0], spm->wake.ddr_after[1],

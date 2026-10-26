@@ -19,4 +19,8 @@ int mt6580_cpu0_suspend(struct mt6580_cpu0_context *ctx, unsigned int mode,
 		       int (*idle)(unsigned long), int (*wait)(unsigned long),
 		       unsigned long arg);
 
+/* Prepare before timekeeping suspend; account before syscore resume. */
+int mt6580_suspend_clock_prepare(void);
+void mt6580_suspend_clock_add(u64 stopped_ns);
+
 #endif

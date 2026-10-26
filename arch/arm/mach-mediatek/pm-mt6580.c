@@ -3,17 +3,21 @@
 #include <linux/init.h>
 #include <linux/cpu_pm.h>
 #include <linux/io.h>
+#include <linux/math64.h>
 #include <linux/of.h>
+#include <linux/seqlock.h>
 #include <linux/sizes.h>
 #include <linux/smp.h>
 #include <linux/soc/mediatek/mt6580-cpu-pm.h>
 #include <linux/suspend.h>
+#include <linux/timekeeping.h>
 
 #include <asm/arch_timer.h>
 #include <asm/barrier.h>
 #include <asm/cacheflush.h>
 #include <asm/cp15.h>
 #include <asm/memory.h>
+#include <asm/mach/time.h>
 #include <asm/irqflags.h>
 #include <asm/proc-fns.h>
 #include <asm/smp_plat.h>
@@ -21,6 +25,71 @@
 #include <asm/system_misc.h>
 
 #include "pm-mt6580.h"
+
+/* CNT physical counter runs at 13 MHz while awake. PCM supplies the
+ * missing interval when that source stops. No timekeeping API is called
+ * from the persistent-clock reader itself.
+ */
+static DEFINE_SEQLOCK(mt6580_time_lock);
+static struct timespec64 mt6580_time_epoch;
+static u64 mt6580_time_counter, mt6580_time_extra;
+static u32 mt6580_time_rate;
+static bool mt6580_time_registered, mt6580_time_ready;
+
+static void mt6580_read_persistent_clock(struct timespec64 *ts)
+{
+	u64 counter, base, extra, ns;
+	unsigned int seq;
+	bool ready;
+
+	do {
+		seq = read_seqbegin(&mt6580_time_lock);
+		ready = mt6580_time_ready;
+		*ts = mt6580_time_epoch;
+		base = mt6580_time_counter;
+		extra = mt6580_time_extra;
+		counter = __arch_counter_get_cntpct();
+	} while (read_seqretry(&mt6580_time_lock, seq));
+	if (!ready) {
+		*ts = (struct timespec64) { 0 };
+		return;
+	}
+	ns = mul_u64_u32_div(counter - base, NSEC_PER_SEC, mt6580_time_rate);
+	timespec64_add_ns(ts, ns + extra);
+}
+
+int mt6580_suspend_clock_prepare(void)
+{
+	struct timespec64 now;
+	unsigned long flags;
+	u64 counter;
+
+	if (!mt6580_time_registered)
+		return -ENODEV;
+	/* Sample timekeeping before taking our seqlock: the reader may be
+	 * called from timekeeping, so reverse nesting would deadlock.
+	 */
+	local_irq_save(flags);
+	ktime_get_real_ts64(&now);
+	counter = __arch_counter_get_cntpct();
+	write_seqlock(&mt6580_time_lock);
+	mt6580_time_epoch = now;
+	mt6580_time_counter = counter;
+	mt6580_time_extra = 0;
+	mt6580_time_ready = true;
+	write_sequnlock(&mt6580_time_lock);
+	local_irq_restore(flags);
+	return 0;
+}
+
+void mt6580_suspend_clock_add(u64 stopped_ns)
+{
+	unsigned long flags;
+
+	write_seqlock_irqsave(&mt6580_time_lock, flags);
+	mt6580_time_extra += stopped_ns;
+	write_sequnlock_irqrestore(&mt6580_time_lock, flags);
+}
 
 #define MT6580_INFRACFG_AO	0x10001000
 #define BOOT_ADDR		0x800
@@ -236,6 +305,12 @@ static int __init mt6580_pm_init(void)
 			mt6580_cpu_config = NULL;
 			mt6580_cpu_wdt = NULL;
 			return -ENOMEM;
+		}
+		if (IS_ENABLED(CONFIG_MTK_MT6580_SPM)) {
+			mt6580_time_rate = arch_timer_get_rate();
+			if (mt6580_time_rate == 13000000 &&
+			    !register_persistent_clock(mt6580_read_persistent_clock))
+				mt6580_time_registered = true;
 		}
 	}
 	/* The optional SPM child driver supplies the staged PCM path. */

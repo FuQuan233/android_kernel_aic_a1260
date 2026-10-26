@@ -45,6 +45,12 @@ Description:
 		returns without reset, and errata counts completed sibling-core
 		L2 recovery sequences. L2 control/cache reset policy and temporary
 		watchdog before/armed/restored values are also captured.
+		sleep_clock ready records the ARM persistent-clock provider; ticks
+		and counter record paired PCM 32.768 kHz and physical CNT samples.
+		stopped_ns is the nonnegative PCM interval minus CNT time when
+		F26M is handed off. It is added before timekeeping resumes.
+		Generic timekeeping uses the composite clock instead of injecting
+		second-granularity RTC sleep time a second time.
 
 What:		/sys/devices/platform/10006000.power-controller/*suspend/cpu0_mode
 Date:		October 2026
@@ -76,8 +82,11 @@ Date:		October 2026
 Contact:	FuQuan <i@fuquan.moe>
 Description:
 		Optional PCM timer for explicit standby, in milliseconds, 0..60000.
-		Default 0 disables it and uses external wakeup. A nonzero value
-		arms a 32.768 kHz PCM timer for the next standby entry. It neither
+		Default 0 selects external wakeup. With the platform sleep clock
+		available, its timer still counts to U32_MAX (about 36.4 hours) so
+		external wake intervals can be measured; rollover also wakes PCM.
+		Without that clock, 0 disables the timer. A nonzero value arms a
+		32.768 kHz PCM timer for the next standby entry. It neither
 		changes Android's default s2idle policy nor enables power gating.
 
 What:		/sys/devices/platform/10006000.power-controller/*suspend/r0_control

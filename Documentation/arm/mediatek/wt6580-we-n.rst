@@ -2384,3 +2384,41 @@ chrdet-104-plug-wake.txt, chrdet-104-plug-trace.txt, chrdet-104-infra.txt,
 chrdet-104-infra-trace.txt, chrdet-104-resume.txt, chrdet-104-final.txt and
 chrdet-104-dmesg.txt. Host bus remote-resume and bound-gadget PHY gating
 remain separate work; USB bulk debugging stays deferred.
+
+Subsecond stopped-clock accounting
+----------------------------------
+
+The seconds-only MT6350 RTC cannot accurately compensate short clock-stop
+intervals. The MT6580 ARM persistent-clock reader now combines the awake
+13 MHz physical counter with elapsed PCM 32.768 kHz ticks. The provider is
+registered at architecture init, returns zero until the first prepared
+standby, and is rebased before timekeeping suspends. The reader never calls
+timekeeping. Entry/exit samples subtract time already covered by CNT; the
+missing nonnegative interval is published before timekeeping resumes.
+Generic timekeeping then handles BOOTTIME/REALTIME and skips duplicate RTC
+injection. A later s2idle continues to use the running physical counter.
+No generic timekeeping or RTC-core code is changed.
+
+For external wake with pcm_timer_ms=0, PCM counts to U32_MAX instead of
+being disabled when the composite clock is available. The approximately
+36.4-hour rollover also wakes the system. The current 30-second CPU0 test
+guard still applies independently. Other entry prerequisites are unchanged.
+
+Kernel #105 completed three infra cold entries plus default s2idle and
+bound standby; two PCM two-second sleeps injected 2.004827438 and
+2.004827670 seconds. An external RTC wake injected 8.020819420 seconds.
+Additional 125/375/1000 ms entries injected 0.129832822/0.379831440/
+1.004827362 seconds, including entry/exit work while timekeeping was
+suspended. Their PCM-minus-CNT stopped portions were 0.128186362/
+0.378186516/1.003186901 seconds. These are internally consistent counter
+checks, not an independent calibration of the 32 kHz oscillator.
+REALTIME and BOOTTIME sleep deltas agreed within a few microseconds;
+MONOTONIC/RAW stayed consistent. Total success/fail was 8/1: an Android
+alarm cancelled one entry before sleep, and its retry passed. RAM hashes,
+52 MHz eMMC direct I/O, Mali drawing and display recovery passed, without
+new kernel WARNING/Oops. Controls, RTC, tracing and temporary wake locks
+were cleared; default Android remains s2idle. Evidence is
+out/a1260-runtime-pm/precise-clock-105-{check,trace,short,short-trace,
+resume,final,dmesg}.txt. Production long sleep still requires replacing
+the qualification watchdog; physical USB insertion wake was verified in
+#104 as described above.
