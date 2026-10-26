@@ -1931,3 +1931,47 @@ underflows recovered. No kernel WARNING/Oops was captured. Evidence is
 ``cpu0-82-multi.txt``, ``cpu0-82-dmesg.txt`` and ``cpu0-82-resume.txt``.
 Standard product boot/kernel use #82. Qualification mode, RTC/PCM timers,
 trace overrides and temporary wake references were cleared/restored.
+
+Unused modem shutdown and MD1 domain
+-----------------------------------
+
+This product never loads modem firmware. Its original devinfo index 3 is
+0x1002 (the modem-disabled fuse bit is clear), and MD1 booted powered on
+with R13 MD1_SRCLKENA/APSRC_REQ/ACK bits 3/4/5 high. No telephony service
+does not itself shut down this hardware. The dedicated modem-off DT node
+now claims the two private TOPSM windows exclusively. It must not coexist
+with a working modem/CCCI consumer.
+
+The GPL BSP ccci_util/mt6580/ccci_off.c sequence first quiesces the five 2G
+power-control blocks, timers, MD/2G requests and ABB PLL requests. Only then
+does its runtime-PM reference release MD1 to genpd. SCPSYS uses the BSP
+0xcc bus-protection mask, SRAM power-down bit 8, isolation, reset and clock
+disable, and checks both power-status mirrors with bounded polls. MD1 has
+no separate SRAM acknowledgment field in the BSP. The cached modem state
+never reads private registers after power-off, and the modem carve-out
+and SPM hardware arbitration masks remain intact.
+
+Build #83 stopped at readback validation: it compared request masks with
+0xffffffff, while the implemented MD/2G fields read back 0x3f/0x03 and
+reserved bits read as zero. It was not promoted. Build #84 checks those
+implemented fields and completes shutdown. Its cached request masks are
+0 -> 0x3f and 0 -> 0x03; MD_PWR_CON=0x112, MD1 is off in both power mirrors,
+and 0xcc protection is acknowledged. R13 becomes 0xfc041000 at boot and
+0xfc001000 after standby, with bits 3/4/5 clear. This is observed request
+release, without forcing those request inputs low in SPM.
+
+Three CPU-reset standby entries slept 2.001057/2.001068/8.826180 seconds,
+with cold/erratum counts 3/3 and no WFI abort. Before the RTC entry, an
+imminent Android alarm canceled device suspend once with -EBUSY; a retry
+completed. Default s2idle then slept 8.635725 seconds. MD1 remained off and
+its quiesce count remained 1 through all four entries. Four CPUs and the
+16 MiB RAM hash recovered; 52 MHz eMMC direct write/fsync/readback, Mali
+pixel readback, RDMA without underflow/abnormal frames, thermal and 500 mA
+charging readings recovered, without a new kernel WARNING/Oops.
+
+Standard product boot/kernel use #84. Temporary mode, wake references,
+RTC/PCM timers and tracing were cleared/restored. Evidence under
+``out/a1260-runtime-pm/`` is ``modem-off-baseline.txt``,
+``modem-off-83-{initial,dmesg}.txt`` and
+``modem-off-84-{initial,check,dmesg,resume,final}.txt``. USB clock/PHY system
+PM and physical clock/DDR transitions remain separate work.

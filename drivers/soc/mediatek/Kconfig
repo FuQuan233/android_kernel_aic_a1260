@@ -81,6 +81,15 @@ config MTK_MT6580_SPM
 	  26 MHz override; APSRC and crystal control remain retained.
 	  Firmware-initialized MT6350 PWRAP and CIRQ are required.
 
+config MTK_MT6580_MODEM_OFF
+	bool "MT6580 unused modem shutdown"
+	depends on MACH_MT6580 && PM && MTK_SCPSYS=y
+	help
+	  Quiesce the internal MD/2G TOPSM and ABB on boards that never use
+	  the modem, then release the MD1 power domain through genpd. The
+	  dedicated DT node must not coexist with a modem firmware driver.
+	  Reserved modem RAM and SPM hardware arbitration masks stay intact.
+
 config MTK_REGULATOR_COUPLER
 	bool "MediaTek SoC Regulator Coupler" if COMPILE_TEST
 	default ARCH_MEDIATEK

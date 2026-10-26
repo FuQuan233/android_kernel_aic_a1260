@@ -36,6 +36,7 @@
 #define SPM_ISP_PWR_CON			0x0238
 #define SPM_DIS_PWR_CON			0x023c
 #define SPM_CONN_PWR_CON		0x0280
+#define SPM_MD_PWR_CON			0x0284
 #define SPM_VEN2_PWR_CON		0x0298
 #define SPM_AUDIO_PWR_CON		0x029c	/* MT8173, MT2712 */
 #define SPM_BDP_PWR_CON			0x029c	/* MT2701 */
@@ -60,6 +61,7 @@
 #define PWR_ON_2ND_BIT			BIT(3)
 #define PWR_CLK_DIS_BIT			BIT(4)
 
+#define PWR_STATUS_MD1			BIT(0)
 #define PWR_STATUS_CONN			BIT(1)
 #define PWR_STATUS_DISP			BIT(3)
 #define PWR_STATUS_MFG			BIT(4)
@@ -1022,6 +1024,15 @@ static const struct scp_subdomain scp_subdomain_mt8173[] = {
 
 /* MT6580 BSP MTCMOS sequences. Domain IDs are independent of other SoCs. */
 static const struct scp_domain_data scp_domain_data_mt6580[] = {
+	[MT6580_POWER_DOMAIN_MD1] = {
+		.name = "md1",
+		.sta_mask = PWR_STATUS_MD1,
+		.ctl_offs = SPM_MD_PWR_CON,
+		.sram_pdn_bits = BIT(8),
+		/* The BSP defines no SRAM acknowledgment for MD1. */
+		.bus_prot_mask = BIT(2) | BIT(3) | BIT(6) | BIT(7),
+		.clk_id = { CLK_NONE },
+	},
 	[MT6580_POWER_DOMAIN_MFG] = {
 		.name = "mfg",
 		.sta_mask = PWR_STATUS_MFG,

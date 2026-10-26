@@ -6,6 +6,7 @@ obj-$(CONFIG_MTK_INFRACFG) += mtk-infracfg.o
 obj-$(CONFIG_MTK_PMIC_WRAP) += mtk-pmic-wrap.o
 obj-$(CONFIG_MTK_MT6580_PMIC_WRAP) += mt6580-pmic-wrap.o
 obj-$(CONFIG_MTK_MT6580_SPM) += mt6580-spm.o
+obj-$(CONFIG_MTK_MT6580_MODEM_OFF) += mt6580-modem-off.o
 obj-$(CONFIG_MTK_REGULATOR_COUPLER) += mtk-regulator-coupler.o
 obj-$(CONFIG_MTK_MMSYS) += mtk-mmsys.o
 obj-$(CONFIG_MTK_MMSYS) += mtk-mutex.o

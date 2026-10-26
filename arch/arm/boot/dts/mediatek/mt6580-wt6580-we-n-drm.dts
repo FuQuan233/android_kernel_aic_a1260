@@ -69,6 +69,14 @@
 		};
 	};
 
+	/* This remote has no modem service; quiesce MD/ABB before MD1 off. */
+	modem_off: modem-power-controller@20030000 {
+		compatible = "mediatek,mt6580-modem-off";
+		reg = <0 0x20030000 0 0x900>, <0 0x23010000 0 0x900>;
+		reg-names = "md-topsm", "2g-topsm";
+		power-domains = <&scpsys MT6580_POWER_DOMAIN_MD1>;
+	};
+
 	mfgcfg: clock-controller@13000000 {
 		compatible = "mediatek,mt6580-mfgcfg";
 		reg = <0 0x13000000 0 0x1000>;
