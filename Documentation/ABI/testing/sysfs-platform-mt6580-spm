@@ -223,7 +223,9 @@ Description:
 		Deep also parks AXI at 26 MHz and power-cycles MAINPLL using the
 		verified software sequence before/after PCM execution. Missing PLL
 		suppliers reject entry with -EBUSY before changes, allowing retained
-		fallback. Suspend-voltage bank policy remains unchanged.
+		fallback. Boards opting into mediatek,vproc-retention borrow the
+		qualified MT6350 hardware sleep policy during mem; other boards
+		retain their prior voltage-bank policy.
 
 What:		/sys/devices/platform/10006000.power-controller/*suspend/axi_26m_control
 Date:		October 2026
@@ -286,3 +288,34 @@ Description:
 		700000 + value * 6250 microvolts. No voltage/bank write is provided.
 		The before/resume values do not sample the rail while CPU is off
 		and must not be presented as a measurement of retention voltage.
+
+What:		/sys/devices/platform/10006000.power-controller/*suspend/voltage_bank_control
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Unsigned qualification mode, default 0, affecting explicit standby.
+		1 tests software/hardware ON bank ownership with a 1.15625 V marker;
+		2 stages the MT6580 BSP's 0.85 V sleep selector, sleep reference,
+		soft-change/transition enable and SRCLKEN/oscillator hardware clock
+		handoff. Both require CPU0 mode 2 and all R0/APSRC/F26M/DDRPHY/infra/
+		AXI/MAINPLL qualification controls. CPUFreq must already have selected
+		the 1.15 V suspend OPP; software/on/sleep baseline selectors must all
+		be 0x48 with software ownership and sleep transition disabled.
+		Mode 2 additionally requires the known software-enabled clock baseline.
+		Every added field is checked by readback; an error unwinds through
+		platform finish. Return to the software bank and the original actual
+		selector is checked before CPUFreq/device resume. Failed bank recovery
+		panics rather than resuming a governor with the wrong voltage owner.
+		Mode 1 never enables analog-sleep controls. Mode 2 uses the exact
+		MT6580 BSP fields; it does not clear unused PCM voltage flags.
+		The sleep_voltage snapshot adds bank ownership/counts/error, armed/
+		marker/released/restored snapshots and mode-2 clock/reference/slew/
+		transition snapshots. resume_error reports observation failure;
+		counts include a prepared transaction rolled back after an early abort.
+		Automatic mem ignores this qualification control. With board property
+		mediatek,vproc-retention it applies mode 2 independently, skipping an
+		unsupported/firmware-owned baseline only before any new bank write.
+		Retained-power fallback holds F26M and does not request hardware sleep,
+		although the prepared bank policy is still restored on return.
+		The 0.85 V value is a programmed sleep target, not a rail measurement
+		made while the CPU is powered off. Awake OPP limits are unchanged.

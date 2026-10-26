@@ -2,12 +2,14 @@
 /* MT6580 WACS2 access, retaining the bootloader's MT6350 wrapper setup. */
 #include <linux/bitfield.h>
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mfd/mt6350/registers.h>
 #include <linux/mutex.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/panic.h>
 #include <linux/regmap.h>
 #include <linux/soc/mediatek/mt6580-pwrap.h>
 
@@ -25,6 +27,30 @@
 #define DVFS_ADR5	0x10c
 #define DVFS_WDATA5	0x110
 #define AUXADC_START	BIT(4)
+#define VPROC_CTRL	0x216
+#define VPROC_ON	0x220
+#define VPROC_SLEEP	0x222
+#define VPROC_ACTUAL	0x224
+#define VPROC_TRANS	0x230
+#define PMIC_CLK_CTRL	0x120
+#define VPROC_SLP	0x212
+#define VPROC_SLEW	0x21c
+#define VPROC_HW_VOSEL	BIT(1)
+#define VPROC_SLEEP_EN	BIT(8)
+#define VPROC_SLEEP_SEL	BIT(11)
+#define VPROC_SEL_MASK	GENMASK(6, 0)
+#define VPROC_FLOOR_SEL	0x48
+#define VPROC_MARKER_SEL	0x49
+#define VPROC_RETENTION_SEL 0x18
+#define PMIC_CLK_MASK	(BIT(0) | BIT(4) | BIT(5))
+#define VPROC_SLP_MASK	GENMASK(5, 4)
+#define VPROC_SLEW_MASK	(BIT(15) | GENMASK(7, 0))
+#define VPROC_TRANS_MASK	(BIT(8) | GENMASK(5, 4) | GENMASK(1, 0))
+
+static const u16 retention_regs[] = { PMIC_CLK_CTRL, VPROC_SLP, VPROC_SLEW, VPROC_TRANS };
+static const u16 retention_masks[] = {
+	PMIC_CLK_MASK, VPROC_SLP_MASK, VPROC_SLEW_MASK, VPROC_TRANS_MASK,
+};
 
 static const u16 suspend_slot_regs[] = {
 	DVFS_ADR4, DVFS_WDATA4, DVFS_ADR5, DVFS_WDATA5,
@@ -46,8 +72,42 @@ struct mt6580_pwrap {
 	unsigned int vproc_before[ARRAY_SIZE(vproc_snapshot_regs)];
 	unsigned int vproc_resume[ARRAY_SIZE(vproc_snapshot_regs)];
 	int vproc_before_error, vproc_resume_error;
+	unsigned int bank_armed[6], bank_forced[6], bank_released[6], bank_restored[6];
+	unsigned int bank_entries, bank_restores, bank_markers;
+	bool bank_active;
+	int bank_error;
+	unsigned int bank_mode;
+	unsigned int retention_skips;
+	int retention_resume_error;
+	unsigned int retention_before[4], retention_armed[4];
+	unsigned int retention_resume[4], retention_restored[4];
 	bool suspend_phase;
 };
+
+static int mt6580_pwrap_retention_snapshot(struct mt6580_pwrap *wrp, unsigned int *values)
+{
+	int i, ret;
+
+	for (i = 0; i < ARRAY_SIZE(retention_regs); i++) {
+		ret = regmap_read(wrp->regmap, retention_regs[i], &values[i]);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static int mt6580_pwrap_update_checked(struct mt6580_pwrap *wrp, unsigned int reg,
+				      unsigned int mask, unsigned int value)
+{
+	unsigned int after;
+	int ret = regmap_update_bits(wrp->regmap, reg, mask, value);
+
+	if (!ret)
+		ret = regmap_read(wrp->regmap, reg, &after);
+	if (!ret && ((after ^ value) & mask))
+		ret = -EIO;
+	return ret;
+}
 
 static int mt6580_pwrap_snapshot_vproc(struct mt6580_pwrap *wrp, unsigned int *values)
 {
@@ -59,6 +119,193 @@ static int mt6580_pwrap_snapshot_vproc(struct mt6580_pwrap *wrp, unsigned int *v
 			return ret;
 	}
 	return 0;
+}
+
+static int mt6580_pwrap_restore_bank(struct mt6580_pwrap *wrp)
+{
+	unsigned int value;
+	int i, ret;
+
+	if (!wrp->bank_active)
+		return 0;
+	/* Reassert the original clock policy before undoing bank ownership. */
+	if (wrp->bank_mode == MT6580_VPROC_RETENTION_TEST) {
+		ret = mt6580_pwrap_update_checked(wrp, PMIC_CLK_CTRL, PMIC_CLK_MASK,
+						wrp->retention_before[0]);
+		if (ret)
+			return ret;
+	}
+	/* Return voltage ownership before CPUFreq can write its software bank.
+	 * The software selector was left at the qualified 1.15 V suspend OPP.
+	 */
+	ret = regmap_update_bits(wrp->regmap, VPROC_CTRL, VPROC_HW_VOSEL,
+				 wrp->vproc_before[0] & VPROC_HW_VOSEL);
+	if (ret)
+		return ret;
+	ret = regmap_read_poll_timeout(wrp->regmap, VPROC_ACTUAL, value,
+		(value & VPROC_SEL_MASK) == (wrp->vproc_before[4] & VPROC_SEL_MASK),
+		10, 10000);
+	if (ret)
+		return ret;
+	ret = regmap_update_bits(wrp->regmap, VPROC_ON, VPROC_SEL_MASK,
+				 wrp->vproc_before[2]);
+	if (ret)
+		return ret;
+	if (wrp->bank_mode == MT6580_VPROC_RETENTION_TEST) {
+		for (i = ARRAY_SIZE(retention_regs) - 1; i > 0; i--) {
+			ret = mt6580_pwrap_update_checked(wrp, retention_regs[i],
+				retention_masks[i], wrp->retention_before[i]);
+			if (ret)
+				return ret;
+		}
+		ret = mt6580_pwrap_update_checked(wrp, VPROC_SLEEP, VPROC_SEL_MASK,
+						wrp->vproc_before[3]);
+		if (ret)
+			return ret;
+		ret = mt6580_pwrap_retention_snapshot(wrp, wrp->retention_restored);
+		if (ret)
+			return ret;
+	}
+	ret = mt6580_pwrap_snapshot_vproc(wrp, wrp->bank_restored);
+	if (ret)
+		return ret;
+	if (((wrp->bank_restored[0] ^ wrp->vproc_before[0]) & VPROC_HW_VOSEL) ||
+	    ((wrp->bank_restored[2] ^ wrp->vproc_before[2]) & VPROC_SEL_MASK) ||
+	    ((wrp->bank_restored[3] ^ wrp->vproc_before[3]) & VPROC_SEL_MASK) ||
+	    ((wrp->bank_restored[5] ^ wrp->vproc_before[5]) &
+	     (VPROC_TRANS_MASK | VPROC_SLEEP_SEL)) ||
+	    ((wrp->bank_restored[1] ^ wrp->vproc_before[1]) & VPROC_SEL_MASK) ||
+	    ((wrp->bank_restored[4] ^ wrp->vproc_before[4]) & VPROC_SEL_MASK))
+		return -EIO;
+	wrp->bank_active = false;
+	wrp->bank_restores++;
+	return 0;
+}
+
+static int mt6580_pwrap_bank_snapshot(struct mt6580_pwrap *wrp, unsigned int *values)
+{
+	int ret = mt6580_pwrap_snapshot_vproc(wrp, values);
+	unsigned int actual;
+
+	if (ret)
+		return ret;
+	actual = values[4] & VPROC_SEL_MASK;
+	/* This test never requests undervoltage: both possible banks are at
+	 * the proven active floor or one 6.25 mV step above it.
+	 */
+	if (actual != VPROC_FLOOR_SEL && actual != VPROC_MARKER_SEL)
+		return -EIO;
+	if (actual == VPROC_MARKER_SEL)
+		wrp->bank_markers++;
+	return 0;
+}
+
+static int mt6580_pwrap_arm_retention(struct mt6580_pwrap *wrp)
+{
+	unsigned int actual;
+	int ret;
+
+	/* Exact MT6580 BSP fields: sleep reference 2, falling/rising soft
+	 * change, digital sleep selector 0x18 and transition/VSLEEP enable.
+	 * Software and ON selectors stay at 0x48. Only the final clock handoff
+	 * allows hardware to observe SRCLKEN falling during PCM suspend.
+	 */
+	ret = mt6580_pwrap_update_checked(wrp, VPROC_SLP, VPROC_SLP_MASK, 2 << 4);
+	if (!ret)
+		ret = mt6580_pwrap_update_checked(wrp, VPROC_SLEW, VPROC_SLEW_MASK, 0x8097);
+	if (!ret)
+		ret = mt6580_pwrap_update_checked(wrp, VPROC_SLEEP,
+						VPROC_SEL_MASK, VPROC_RETENTION_SEL);
+	if (!ret)
+		ret = mt6580_pwrap_update_checked(wrp, VPROC_CTRL, VPROC_HW_VOSEL, VPROC_HW_VOSEL);
+	if (!ret)
+		ret = mt6580_pwrap_update_checked(wrp, VPROC_TRANS, VPROC_TRANS_MASK, 0x113);
+	if (!ret)
+		ret = regmap_read(wrp->regmap, VPROC_ACTUAL, &actual);
+	if (!ret && (actual & VPROC_SEL_MASK) != VPROC_FLOOR_SEL)
+		ret = -EIO;
+	if (!ret)
+		ret = mt6580_pwrap_update_checked(wrp, PMIC_CLK_CTRL, PMIC_CLK_MASK, PMIC_CLK_MASK);
+	if (!ret)
+		ret = mt6580_pwrap_snapshot_vproc(wrp, wrp->bank_armed);
+	if (!ret)
+		ret = mt6580_pwrap_retention_snapshot(wrp, wrp->retention_armed);
+	if (!ret && (wrp->bank_armed[4] & VPROC_SEL_MASK) != VPROC_FLOOR_SEL)
+		ret = -EIO;
+	return ret;
+}
+
+static int mt6580_pwrap_arm_bank(struct mt6580_pwrap *wrp, unsigned int mode)
+{
+	int ret;
+
+	if (wrp->bank_active)
+		return -EBUSY;
+	wrp->bank_error = 0;
+	wrp->bank_mode = mode;
+	wrp->retention_resume_error = -ENODATA;
+	memset(wrp->retention_before, 0, sizeof(wrp->retention_before));
+	memset(wrp->retention_armed, 0, sizeof(wrp->retention_armed));
+	memset(wrp->retention_resume, 0, sizeof(wrp->retention_resume));
+	memset(wrp->retention_restored, 0, sizeof(wrp->retention_restored));
+	memset(wrp->bank_armed, 0, sizeof(wrp->bank_armed));
+	memset(wrp->bank_forced, 0, sizeof(wrp->bank_forced));
+	memset(wrp->bank_released, 0, sizeof(wrp->bank_released));
+	memset(wrp->bank_restored, 0, sizeof(wrp->bank_restored));
+	if (wrp->vproc_before_error ||
+	    (wrp->vproc_before[0] & VPROC_HW_VOSEL) ||
+	    (wrp->vproc_before[5] & (GENMASK(5, 4) | VPROC_SLEEP_EN | VPROC_SLEEP_SEL)) ||
+	    (wrp->vproc_before[1] & VPROC_SEL_MASK) != VPROC_FLOOR_SEL ||
+	    (wrp->vproc_before[2] & VPROC_SEL_MASK) != VPROC_FLOOR_SEL ||
+	    (wrp->vproc_before[3] & VPROC_SEL_MASK) != VPROC_FLOOR_SEL ||
+	    (wrp->vproc_before[4] & VPROC_SEL_MASK) != VPROC_FLOOR_SEL)
+		return -EBUSY;
+	if (mode == MT6580_VPROC_RETENTION_TEST) {
+		ret = mt6580_pwrap_retention_snapshot(wrp, wrp->retention_before);
+		if (ret)
+			return ret;
+		/* Do not borrow a clock policy already owned by firmware. */
+		if ((wrp->retention_before[0] & PMIC_CLK_MASK) != BIT(0))
+			return -EBUSY;
+	}
+	/* Keep ownership across a partial setup so platform finish rolls it
+	 * back before the software-bank regulator driver resumes.
+	 */
+	wrp->bank_active = true;
+	if (mode == MT6580_VPROC_RETENTION_TEST) {
+		ret = mt6580_pwrap_arm_retention(wrp);
+		goto done;
+	}
+	ret = regmap_update_bits(wrp->regmap, VPROC_ON, VPROC_SEL_MASK, VPROC_MARKER_SEL);
+	if (!ret)
+		ret = regmap_update_bits(wrp->regmap, VPROC_CTRL, VPROC_HW_VOSEL, VPROC_HW_VOSEL);
+	if (!ret) {
+		usleep_range(100, 150);
+		ret = mt6580_pwrap_bank_snapshot(wrp, wrp->bank_forced);
+		if (!ret && (wrp->bank_forced[4] & VPROC_SEL_MASK) != VPROC_MARKER_SEL)
+			ret = -EIO;
+	}
+	if (!ret)
+		ret = regmap_update_bits(wrp->regmap, VPROC_ON, VPROC_SEL_MASK, VPROC_FLOOR_SEL);
+	if (!ret) {
+		usleep_range(100, 150);
+		ret = mt6580_pwrap_bank_snapshot(wrp, wrp->bank_released);
+		if (!ret && (wrp->bank_released[4] & VPROC_SEL_MASK) != VPROC_FLOOR_SEL)
+			ret = -EIO;
+	}
+	if (!ret)
+		ret = regmap_update_bits(wrp->regmap, VPROC_ON, VPROC_SEL_MASK, VPROC_MARKER_SEL);
+	if (!ret) {
+		usleep_range(100, 150);
+		ret = mt6580_pwrap_bank_snapshot(wrp, wrp->bank_armed);
+		if (!ret && (wrp->bank_armed[4] & VPROC_SEL_MASK) != VPROC_MARKER_SEL)
+			ret = -EIO;
+	}
+done:
+	wrp->bank_error = ret;
+	if (!ret)
+		wrp->bank_entries++;
+	return ret;
 }
 
 static int mt6580_pwrap_restore_slots(struct mt6580_pwrap *wrp)
@@ -78,22 +325,23 @@ static int mt6580_pwrap_restore_slots(struct mt6580_pwrap *wrp)
 }
 
 /* Called in sleepable suspend preparation, before CPUs/IRQs are disabled.
- * Staging commands does not execute them or change the PMIC register.
- * WACS2 voltage/RTC users do not use these autonomous command slots.
+ * Staging AUXADC commands does not execute them. The optional bank
+ * transaction separately owns checked PMIC configuration until finish.
+ * WACS2 voltage/RTC users do not use the autonomous AUXADC command slots.
  */
-int mt6580_pwrap_prepare_suspend(struct device *dev)
+int mt6580_pwrap_prepare_suspend(struct device *dev, enum mt6580_vproc_sleep_mode mode)
 {
 	struct mt6580_pwrap *wrp = dev_get_drvdata(dev);
 	unsigned int value;
 	int i, ret;
 
 	mutex_lock(&wrp->phase_lock);
-	if (wrp->suspend_phase) {
+	if (wrp->suspend_phase || wrp->bank_active) {
 		ret = -EBUSY;
 		goto out;
 	}
 	/* CPUFreq has already selected its suspend OPP. Observe the actual
-	 * selector here without switching voltage banks or adding PMIC writes.
+	 * selector before any optional bank transaction changes ownership.
 	 */
 	memset(wrp->vproc_before, 0, sizeof(wrp->vproc_before));
 	memset(wrp->vproc_resume, 0, sizeof(wrp->vproc_resume));
@@ -120,6 +368,18 @@ int mt6580_pwrap_prepare_suspend(struct device *dev)
 		}
 	}
 	wrp->prepared++;
+	if (mode != MT6580_VPROC_RETAIN) {
+		ret = mt6580_pwrap_arm_bank(wrp, mode == MT6580_VPROC_RETENTION_AUTO ?
+					  MT6580_VPROC_RETENTION_TEST : mode);
+		/* A firmware-owned or unsupported baseline can retain the previous
+		 * voltage policy. Only skip before any bank write; real bus/setup
+		 * or recovery errors still abort and unwind the transaction.
+		 */
+		if (mode == MT6580_VPROC_RETENTION_AUTO && ret == -EBUSY && !wrp->bank_active) {
+			wrp->retention_skips++;
+			ret = 0;
+		}
+	}
 out:
 	mutex_unlock(&wrp->phase_lock);
 	return ret;
@@ -129,12 +389,26 @@ EXPORT_SYMBOL_GPL(mt6580_pwrap_prepare_suspend);
 int mt6580_pwrap_finish_suspend(struct device *dev)
 {
 	struct mt6580_pwrap *wrp = dev_get_drvdata(dev);
+	bool bank_active;
 	int ret = 0, restore;
 
 	mutex_lock(&wrp->phase_lock);
+	bank_active = wrp->bank_active;
+	if (wrp->bank_active) {
+		/* Sample hardware ownership before returning to the software bank. */
+		wrp->vproc_resume_error = mt6580_pwrap_snapshot_vproc(wrp, wrp->vproc_resume);
+		if (wrp->bank_mode == MT6580_VPROC_RETENTION_TEST)
+			wrp->retention_resume_error =
+				mt6580_pwrap_retention_snapshot(wrp, wrp->retention_resume);
+		ret = mt6580_pwrap_restore_bank(wrp);
+		if (ret)
+			panic("MT6580: VPROC bank ownership did not recover (%d)", ret);
+	}
 	if (wrp->suspend_phase) {
 		/* Platform finish still precedes CPUFreq governor/device resume. */
-		wrp->vproc_resume_error = mt6580_pwrap_snapshot_vproc(wrp, wrp->vproc_resume);
+		if (!bank_active)
+			wrp->vproc_resume_error =
+				mt6580_pwrap_snapshot_vproc(wrp, wrp->vproc_resume);
 		ret = regmap_read(wrp->regmap, MT6350_STRUP_CON10, &wrp->resume_auxadc);
 		if (ret)
 			goto restore_slots;
@@ -195,6 +469,37 @@ static ssize_t sleep_voltage_show(struct device *dev, struct device_attribute *a
 			 wrp->vproc_before[3], wrp->vproc_before[4], wrp->vproc_before[5],
 			 wrp->vproc_resume[0], wrp->vproc_resume[1], wrp->vproc_resume[2],
 			 wrp->vproc_resume[3], wrp->vproc_resume[4], wrp->vproc_resume[5]);
+	len += sysfs_emit_at(buf, len,
+		"bank active=%u entries=%u restores=%u markers=%u error=%d\n"
+		"bank_armed=%04x/%04x/%04x/%04x/%04x/%04x\n"
+		"bank_forced=%04x/%04x/%04x/%04x/%04x/%04x\n"
+		"bank_released=%04x/%04x/%04x/%04x/%04x/%04x\n"
+		"bank_restored=%04x/%04x/%04x/%04x/%04x/%04x\n",
+		wrp->bank_active, wrp->bank_entries, wrp->bank_restores,
+		wrp->bank_markers, wrp->bank_error,
+		wrp->bank_armed[0], wrp->bank_armed[1], wrp->bank_armed[2],
+		wrp->bank_armed[3], wrp->bank_armed[4], wrp->bank_armed[5],
+		wrp->bank_forced[0], wrp->bank_forced[1], wrp->bank_forced[2],
+		wrp->bank_forced[3], wrp->bank_forced[4], wrp->bank_forced[5],
+		wrp->bank_released[0], wrp->bank_released[1], wrp->bank_released[2],
+		wrp->bank_released[3], wrp->bank_released[4], wrp->bank_released[5],
+		wrp->bank_restored[0], wrp->bank_restored[1], wrp->bank_restored[2],
+		wrp->bank_restored[3], wrp->bank_restored[4], wrp->bank_restored[5]);
+	len += sysfs_emit_at(buf, len,
+		"bank_mode=%u skips=%u resume_error=%d retention_regs=0120/0212/021c/0230\n"
+		"retention_before=%04x/%04x/%04x/%04x\n"
+		"retention_armed=%04x/%04x/%04x/%04x\n"
+		"retention_resume=%04x/%04x/%04x/%04x\n"
+		"retention_restored=%04x/%04x/%04x/%04x\n",
+		wrp->bank_mode, wrp->retention_skips, wrp->retention_resume_error,
+		wrp->retention_before[0], wrp->retention_before[1],
+		wrp->retention_before[2], wrp->retention_before[3],
+		wrp->retention_armed[0], wrp->retention_armed[1],
+		wrp->retention_armed[2], wrp->retention_armed[3],
+		wrp->retention_resume[0], wrp->retention_resume[1],
+		wrp->retention_resume[2], wrp->retention_resume[3],
+		wrp->retention_restored[0], wrp->retention_restored[1],
+		wrp->retention_restored[2], wrp->retention_restored[3]);
 	mutex_unlock(&wrp->phase_lock);
 	return len;
 }

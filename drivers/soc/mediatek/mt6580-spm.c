@@ -159,6 +159,9 @@ struct mt6580_spm {
 	bool infra_control;
 	bool axi_26m_control;
 	bool mainpll_control;
+	unsigned int voltage_bank_control;
+	bool vproc_retention;
+	suspend_state_t requested_state;
 	struct mt6580_axi_context axi;
 	bool sleep_clock_ready;
 	suspend_state_t last_state;
@@ -701,13 +704,24 @@ static irqreturn_t mt6580_spm_irq(int irq, void *data)
 static int mt6580_spm_prepare_late(void)
 {
 	struct mt6580_spm *spm = mt6580_spm;
+	enum mt6580_vproc_sleep_mode bank_test = MT6580_VPROC_RETAIN;
 	int ret = mt6580_pcm_idle(spm);
 
+	if (spm->requested_state == PM_SUSPEND_STANDBY)
+		bank_test = READ_ONCE(spm->voltage_bank_control);
+	else if (spm->requested_state == PM_SUSPEND_MEM && spm->vproc_retention)
+		bank_test = MT6580_VPROC_RETENTION_AUTO;
+	if (spm->requested_state == PM_SUSPEND_STANDBY && bank_test &&
+	    (READ_ONCE(spm->cpu0_mode) != 2 || !READ_ONCE(spm->r0_control) ||
+	     !READ_ONCE(spm->apsrc_control) || !READ_ONCE(spm->f26m_control) ||
+	     !READ_ONCE(spm->ddrphy_control) || !READ_ONCE(spm->infra_control) ||
+	     !READ_ONCE(spm->axi_26m_control) || !READ_ONCE(spm->mainpll_control)))
+		return -EINVAL;
 	spm->sleep_clock_ready = !mt6580_suspend_clock_prepare();
 	if (!ret && !spm->sleep_clock_ready && READ_ONCE(spm->f26m_control))
 		ret = -ENODEV;
 	if (!ret)
-		ret = mt6580_pwrap_prepare_suspend(spm->pwrap);
+		ret = mt6580_pwrap_prepare_suspend(spm->pwrap, bank_test);
 	if (!ret) {
 		ret = enable_irq_wake(spm->irq);
 		if (!ret)
@@ -798,8 +812,15 @@ static int mt6580_spm_valid(suspend_state_t state)
 	return state == PM_SUSPEND_STANDBY || state == PM_SUSPEND_MEM;
 }
 
+static int mt6580_spm_begin(suspend_state_t state)
+{
+	mt6580_spm->requested_state = state;
+	return 0;
+}
+
 static const struct platform_suspend_ops mt6580_spm_ops = {
 	.valid = mt6580_spm_valid,
+	.begin = mt6580_spm_begin,
 	.prepare_late = mt6580_spm_prepare_late,
 	.enter = mt6580_spm_enter,
 	.finish = mt6580_spm_finish,
@@ -1115,6 +1136,30 @@ static ssize_t mainpll_control_store(struct device *dev, struct device_attribute
 }
 static DEVICE_ATTR_RW(mainpll_control);
 
+static ssize_t voltage_bank_control_show(struct device *dev, struct device_attribute *attr,
+					char *buf)
+{
+	struct mt6580_spm *spm = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(spm->voltage_bank_control));
+}
+
+static ssize_t voltage_bank_control_store(struct device *dev, struct device_attribute *attr,
+					 const char *buf, size_t count)
+{
+	struct mt6580_spm *spm = dev_get_drvdata(dev);
+	unsigned int mode;
+	int ret = kstrtouint(buf, 0, &mode);
+
+	if (ret)
+		return ret;
+	if (mode > MT6580_VPROC_RETENTION_TEST)
+		return -EINVAL;
+	WRITE_ONCE(spm->voltage_bank_control, mode);
+	return count;
+}
+static DEVICE_ATTR_RW(voltage_bank_control);
+
 static struct attribute *mt6580_spm_attrs[] = {
 	&dev_attr_state.attr,
 	&dev_attr_pcm_timer_ms.attr,
@@ -1126,6 +1171,7 @@ static struct attribute *mt6580_spm_attrs[] = {
 	&dev_attr_infra_control.attr,
 	&dev_attr_axi_26m_control.attr,
 	&dev_attr_mainpll_control.attr,
+	&dev_attr_voltage_bank_control.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(mt6580_spm);
@@ -1226,6 +1272,7 @@ static int mt6580_spm_probe(struct platform_device *pdev)
 	if (!spm)
 		return -ENOMEM;
 	spm->dev = dev;
+	spm->vproc_retention = of_property_read_bool(dev->of_node, "mediatek,vproc-retention");
 	spm->pwrap = &pwrap->dev;
 	ret = mt6580_spm_get_clock_controllers(spm);
 	if (ret)

@@ -66,6 +66,7 @@
 			mediatek,uarts = <&uart0>;
 			mediatek,usbs = <&usb>;
 			mediatek,clock-controllers = <&topckgen>, <&apmixedsys>;
+			mediatek,vproc-retention;
 			interrupts = <GIC_SPI 88 IRQ_TYPE_LEVEL_LOW>;
 			clocks = <&topckgen CLK_MT6580_TOP_SPM>;
 			clock-names = "spm";

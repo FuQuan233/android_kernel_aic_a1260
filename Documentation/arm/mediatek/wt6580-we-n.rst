@@ -2789,3 +2789,110 @@ responsive. Standard product boot/kernel now use boot-deep-voltage.img
 and kernel-deep-voltage (#116). Additional evidence is
 deep-voltage-116-resume.txt, deep-voltage-116-meter.txt,
 deep-voltage-116-dmesg.txt and deep-voltage-116-final.txt.
+
+MT6350 VPROC bank and hardware sleep handoff
+-------------------------------------------
+
+The BSP PMIC initialization supplies more than a sleep selector: it sets
+SRCLKEN/OSC hardware mode in 0x120, sleep reference 2 in 0x212[5:4],
+0x21c falling-rate 0x17 plus falling/rising enables, 0x222 sleep selector
+0x18, and 0x230 TRANSTD=3, transition enable=1 and VSLEEP enable=1.
+Only the corresponding masks are changed. These fields were taken from
+power/mt6580/pmic.c:3075-3116 and the MT6580 PMIC register definitions.
+The public MT6350 datasheet corroborates the software voltage encoding,
+but omits these detailed hardware-sleep controls. Other PMIC models'
+register descriptions were not used as authority for MT6350 writes.
+Document identity, source fields and limitations are retained under
+out/a1260-runtime-pm/pmic-retention/source-notes.json.
+
+Before using that handoff, #118 separately tested software/hardware bank
+ownership with a higher 1.15625 V marker. CPUFreq was suspended at the
+existing 604.5 MHz / 1.15 V OPP. The ON selector was changed to 0x49,
+control bit 1 handed ownership to hardware, and actual selector 0x224
+followed ON 0x49 -> 0x48 -> 0x49. CPU0/infra/DDRPHY/MAINPLL sleep and
+RTC wake completed while hardware retained the marker; platform finish
+returned control to software and actual voltage to 1.15 V before the
+performance governor resumed at 1.3 GHz. Analog sleep controls were not
+enabled in this marker test. A subsequent normal deep ignored the
+explicit qualification switch, and the 16 MiB RAM hash matched.
+Evidence is voltage-bank-118-check.txt and voltage-bank-118-clocks.json.
+
+#119 then qualified the BSP hardware sleep policy separately. Checked
+armed fields were VPROC control=2, SW/ON=0x48, sleep=0x18, actual=0x48,
+transition=0x113; clock/reference/slew/transition were
+0x0031/0x0023/0x8597/0x0113. After full CPU0/infra/DDRPHY/MAINPLL suspend
+and RTC wake, actual was already back at 0x48. The original clock and
+voltage ownership and all changed fields were restored to
+0x0001/0x0003/0x0505/0x0000 and software/on/sleep/actual=0x48.
+A separate physical insertion woke the system after 19.696 seconds,
+advanced CHRDET 0 -> 2 and bank transactions 1/1 -> 2/2, and matched
+the 16 MiB RAM hash. The user confirmed automatic screen-on and normal
+picture/touch. Evidence is retention-voltage-119-check.txt,
+retention-voltage-119-clocks.json and retention-voltage-119-plug.txt.
+
+The qualification switch voltage_bank_control is scoped by the target
+suspend state recorded in platform begin: 0 retains the old policy,
+1 selects the marker test and 2 selects the BSP sleep policy. Explicit
+standby requires all full CPU0/R0/APSRC/F26M/DDRPHY/infra/AXI/MAINPLL
+controls. A1260's DT now opts into mediatek,vproc-retention for automatic
+mem/deep independently of these qualification settings. Other boards do
+not change policy. An unsupported/firmware-owned baseline is skipped
+only before any new bank write; bus/setup/recovery errors are not hidden.
+If rollback cannot recover software ownership, the driver stops before
+CPUFreq/device resume rather than accepting future writes to the wrong
+bank. Hardware fields and restoration are checked through fresh regmap
+reads; AUXADC slots remain a separate transaction.
+
+#121's automatic profile and connected-gadget retained fallback both
+completed. Actual before/resume was 1.15 V, bank transactions were 2/2,
+with error=0, skips=0 and successful resume observations. Retained
+fallback held F26M and left MAINPLL counts unchanged, although its
+prepared PMIC policy was also restored on return. The 16 MiB RAM hash
+matched and performance mode returned to 1.3 GHz; limits stayed
+604500..1300000 kHz and schedutil was restored. Evidence is
+auto-retention-121-check.txt and auto-retention-121-clocks.json.
+
+The 0.85 V value is a configured hardware sleep target. Entry/recovery
+register samples and successful wake do not directly measure the rail
+while CPU0 is off, nor quantify sleep current. Awake OPP voltages and
+the shared CPU/GPU 1.15 V floor remain unchanged.
+
+Final #121 automatic-deep physical qualification
+----------------------------------------------
+
+The first combined key/insertion helper did not enter a new deep cycle:
+unplug itself woke the display and the helper had only sent sleep before
+unplug. Its stale cold count correctly failed the check. User-visible
+screen responses from that attempt were not counted as sleep qualification.
+The helper now sends sleep after the unplug event settles, then releases
+its local hold. This was a helper sequencing fix, not a kernel change.
+The rejected record is auto-retention-121-cycle.txt.
+
+The corrected run recorded a real KEY_POWER DOWN with VBUS still absent,
+a new CPU0 cold/L2 return after 21.780748309 seconds of stopped counter,
+and bank preparation/restoration advancing 2/2 -> 3/3. The helper then
+slept the display again and released its hold. A separate cable insertion
+woke the system after 27.002212988 seconds, CHRDET advanced 3 -> 4,
+another cold/L2 return completed and bank counts advanced 3/3 -> 4/4.
+Both had hardware sleep configuration 0031/0023/8597/0113 at wake,
+actual selector 0x48, complete original-field restoration, error=0,
+skips=0 and resume observation error=0. The user confirmed both wakes,
+normal picture and touch. The same 16 MiB RAM hash survived both cycles.
+Total suspend success/fail was 4/0. Evidence is
+auto-retention-121-cycle-fixed.txt.
+
+After these physical cycles, 52 MHz eMMC direct writes and two direct
+reads matched with zero hardware errors; Mali returned the expected
+green pixel, and RDMA underflow/abnormal remained zero. Frequency
+measurement returned MAINPLL_D12/AXI=125125000 Hz and reference=26000000 Hz.
+No new kernel WARNING/Oops/panic was seen. Temporary qualification
+controls, wake references and RTC alarm were cleared, schedutil and
+604500..1300000 kHz limits were restored, all four CPUs were online,
+and Android was Asleep with display/system blockers released while
+connected ADB remained responsive. Standard boot/kernel are now
+boot-auto-retention.img and kernel-auto-retention (#121), retaining the
+first-stage fsck ramdisk. Further evidence is auto-retention-121-resume.txt,
+auto-retention-121-meter.txt, auto-retention-121-dmesg.txt and
+auto-retention-121-final.txt. Kernel/DT builds and checkpatch passed;
+binding YAML parsed, but full dt-schema tools were unavailable locally.
+Rail/current measurement during CPU-off sleep remains a separate task.
