@@ -72,6 +72,7 @@ config MTK_MT6580_SPM
 	  Prepare the MT6350 suspend command slots and load the BSP PCM program
 	  during explicit retained-state standby. The PCM is not executed yet;
 	  CPU0, GIC, infra and DDR remain powered. Android keeps using s2idle.
+	  Firmware-initialized MT6350 PWRAP and CIRQ support are required.
 
 config MTK_REGULATOR_COUPLER
 	bool "MediaTek SoC Regulator Coupler" if COMPILE_TEST
