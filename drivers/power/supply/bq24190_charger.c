@@ -243,6 +243,9 @@ struct bq24190_dev_info {
 	u32				vreg;
 	u32				vreg_max;
 	struct mutex			f_reg_lock;
+	/* Serialize the system-sleep gate with every SMBus transfer. */
+	struct mutex			io_lock;
+	bool				system_suspended;
 	u8				f_reg;
 	u8				ss_reg;
 	u8				watchdog;
@@ -293,7 +296,10 @@ static int bq24190_read(struct bq24190_dev_info *bdi, u8 reg, u8 *data)
 {
 	int ret;
 
-	ret = i2c_smbus_read_byte_data(bdi->client, reg);
+	mutex_lock(&bdi->io_lock);
+	ret = bdi->system_suspended ? -ENODATA :
+		i2c_smbus_read_byte_data(bdi->client, reg);
+	mutex_unlock(&bdi->io_lock);
 	if (ret < 0)
 		return ret;
 
@@ -303,7 +309,13 @@ static int bq24190_read(struct bq24190_dev_info *bdi, u8 reg, u8 *data)
 
 static int bq24190_write(struct bq24190_dev_info *bdi, u8 reg, u8 data)
 {
-	return i2c_smbus_write_byte_data(bdi->client, reg, data);
+	int ret;
+
+	mutex_lock(&bdi->io_lock);
+	ret = bdi->system_suspended ? -EAGAIN :
+		i2c_smbus_write_byte_data(bdi->client, reg, data);
+	mutex_unlock(&bdi->io_lock);
+	return ret;
 }
 
 static int bq24190_read_mask(struct bq24190_dev_info *bdi, u8 reg,
@@ -1322,6 +1334,9 @@ static int bq24190_charger_get_property(struct power_supply *psy,
 
 	dev_dbg(bdi->dev, "prop: %d\n", psp);
 
+	if (READ_ONCE(bdi->system_suspended))
+		return -ENODATA;
+
 	ret = pm_runtime_resume_and_get(bdi->dev);
 	if (ret < 0)
 		return ret;
@@ -1479,7 +1494,7 @@ static void bq24190_charger_external_power_changed(struct power_supply *psy)
 	 * too low default 500mA iinlim. Delay setting the input-current-limit
 	 * for 300ms to avoid this.
 	 */
-	queue_delayed_work(system_percpu_wq, &bdi->input_current_limit_work,
+	queue_delayed_work(system_freezable_wq, &bdi->input_current_limit_work,
 			   msecs_to_jiffies(300));
 }
 
@@ -1656,6 +1671,9 @@ static int bq24190_battery_get_property(struct power_supply *psy,
 	dev_warn(bdi->dev, "warning: /sys/class/power_supply/bq24190-battery is deprecated\n");
 	dev_dbg(bdi->dev, "prop: %d\n", psp);
 
+	if (READ_ONCE(bdi->system_suspended))
+		return -ENODATA;
+
 	ret = pm_runtime_resume_and_get(bdi->dev);
 	if (ret < 0)
 		return ret;
@@ -1783,6 +1801,8 @@ static void bq24190_check_status(struct bq24190_dev_info *bdi)
 
 	ret = bq24190_read(bdi, BQ24190_REG_SS, &ss_reg);
 	if (ret < 0) {
+		if (ret == -ENODATA)
+			return;
 		dev_err(bdi->dev, "Can't read SS reg: %d\n", ret);
 		return;
 	}
@@ -1791,6 +1811,8 @@ static void bq24190_check_status(struct bq24190_dev_info *bdi)
 	do {
 		ret = bq24190_read(bdi, BQ24190_REG_F, &f_reg);
 		if (ret < 0) {
+			if (ret == -ENODATA)
+				return;
 			dev_err(bdi->dev, "Can't read F reg: %d\n", ret);
 			return;
 		}
@@ -2124,6 +2146,7 @@ static int bq24190_probe(struct i2c_client *client)
 	strscpy(bdi->model_name, id->name, sizeof(bdi->model_name));
 	bdi->info = i2c_get_match_data(client);
 	mutex_init(&bdi->f_reg_lock);
+	mutex_init(&bdi->io_lock);
 	bdi->charge_type = POWER_SUPPLY_CHARGE_TYPE_FAST;
 	bdi->f_reg = 0;
 	bdi->ss_reg = BQ24190_REG_SS_VBUS_STAT_MASK; /* impossible state */
@@ -2289,7 +2312,7 @@ static __maybe_unused int bq24190_runtime_resume(struct device *dev)
 	struct i2c_client *client = to_i2c_client(dev);
 	struct bq24190_dev_info *bdi = i2c_get_clientdata(client);
 
-	if (!bdi->initialized)
+	if (!bdi->initialized || READ_ONCE(bdi->system_suspended))
 		return 0;
 
 	if (!bdi->irq_event) {
@@ -2316,6 +2339,14 @@ static __maybe_unused int bq24190_pm_suspend(struct device *dev)
 		pm_runtime_put_autosuspend(bdi->dev);
 	}
 
+	/* Drain in-flight SMBus I/O before the adapter's suspend callback.
+	 * Change notifications run on a non-freezable workqueue, so freezing
+	 * userspace/polling alone does not keep them away from the adapter.
+	 */
+	mutex_lock(&bdi->io_lock);
+	WRITE_ONCE(bdi->system_suspended, true);
+	mutex_unlock(&bdi->io_lock);
+
 	return 0;
 }
 
@@ -2324,6 +2355,11 @@ static __maybe_unused int bq24190_pm_resume(struct device *dev)
 	struct i2c_client *client = to_i2c_client(dev);
 	struct bq24190_dev_info *bdi = i2c_get_clientdata(client);
 	int error;
+
+	/* The adapter has resumed before its charger child. */
+	mutex_lock(&bdi->io_lock);
+	WRITE_ONCE(bdi->system_suspended, false);
+	mutex_unlock(&bdi->io_lock);
 
 	bdi->f_reg = 0;
 	bdi->ss_reg = BQ24190_REG_SS_VBUS_STAT_MASK; /* impossible state */

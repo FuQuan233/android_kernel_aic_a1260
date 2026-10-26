@@ -1696,3 +1696,49 @@ suspended, producing ``Transfer while suspended`` and -ESHUTDOWN. The
 resume and subsequent charge readings completed, but this workqueue/PM
 ordering needs a separate fix; these checks do not establish warning-free
 charger suspend. The full trace is ``pcm-run-69-dmesg.txt``.
+
+Charger I/O across system suspend
+--------------------------------
+
+Build #70 closes the BQ24190-family SMBus entry points at the end of the
+charger's system suspend callback. A mutex drains any active transfer and
+serializes subsequent reads/writes with this gate before the parent I2C
+adapter is suspended. System resume reopens access after the adapter's
+noirq resume. Runtime status checks also respect the gate. Concurrent
+power-supply notifications omit unavailable properties with -ENODATA
+instead of reaching the suspended adapter; resume sends a fresh change
+notification. Input-current-limit delayed work now uses the freezable
+queue, matching the existing polling worker. This is local to the charger
+and does not suppress the I2C core's suspended-transfer checks.
+
+The final rapid sequence completed eight 250 ms PCM standby rounds,
+advancing suspend success from 2 to 10 with failure count unchanged at 1.
+Each timer reported 8195 ticks for an 8192-tick compare, four CPUs returned,
+and the 4 MiB RAM hash matched. Status remained Full and the input limit
+500000 uA on every resume; battery ADC and thermal sampling recovered.
+A preceding two-round run was interrupted by a pending Android alarm:
+alarmtimer returned -EBUSY on the third attempt before PCM entry. That
+cancelled suspend and subsequent recovery are recorded, not counted as a
+successful sleep or a new charger failure.
+
+The final trace retained all 15179 events with no buffer overruns/drops.
+Across eight charger suspend/resume pairs, 426 SMBus requests were outside
+the closed interval; none occurred between charger suspend completion
+and resume entry. Seventeen power-supply change workers ran, all outside
+that interval, so this trace validates ordering but does not establish
+that a notification actually raced the new gate during this sequence.
+No suspended-I2C warning, property-report failure, Oops or charger read
+error was captured on #70.
+
+Evidence under ``out/a1260-runtime-pm/`` is ``charger-pm-70-`` followed by
+``initial.txt``, ``first-check.txt``, ``check.txt``, ``trace.txt``,
+``trace-summary.txt`` and ``dmesg.txt``.
+
+Android's default s2idle then slept for 9.946200 seconds and resumed on
+PMIC RTC IRQ47, increasing success to 11 with the earlier failure count
+still 1. Charger status, 500 mA input limit and battery ADC recovered;
+Mali pixel readback and zero-error RDMA also passed. This evidence is
+``charger-pm-70-auto.txt`` and ``charger-pm-70-final.txt``. Standard product
+boot/kernel now use #70. Tracing, filters, buffer/clock overrides, timer,
+RTC alarm and maintenance wake references were cleared/restored; Android
+plugged-in stay-on remains zero. UART/clock request coordination is next.
