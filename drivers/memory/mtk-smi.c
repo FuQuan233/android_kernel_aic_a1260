@@ -155,7 +155,9 @@ struct mtk_smi {
 
 struct mtk_smi_larb { /* larb: local arbiter */
 	bool context_valid;
-	u32 context[15], control, saves, restores, busy, requested_mmu, programmed_mmu;
+	const u16 *context_offsets;
+	unsigned int context_count, port_count;
+	u32 context[19], control, saves, restores, busy, requested_mmu, programmed_mmu;
 	struct mtk_smi			smi;
 	void __iomem			*base;
 	struct device			*smi_common_dev; /* common or sub-common dev */
@@ -681,14 +683,35 @@ static int mtk_smi_larb_probe(struct platform_device *pdev)
 	pm_runtime_enable(dev);
 	platform_set_drvdata(pdev, larb);
 	if (larb->larb_gen->mt6580) {
-		ret = clk_bulk_prepare_enable(larb->smi.clk_num, larb->smi.clks);
-		if (ret)
+		u32 id;
+
+		ret = of_property_read_u32(dev->of_node, "mediatek,larb-id", &id);
+		if (ret || id > 1) {
+			ret = -EINVAL;
 			goto err_pm_disable;
-		larb->control = readl(larb->base + 0x10);
-		mt6580_smi_save(larb->base, mt6580_smi_larb_offsets,
-				larb->context, ARRAY_SIZE(mt6580_smi_larb_offsets));
-		larb->context_valid = true;
-		clk_bulk_disable_unprepare(larb->smi.clk_num, larb->smi.clks);
+		}
+		larb->larbid = id;
+		larb->port_count = id ? 11 : 6;
+		larb->context_offsets = id ? mt6580_smi_larb1_offsets : mt6580_smi_larb_offsets;
+		larb->context_count = id ? ARRAY_SIZE(mt6580_smi_larb1_offsets) :
+			ARRAY_SIZE(mt6580_smi_larb_offsets);
+		/* Resume the device, not just its gate: COMMON must be up before
+		 * accessing the independently powered ISP/LARB1 block.
+		 */
+		ret = pm_runtime_resume_and_get(dev);
+		if (ret < 0)
+			goto err_pm_disable;
+		if (id) {
+			unsigned int port;
+
+			/* BSP SMI_R normal profile, not another SoC's port table. */
+			writel(2, larb->base + 0x20);
+			for (port = 0; port < larb->port_count; port++)
+				writel(1, larb->base + 0x200 + port * 4);
+		}
+		ret = pm_runtime_put_sync_suspend(dev);
+		if (ret < 0)
+			goto err_pm_disable;
 		ret = devm_device_add_group(dev, mt6580_smi_groups[0]);
 		if (ret)
 			goto err_pm_disable;
@@ -732,8 +755,8 @@ static int __maybe_unused mtk_smi_larb_resume(struct device *dev)
 		writel(~larb->control, larb->base + 0x18);
 		writel(larb->control, larb->base + 0x14);
 		writel(~0U, larb->base + 0x64);
-		mt6580_smi_restore(larb->base, mt6580_smi_larb_offsets,
-				   larb->context, ARRAY_SIZE(mt6580_smi_larb_offsets));
+		mt6580_smi_restore(larb->base, larb->context_offsets,
+				   larb->context, larb->context_count);
 		larb->restores++;
 	}
 	/* Configure ports after context, before any consumer starts DMA. */
@@ -756,8 +779,8 @@ static int __maybe_unused mtk_smi_larb_suspend(struct device *dev)
 			return -EBUSY;
 		}
 		larb->control = readl(larb->base + 0x10);
-		mt6580_smi_save(larb->base, mt6580_smi_larb_offsets,
-				larb->context, ARRAY_SIZE(mt6580_smi_larb_offsets));
+		mt6580_smi_save(larb->base, larb->context_offsets,
+				larb->context, larb->context_count);
 		larb->context_valid = true;
 		larb->saves++;
 	}
@@ -975,6 +998,7 @@ static int mtk_smi_common_probe(struct platform_device *pdev)
 		}
 		mt6580_smi_save(common->base, mt6580_smi_common_offsets,
 				common->context, ARRAY_SIZE(mt6580_smi_common_offsets));
+		common->context[2] = 0x1001; /* SMI_R COMMON+0x108 LARB1 normal arbitration */
 		common->context_valid = true;
 		clk_bulk_disable_unprepare(common->clk_num, common->clks);
 		ret = devm_device_add_group(dev, mt6580_smi_groups[0]);

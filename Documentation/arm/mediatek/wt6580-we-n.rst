@@ -3022,8 +3022,9 @@ This audit does not establish complete SoC support. Remaining areas are:
 * Runtime coordinated CPU deep idle and a complete CPU/interconnect/memory
   DCM policy. cpuidle currently exposes hardware WFI only; the separately
   validated system deep-suspend path must not be confused with runtime idle.
-* Display M4U/SMI is connected and qualified; see mt6580-m4u.rst. LARB1
-  and video codecs remain unimplemented. HACC software-key AES
+* Display M4U/SMI and the LARB1 bus/ISP gate context are connected and
+  qualified; see mt6580-m4u.rst and mt6580-larb1.rst. Video codec DMA and
+  Android hardware decoding remain unimplemented. HACC software-key AES
   is described in mt6580-hacc.rst; its PIO path retains lower priority than
   software AES. hw_random still has no provider: the TRNG register protocol
   and entropy quality are unresolved. eMMC stays at qualified 8-bit 52 MHz;
@@ -3396,3 +3397,16 @@ four cores, schedutil604500..1300000 and automatic deep retained; test locks,
 files, alarms and trace are cleaned. See mt6580-m4u.rst and
 out/a1260-runtime-pm/m4u/summary.json for evidence and limits, including
 NO_PERMS, same-device import scope and unqualified codec/LARB1 paths.
+
+LARB1 and ISP source dependency (#170)
+-------------------------------------
+
+The LARB1/IMGSYS provider and eleven-port context are now connected to M4U.
+The BSP SMI_R normal QoS profile is applied. ISP power handshakes retain
+CLK_SMI even during genpd noirq restoration; this fixes the #169 timeout
+and subsequent deep fallback. Two complete deep cycles and four runtime
+LARB1 on/off cycles passed, along with Mali, RAM, eMMC and display/M4U
+regressions. Standard boot/kernel are #170. See mt6580-larb1.rst for source,
+retained failure evidence and exact limits: the stock decoder loads and
+answers metadata queries in isolation, but actual decoder jobs, ION/Vcodec
+compatibility and Android media integration are still pending.

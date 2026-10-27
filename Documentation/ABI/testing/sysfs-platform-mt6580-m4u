@@ -23,3 +23,13 @@ Contact:        FuQuan233
 Description:
                 Read-only SMI COMMON context-valid flag and save/restore
                 counters. Reading does not power on the DISP domain.
+
+What:           /sys/devices/platform/15001000.larb/context
+Date:           October 2026
+Contact:        FuQuan233
+Description:
+                Read-only LARB1 context-valid flag, save/restore and busy
+                counters, last requested MMU bitmap and programmed readback.
+                The owner field identifies larb1. Values are cached; reading
+                does not enable clocks or access the powered-off ISP block.
+                No active ports does not establish codec DMA operation.

@@ -38,6 +38,9 @@
 #define CLK_MT6580_MM_SMI_LARB0	4
 #define CLK_MT6580_MM_NR_CLK	5
 
+#define CLK_MT6580_IMG_LARB1	0
+#define CLK_MT6580_IMG_VCODEC	1
+
 #define CLK_MT6580_MFG_BG3D	0
 
 #endif

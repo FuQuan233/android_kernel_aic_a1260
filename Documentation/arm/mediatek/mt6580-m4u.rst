@@ -9,8 +9,9 @@ drivers/misc/mediatek/m4u/mt6580/{m4u_reg.h,m4u_hw.c,m4u_platform.h,m4u_port.h},
 m4u/2.0/{m4u_pgtable.c,m4u_pgtable.h}, and the MT6580 clock manager. Its M4U
 is at 0x10203000, SPI81 level-low, with one MMU and two larbs. LARB0 is
 0x14016000, SMI COMMON 0x14017000; display RDMA is larb0 port1. LARB1 and the
-shared camera/codec ports are described by the port binding, but are not
-instantiated by this display-only change.
+shared camera/codec ports were initially binding-only. Build #170 adds the
+LARB1 bus and ISP gate/power context; see mt6580-larb1.rst. Codec consumers
+and actual LARB1 DMA remain unimplemented.
 
 This is the two-level short-descriptor M4U, not the flat MT2701 IOMMU v1.
 BSP PGD is 16 KiB; table descriptors point to 1 KiB L2 tables. The reference
@@ -111,3 +112,10 @@ boot and hardware state checks. Standard boot/kernel were updated to
 #168; ordinary ADB shell, four CPUs, schedutil 604500..1300000, default
 deep and stay-on0 retained. Temporary files, wake locks, alarm and trace
 were removed. Default Windows ADB recovered without physical intervention.
+
+Build #170 adds the independently powered LARB1 bus, its eleven-port
+context and BSP SMI_R normal arbitration profile. ISP now retains the real
+SMI source for genpd SRAM handshakes, including noirq restore. Two further
+deep cycles and four LARB1 runtime cycles passed with no display/M4U errors.
+See mt6580-larb1.rst for the #169 failure, #170 correction, qualification and
+remaining stock decoder interface work. Standard boot/kernel are now #170.

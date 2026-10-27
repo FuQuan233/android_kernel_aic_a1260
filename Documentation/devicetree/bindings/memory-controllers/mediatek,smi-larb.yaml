@@ -79,6 +79,19 @@ required:
   - power-domains
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: mediatek,mt6580-smi-larb
+    then:
+      properties:
+        mediatek,larb-id:
+          maximum: 1
+      required:
+        - mediatek,larb-id
+        - mediatek,smi
+
   - if:  # HW has gals
       properties:
         compatible:

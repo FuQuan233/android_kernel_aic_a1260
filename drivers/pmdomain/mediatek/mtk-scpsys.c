@@ -1059,7 +1059,11 @@ static const struct scp_domain_data scp_domain_data_mt6580[] = {
 		.ctl_offs = SPM_ISP_PWR_CON,
 		.sram_pdn_bits = GENMASK(11, 8),
 		.sram_pdn_ack_bits = GENMASK(13, 12),
-		.clk_id = { CLK_NONE },
+		/* BSP powers COMMON before ISP. genpd also restores an idle
+		 * domain in noirq, when the COMMON consumer may stay suspended.
+		 * Keep its real SMI source during SRAM handshakes independently.
+		 */
+		.clk_id = { CLK_SMI },
 	},
 };
 

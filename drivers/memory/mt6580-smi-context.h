@@ -8,6 +8,11 @@ static const u16 mt6580_smi_larb_offsets[] = {
 	0xfc0, 0xfc4, 0xfd0, 0xfd4, 0xfd8, 0xfdc,
 };
 
+static const u16 mt6580_smi_larb1_offsets[] = {
+	0x020, 0x02c, 0x200, 0x204, 0x208, 0x20c, 0x210, 0x214, 0x218,
+	0x21c, 0x220, 0x224, 0x228, 0xfc0, 0xfc4, 0xfd0, 0xfd4, 0xfd8, 0xfdc,
+};
+
 static void mt6580_smi_save(void __iomem *base, const u16 *offsets,
 			     u32 *values, unsigned int count)
 {
@@ -30,26 +35,30 @@ static int mt6580_smi_larb_config(struct device *dev)
 {
 	struct mtk_smi_larb *larb = dev_get_drvdata(dev);
 	u32 mmu = larb->mmu ? READ_ONCE(*larb->mmu) : 0;
-	u32 val, mask = 0;
-	unsigned int port;
+	u32 val, ports = GENMASK(larb->port_count - 1, 0);
+	unsigned int group, port;
 
 	/* Before component binding, capture LK context without changing ports. */
 	if (!larb->mmu)
 		return 0;
 	larb->requested_mmu = mmu;
-	if (mmu & ~GENMASK(5, 0))
+	if (mmu & ~ports)
 		return -EINVAL;
-	for (port = 0; port < 6; port++)
-		if (mmu & BIT(port))
-			mask |= 0xf << (4 * port);
-	val = readl(larb->base + 0xfd0);
-	writel((val & ~mask) | (0x33333333 & mask), larb->base + 0xfd0);
+	for (group = 0; group < DIV_ROUND_UP(larb->port_count, 8); group++) {
+		u32 mask = 0;
+
+		for (port = group * 8; port < min((group + 1) * 8, larb->port_count); port++)
+			if (mmu & BIT(port))
+				mask |= 0xf << (4 * (port % 8));
+		val = readl(larb->base + 0xfd0 + group * 4);
+		writel((val & ~mask) | (0x33333333 & mask), larb->base + 0xfd0 + group * 4);
+	}
 	val = readl(larb->base + 0xfc4);
 	writel(val & ~mmu, larb->base + 0xfc4);
 	val = readl(larb->base + 0xfc0);
-	writel((val & ~GENMASK(5, 0)) | mmu, larb->base + 0xfc0);
+	writel((val & ~ports) | mmu, larb->base + 0xfc0);
 	larb->programmed_mmu = readl(larb->base + 0xfc0);
-	if ((larb->programmed_mmu & GENMASK(5, 0)) != mmu)
+	if ((larb->programmed_mmu & ports) != mmu)
 		return -EIO;
 	return 0;
 }
@@ -64,8 +73,8 @@ static ssize_t context_show(struct device *dev, struct device_attribute *attr, c
 	} else {
 		struct mtk_smi_larb *larb = dev_get_drvdata(dev);
 
-		return sysfs_emit(buf, "owner=larb0 valid=%u saves=%u restores=%u busy=%u mmu=%08x programmed=%08x\n",
-			larb->context_valid, larb->saves, larb->restores, larb->busy,
+		return sysfs_emit(buf, "owner=larb%u valid=%u saves=%u restores=%u busy=%u mmu=%08x programmed=%08x\n",
+			larb->larbid, larb->context_valid, larb->saves, larb->restores, larb->busy,
 			larb->requested_mmu, larb->programmed_mmu);
 	}
 }
