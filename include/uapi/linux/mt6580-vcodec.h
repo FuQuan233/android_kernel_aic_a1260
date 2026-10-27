@@ -38,7 +38,7 @@ struct mt6580_vcodec_buffer {
 #define MT6580_VCODEC_RELEASE \
 	_IOW('V', 0x82, struct mt6580_vcodec_buffer)
 
-/* Native root-only hybrid H.264 prototype; no legacy ioctl emulation. */
+/* Native privileged hybrid H.264 interface; no legacy ioctl emulation. */
 #define MT6580_VCODEC_H264_DRIVER 6
 #define MT6580_VCODEC_OAL_MAX_REGS 16
 /* mmap2's page offset is 32-bit on ARM. Reserve its upper half for MMIO. */
@@ -95,7 +95,7 @@ struct mt6580_vcodec_oal {
  * ACQUIRE enables the real power/clock chain and IRQ, holding a wake source.
  * Userspace may then access only its mapped VDEC/MP4-VENC windows. MMIO VMAs
  * themselves do not hold power: accessing them outside an acquired job is
- * forbidden by this root prototype's caller contract. IRQ completion masks
+ * forbidden by this privileged interface's caller contract. IRQ completion masks
  * IRQ and releases power automatically. A timed-out WAIT or explicit RELEASE
  * synchronizes IRQ before abort/power release. Successful WAIT does not erase
  * the result; RELEASE frees its record, returning EALREADY after completion.

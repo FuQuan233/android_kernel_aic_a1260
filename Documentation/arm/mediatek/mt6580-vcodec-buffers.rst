@@ -8,7 +8,7 @@ This implements buffer preparation for the stock ARM32 decoder. It does not
 create a V4L2/Codec2/OMX media service, program VDEC registers, enable its
 functional gate, or submit decode jobs. The Linux device is deliberately
 /dev/mt6580-vcodec, not a placeholder /dev/Vcodec returning success for
-unimplemented legacy commands. Access requires root plus CAP_SYS_RAWIO.
+unimplemented legacy commands. Access requires device-node permission plus CAP_SYS_RAWIO.
 
 The ioctl structure and field initialization rules are in
 include/uapi/linux/mt6580-vcodec.h. IMPORT uses the DMA-BUF API and validates
@@ -211,3 +211,33 @@ final adapter (unused/uninitialized thread-array words are no longer copied
 or logged). All 64 frames/token/PTS match; cumulative #182 counters become
 jobs73/IRQs72/timeouts0/cancellations1 (the preceding explicit empty-lock
 check), no faults/power errors and live0. Android integration remains pending.
+
+
+Android Codec2 qualification (#182)
+----------------------------------
+
+The product now registers c2.mt6580.avc.decoder through Codec2 AIDL V2.
+The modern frontend exchanges bounded messages with a separately privileged
+mediacodec worker (CAP_SYS_RAWIO, not UID 0), which privately loads the owned
+8.1 decoder libraries. Ordinary shell MediaCodec automatically selects the
+hardware component. The legacy buffer adapter opens the heap node O_RDONLY,
+matching AOSP 0444 heap permissions; allocated DMA-BUFs remain writable.
+
+mediacodec-yuv-final.txt and mediacodec-720-final.txt each verify 48 real
+MediaCodec frames at 128x96 and 1280x720 against independent libavc I420
+pixels. Original PTS, data/empty EOS, flush, stop/reconfigure/start and repeated
+create/release pass. surface-yuv-final.txt verifies eight frames through a
+real SurfaceTexture, Mali-400 MP external texture and changing GLES readback.
+All 104 submitted frames have 104 real hardware IRQs, no timeouts,
+cancellations, faults or power errors, and zero live VMA/buffer/bytes after
+release. The frontend uses explicit CPU copies; this is not a zero-copy or
+throughput qualification. Current scope is one progressive H.264 Baseline /
+ConstrainedBaseline stream up to 1280x720. Main/High, other codecs,
+interlaced/secure/adaptive playback and retained decode across deep are not
+qualified. Standard product boot/kernel are #182 with the new vendor image.
+
+The minigbm bridge adds linear YV12 without changing the original 168-byte,
+two-FD Mali handle ABI. Logical Y/V/U plane metadata shares one image FD;
+YUV is GPU composed rather than advertised for direct KMS scanout. The device
+repository keeps the source patch and the local private-DSO packaging tool.
+No proprietary decoder library or efuse contents are committed here.

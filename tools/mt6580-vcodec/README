@@ -10,7 +10,7 @@ Build with an Android ARM32 NDK compiler, for example:
   make CC=/absolute/path/to/armv7a-linux-androideabi28-clang
 
 Enable CONFIG_MT6580_VCODEC and the board's M4U/LARB1 codec node. The native
-/dev/mt6580-vcodec interface requires root plus CAP_SYS_RAWIO. buffer-check
+/dev/mt6580-vcodec interface requires device-node permission plus CAP_SYS_RAWIO. buffer-check
 uses a real system DMA heap import and a coherent allocation. It checks CPU
 cache API calls, owned handles, forked mappings and memory survival after
 RELEASE/close; it does not submit a decoder DMA job.

@@ -172,7 +172,8 @@ int eVideoMemAlloc(struct val_memory *m, uint32_t size)
 		a->va = mmap(NULL, a->length, PROT_READ | PROT_WRITE, MAP_SHARED,
 			     codec_fd, a->buffer.mmap_offset);
 	} else {
-		heap_fd = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
+		/* Heap allocation is an ioctl on a read-only heap descriptor. */
+		heap_fd = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
 		if (heap_fd < 0)
 			goto out;
 		heap.len = a->length;
