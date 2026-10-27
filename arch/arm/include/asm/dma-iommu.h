@@ -8,9 +8,13 @@
 #include <linux/scatterlist.h>
 #include <linux/kref.h>
 
+struct device;
+struct iommu_domain;
+
 struct dma_iommu_mapping {
 	/* iommu specific data */
 	struct iommu_domain	*domain;
+	bool automatic; /* installed by the ARM kernel DMA setup path */
 
 	unsigned long		**bitmaps;	/* array of bitmaps */
 	unsigned int		nr_bitmaps;	/* nr of elements in array */
@@ -31,6 +35,7 @@ void arm_iommu_release_mapping(struct dma_iommu_mapping *mapping);
 int arm_iommu_attach_device(struct device *dev,
 					struct dma_iommu_mapping *mapping);
 void arm_iommu_detach_device(struct device *dev);
+bool arm_iommu_is_dma_domain(struct device *dev, struct iommu_domain *domain);
 
 #endif /* __KERNEL__ */
 #endif

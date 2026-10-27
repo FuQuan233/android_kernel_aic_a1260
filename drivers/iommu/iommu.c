@@ -35,6 +35,10 @@
 #include <linux/msi.h>
 #include <uapi/linux/iommufd.h>
 
+#ifdef CONFIG_ARM_DMA_USE_IOMMU
+#include <asm/dma-iommu.h>
+#endif
+
 #include "dma-iommu.h"
 #include "iommu-priv.h"
 
@@ -3236,8 +3240,16 @@ int iommu_device_use_default_domain(struct device *dev)
 		goto unlock_out;
 	}
 	if (group->owner_cnt) {
-		if (group->domain != group->default_domain || group->owner ||
-		    !xa_empty(&group->pasid_array)) {
+		bool dma_domain = group->domain == group->default_domain;
+
+#ifdef CONFIG_ARM_DMA_USE_IOMMU
+		/* ARM's automatic DMA API installs an UNMANAGED domain over
+		 * its identity default. Recognize only that verified DMA mapping,
+		 * so additional members can share normal kernel DMA ownership.
+		 */
+		dma_domain |= arm_iommu_is_dma_domain(dev, group->domain);
+#endif
+		if (!dma_domain || group->owner || !xa_empty(&group->pasid_array)) {
 			ret = -EBUSY;
 			goto unlock_out;
 		}

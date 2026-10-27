@@ -1685,6 +1685,131 @@ int arm_iommu_attach_device(struct device *dev,
 }
 EXPORT_SYMBOL_GPL(arm_iommu_attach_device);
 
+/* Called with the core group mutex held. The per-device mapping is stable
+ * during driver-core DMA ownership setup; automatic is immutable after attach.
+ */
+bool arm_iommu_is_dma_domain(struct device *dev, struct iommu_domain *domain)
+{
+	struct dma_iommu_mapping *mapping = to_dma_iommu_mapping(dev);
+
+	return mapping && mapping->automatic && mapping->domain == domain &&
+		get_dma_ops(dev) == &iommu_ops;
+}
+
+/* Automatic DMA setup must share both the page table and IOVA allocator
+ * across a multi-device group. iommu_attach_device() deliberately rejects
+ * such groups; giving each member an independent bitmap would alias IOVAs.
+ * Keep this private to ARM DMA rather than taking the IOMMU driver's data slot.
+ */
+struct arm_dma_group_mapping {
+	struct list_head node;
+	struct iommu_group *group;
+	struct dma_iommu_mapping *mapping;
+	u64 base, size;
+	unsigned int users;
+};
+static LIST_HEAD(arm_dma_group_mappings);
+static DEFINE_MUTEX(arm_dma_group_lock);
+
+static bool arm_dma_detach_group_member(struct device *dev)
+{
+	struct dma_iommu_mapping *mapping = to_dma_iommu_mapping(dev);
+	struct arm_dma_group_mapping *shared;
+	bool found = false;
+
+	mutex_lock(&arm_dma_group_lock);
+	list_for_each_entry(shared, &arm_dma_group_mappings, node) {
+		if (shared->mapping != mapping || shared->group != dev->iommu_group)
+			continue;
+		to_dma_iommu_mapping(dev) = NULL;
+		set_dma_ops(dev, NULL);
+		arm_iommu_release_mapping(mapping); /* member reference */
+		if (!--shared->users) {
+			iommu_detach_group(mapping->domain, shared->group);
+			list_del(&shared->node);
+			arm_iommu_release_mapping(mapping); /* group reference */
+			iommu_group_put(shared->group);
+			kfree(shared);
+		}
+		found = true;
+		break;
+	}
+	mutex_unlock(&arm_dma_group_lock);
+	return found;
+}
+
+static int arm_dma_count_member(struct device *dev, void *data)
+{
+	unsigned int *count = data;
+
+	(*count)++;
+	return 0;
+}
+
+/* Returns 1 for a shared mapping, 0 for the existing single-device path. */
+static int arm_dma_setup_group(struct device *dev, u64 base, u64 size)
+{
+	struct arm_dma_group_mapping *shared;
+	struct iommu_group *group = iommu_group_get(dev);
+	struct dma_iommu_mapping *mapping;
+	unsigned int members = 0;
+	int ret = 0;
+
+	if (!group)
+		return -ENODEV;
+	mutex_lock(&arm_dma_group_lock);
+	list_for_each_entry(shared, &arm_dma_group_mappings, node) {
+		if (shared->group != group)
+			continue;
+		/* All group members must describe the same DMA aperture. */
+		if (shared->base != base || shared->size != size) {
+			ret = -EINVAL;
+			goto out;
+		}
+		goto attach_member;
+	}
+	iommu_group_for_each_dev(group, &members, arm_dma_count_member);
+	if (members < 2)
+		goto out;
+	shared = kzalloc(sizeof(*shared), GFP_KERNEL);
+	if (!shared) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	mapping = arm_iommu_create_mapping(dev, base, size);
+	if (IS_ERR(mapping)) {
+		ret = PTR_ERR(mapping);
+		kfree(shared);
+		goto out;
+	}
+	mapping->automatic = true;
+	ret = iommu_attach_group(mapping->domain, group);
+	if (ret) {
+		arm_iommu_release_mapping(mapping);
+		kfree(shared);
+		goto out;
+	}
+	shared->group = group; /* retain the lookup reference until final detach */
+	shared->mapping = mapping; /* create reference belongs to the group */
+	shared->base = base;
+	shared->size = size;
+	list_add(&shared->node, &arm_dma_group_mappings);
+	group = NULL;
+attach_member:
+	/* Preserve create/attach ownership expected by detach + release users. */
+	kref_get(&shared->mapping->kref); /* automatic setup ownership */
+	kref_get(&shared->mapping->kref); /* attached member */
+	shared->users++;
+	to_dma_iommu_mapping(dev) = shared->mapping;
+	set_dma_ops(dev, &iommu_ops);
+	ret = 1;
+out:
+	mutex_unlock(&arm_dma_group_lock);
+	if (group)
+		iommu_group_put(group);
+	return ret;
+}
+
 /**
  * arm_iommu_detach_device
  * @dev: valid struct device pointer
@@ -1696,6 +1821,8 @@ void arm_iommu_detach_device(struct device *dev)
 {
 	struct dma_iommu_mapping *mapping;
 
+	if (arm_dma_detach_group_member(dev))
+		return;
 	mapping = to_dma_iommu_mapping(dev);
 	if (!mapping) {
 		dev_warn(dev, "Not attached\n");
@@ -1715,10 +1842,17 @@ static void arm_setup_iommu_dma_ops(struct device *dev)
 {
 	struct dma_iommu_mapping *mapping;
 	u64 dma_base = 0, size = 1ULL << 32;
+	int ret;
 
 	if (dev->dma_range_map) {
 		dma_base = dma_range_map_min(dev->dma_range_map);
 		size = dma_range_map_max(dev->dma_range_map) - dma_base;
+	}
+	ret = arm_dma_setup_group(dev, dma_base, size);
+	if (ret) {
+		if (ret < 0)
+			dev_warn(dev, "Failed to set up shared IOMMU DMA mapping: %d\n", ret);
+		return;
 	}
 	mapping = arm_iommu_create_mapping(dev, dma_base, size);
 	if (IS_ERR(mapping)) {
@@ -1727,6 +1861,7 @@ static void arm_setup_iommu_dma_ops(struct device *dev)
 		return;
 	}
 
+	mapping->automatic = true;
 	if (__arm_iommu_attach_device(dev, mapping)) {
 		pr_warn("Failed to attached device %s to IOMMU_mapping\n",
 				dev_name(dev));
@@ -1743,6 +1878,10 @@ static void arm_teardown_iommu_dma_ops(struct device *dev)
 
 	if (!mapping)
 		return;
+	if (arm_dma_detach_group_member(dev)) {
+		arm_iommu_release_mapping(mapping); /* automatic setup ownership */
+		return;
+	}
 
 	arm_iommu_detach_device(dev);
 	arm_iommu_release_mapping(mapping);
