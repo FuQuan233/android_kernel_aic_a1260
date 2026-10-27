@@ -118,5 +118,10 @@ in battery-stock-1850/model-test. This validates arithmetic, not cell accuracy.
 The sleep current is still an estimate; transplanting factory logic does not
 measure present-day cell capacity or aging. The checked SW path has no active
 caller for the standalone aging-update helper; hardware-FG aging is not
-claimed. Actual runtime boot/RTC/charge/suspend results are recorded in the
-board bring-up log and device TODO when available.
+claimed. Build #126 completed hardware boot, charge-mode restoration, RTC SOC seed
+recovery across a normal reboot, and physical unplug/deep/replug. The gauge
+recorded 108 seconds of sleep, matching the independent SPM stopped clock;
+RTC/sample errors were zero and charge mode/input limit recovered. One
+pending-USB freezer abort preceded the successful automatic retry. See the
+board bring-up log, device TODO and battery-stock-1850/runtime-summary.json
+for the detailed evidence and remaining accuracy limits.

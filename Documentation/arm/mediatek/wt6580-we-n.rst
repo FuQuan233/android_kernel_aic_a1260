@@ -3049,8 +3049,8 @@ The Android device TODO keeps detailed source paths and evidence. Runtime
 snapshots are in out/a1260-runtime-pm/soc-audit-before-normal-adb.txt; some
 optional-device probes in that snapshot intentionally report absent paths.
 
-Factory battery model reconstruction (2026-10-27, hardware test pending)
----------------------------------------------------------------------
+Factory battery model reconstruction and hardware validation (2026-10-27)
+-----------------------------------------------------------------------
 
 The owner confirmed an 1850 mAh / nominal 3.7 V / 6.845 Wh cell. The board
 parameters now use its design charge and energy. The factory normal-boot
@@ -3061,10 +3061,50 @@ RTC persistence and UI tracking are ported using mainline interfaces.
 
 See mt6350-stock-fuel-gauge.rst for exact source digests, addresses, Evidence,
 integer arithmetic and integration differences. Independent mathematical
-comparisons and ARM kernel/DT builds passed. On-demand adb root caused the
-USB/IP attachment to disappear before flashing; the device is still on the
-previous validated #121 kernel. The candidate is
-out/a1260-runtime-pm/boot-factory-battery-1850.img, not yet a hardware-validated
-standard image. Charge-mode restoration, RTC reboot/alarm behavior and
-suspend accounting still need the device connection. Default root remains
-removed from the candidate ramdisk. No storage formatting is involved.
+comparisons and ARM kernel/DT builds passed. After reconnecting USB/IP,
+boot-factory-battery-1850.img was flashed to the boot partition. Kernel #126
+completed Android boot with four CPUs and default deep. ADB remained uid 2000
+(shell), with no return to temporary initial root.
+
+The battery exported CHARGE_FULL_DESIGN=1850000 uAh and
+ENERGY_FULL_DESIGN=6845000 uWh. Initial retained HW OCV was 4115348 uV,
+factory SOC 94 and 24 C effective Qmax 1836 mAh. RTC UI writes succeeded
+with hardware masked readback and rtc_error=0. Charger mode returned to Fast,
+input limit remained 500000 uA, and real Full status advanced UI one point
+per update to 100. Android health reported Design capacity=1850000.
+
+A subsequent normal ADB reboot changed boot ID and booted #126 again as
+shell. Kernel log recorded hw=1 rtc=1 SOC=100 Qmax=1836mAh, confirming the
+RTC value survived the reboot and supplied the new observer seed; UI had
+reached 100 during the preceding shutdown interval after the pre-reboot
+snapshot at 99. RTC time advanced normally. The new boot did not report
+battery sample or SOC-storage errors in the collected log.
+
+Evidence is in out/a1260-runtime-pm/battery-stock-1850, including flash.txt,
+first-boot.txt, boot-complete.txt, rtc-before-reboot.txt, rtc-after-reboot.txt,
+rtc-boot-runtime.txt and seed-and-errors.txt. The physical unplug/replug check then completed. A non-wakeup logger waited
+for unplug, allowed the charging event to settle, and turned the screen off.
+Normal Android deep slept 108.261796893 seconds with CPU0/L2 cold recovery,
+MAINPLL off/on 1/1 and no restore error. The gauge independently reported
+last_sleep_sec=108 and sleep_total_sec=108; HW OCV was 4115 mV before and
+4124 mV after. This short sleep did not enter the >1800-second OCV-reseed
+branch. UI stayed 100 before/after, charge type returned Fast, USB input
+limit remained 500000 uA, RTC/sample errors remained zero, and ADB, four CPUs
+and default deep returned. No artificial battery properties were injected.
+
+One earlier entry was canceled at the freezer after 0.004 seconds by the
+pending mt6350-usb wake source from the cable event. Suspend statistics are
+one success and one -EBUSY freeze abort, with every device suspend/resume
+failure counter zero. The subsequent automatic retry is the actual deep
+interval above; this is not recorded as two successful sleeps or zero aborts.
+
+The final cable.log contains COMPLETE. Snapshot car deltas also include awake
+observer integration and full-status resets, so they are not a direct sleep
+current measurement. The fixed 4 mA formula would add one 0.1 mAh unit for
+108 seconds after factory truncation; this arithmetic is distinct from a
+measured current. Full-cycle/aging calibration and long-sleep OCV reseeding
+remain unqualified. Standard Android product boot.img/kernel were promoted
+to #126. The temporary logger/script were removed, and it had installed no
+wake alarm or wake lock. Runtime summary, cable and suspend details are in
+battery-stock-1850/runtime-summary.json, cable.log, cable-status.txt,
+suspend-details.txt and after-cable.txt.
