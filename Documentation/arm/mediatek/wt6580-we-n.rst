@@ -2954,3 +2954,30 @@ out/a1260-runtime-pm/overnight-20261027-021517, including device baselines,
 resumes.log, dmesg, RAM hashes, paired clocks, summary.json and alarm-after.txt.
 The completed logger removed its RAM file; its bounded reconnect hold was
 released after collection. No runtime power policy was changed for this audit.
+
+HealthLoop userspace follow-up resolved (2026-10-27)
+--------------------------------------------------
+
+The overnight timerfd warning was confirmed as an event-ordering issue:
+resetting a ready timer before reading clears its expiration count. A
+Linux API reproduction returned EAGAIN for the old sequence and one
+expiration when read preceded rearm. HealthLoop now dispatches events
+before resetting the slow timer, uses the charger interval after callbacks,
+retries EINTR and accepts a stale EAGAIN if a same-batch charger event
+already changed the timer. Other read errors include errno in the log.
+
+The health service and vendor image were rebuilt. The live service was
+replaced and /vendor returned read-only; kernel #121 was unchanged.
+A bounded on-device capture advanced one real battery-mode timer expiry
+while preserving its 600-second repeat interval. The service's strace
+recorded read(7,...,8)=8 at 10:47:55.367995, followed by its 600-second
+rearm at 10:47:55.443744. Battery updates continued, no new read-failed
+warning appeared, and reconnect restored the normal 60-second interval.
+The 30-second diagnostic safety alarm, tracer and temporary holds were
+released. This does not establish a reduction in all overnight RTC wakes.
+
+The source patch and fresh-checkout instructions are saved in the device
+repository as patches/health-loop-drain-before-rearm.patch and README.md.
+Evidence is under out/a1260-runtime-pm/healthloop, including API evidence,
+strace, timerfd snapshots, summary.json and final.txt. No further kernel
+or runtime power-policy change was made for this userspace fix.
