@@ -2896,3 +2896,61 @@ auto-retention-121-meter.txt, auto-retention-121-dmesg.txt and
 auto-retention-121-final.txt. Kernel/DT builds and checkpatch passed;
 binding YAML parsed, but full dt-schema tools were unavailable locally.
 Rail/current measurement during CPU-off sleep remains a separate task.
+
+Overnight battery-powered standby (#121, 2026-10-27)
+---------------------------------------------------
+
+The local logger saved connected and post-unplug baselines, an 8 MiB RAM
+hash, paired host/device clocks and boot ID. It used ordinary non-wakeup
+sleep, froze with userspace and installed no RTC alarm. The preparation
+hold was released after the unplug-induced display wake was settled and
+the screen slept again. Logging sampled naturally occurring wakes and
+completed on cable insertion; it did not request an overnight wake lock.
+
+The post-unplug to reconnect interval was 26495.455847 seconds (7:21:35).
+BOOTTIME minus MONOTONIC deltas gave 26186.327917 seconds asleep and
+309.127930 seconds active, or 98.8333 percent asleep. Success advanced
+5 -> 64 with failures unchanged at 1; the failure was already present
+before the overnight baseline. CPU0 cold/L2, MAINPLL and USB off/on each
+advanced 4 -> 63; PMIC bank transactions advanced 5 -> 64. Hardware
+restoration errors, bank skips and resume observation errors remained
+zero. Boot ID was unchanged, the 8 MiB hash matched, all four CPUs were
+online, eMMC hardware error counters were zero and RDMA underflow/
+abnormal counts stayed zero. No new WARNING/Oops/panic was found.
+
+RTC event count advanced 4 -> 61. Framework alarm statistics show light
+idle, Settings battery jobs, calendar and other system wake alarms; the
+health loop also has a ten-minute noncharging wake timer. These snapshots
+do not attribute every RTC interrupt to one client. The non-wakeup logger
+sampled 56 resume records, while aggregate counters captured all 59
+cycles. This was repeated successful deep sleep, not one uninterrupted
+seven-hour sleep interval. Logger and background work are included in
+the reported active time.
+
+Battery voltage was 4108974 uV shortly after unplug and 4025522 uV in the
+last captured Discharging sample before reconnection. Capacity stayed at
+99 percent. That percentage is not a measured overnight drain: the model
+intentionally does not extrapolate awake current across unmeasured sleep,
+and voltage samples have different load/relaxation conditions. Current,
+capacity loss and actual CPU-off rail voltage still need direct measurement.
+
+Over the paired host/device interval of 26750.766143 seconds, device REAL
+advanced 26751.211564 seconds, about 0.445 seconds more than the host.
+This includes ADB timestamp uncertainty and is not a precision oscillator
+calibration. REAL/BOOT deltas agreed and MONOTONIC/RAW deltas agreed;
+no large time jump was observed. The pre-existing absolute date offset
+was preserved rather than changing the clock during the test.
+
+A userspace follow-up remains: repeated HealthLoop wakealarm read-failed
+messages appear. The checked source resets the slow timerfd after epoll
+returns but before dispatching the ready WakeAlarmEvent; this is consistent
+with clearing expirations before a nonblocking read, rather than an ARM32
+read-width error (the read buffer is eight bytes). Runtime errno and the
+precise effect on battery updates still require confirmation. The overnight
+records alone do not prove this generated additional RTC wakeups.
+
+All records and summary are under
+out/a1260-runtime-pm/overnight-20261027-021517, including device baselines,
+resumes.log, dmesg, RAM hashes, paired clocks, summary.json and alarm-after.txt.
+The completed logger removed its RAM file; its bounded reconnect hold was
+released after collection. No runtime power policy was changed for this audit.
