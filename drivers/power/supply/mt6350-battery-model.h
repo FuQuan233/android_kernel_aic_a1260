@@ -1,148 +1,307 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Stateful OCV/resistance observer based on the MT6580 BSP oam_i_2/car_2
- * algorithm. No measured current or hardware coulomb counter is available.
+/* MT6350 software fuel gauge reconstructed from the A1260 factory kernel.
+ * The OAM observers estimate current from voltage and resistance; neither
+ * observer is a measured-current input or a hardware coulomb counter.
  */
 #ifndef _MT6350_BATTERY_MODEL_H
 #define _MT6350_BATTERY_MODEL_H
 
+#include <linux/array_size.h>
+#include <linux/math64.h>
+#include <linux/minmax.h>
+#include <linux/string.h>
+#include <linux/types.h>
+
 #include "mt6350-battery-profile.h"
 
+#define MT6350_MODEL_TEMP_WINDOW	30
+#define MT6350_MODEL_R_FG_MOHM	10
+
 struct mt6350_battery_model {
-	s64 charge_uas;
-	s64 full_uas;
-	s64 remainder;
-	int ocv_uv;
-	int resistance_mohm;
-	int current_ua; /* Estimated, positive means discharge. */
+	int ocv1_mv;
+	int ocv2_mv;
+	int r1_mohm;
+	int r2_mohm;
+	int current1_01ma; /* Estimated, positive means discharge. */
+	int current2_01ma;
+	s64 car1_01mah;
+	s64 car2_01mah;
+	int dod0;
+	int dod1;
+	int dod2;
+	int dod3;
+	int qmax_mah;
+	struct mt6350_profile_point profile[MT6350_PROFILE_SIZE];
+	int profile_temp_c;
+	int temp_history[MT6350_MODEL_TEMP_WINDOW];
+	int temp_sum_c;
+	int temp_avg_c;
+	unsigned int temp_index;
+	bool temp_history_ready;
 };
 
-static int mt6350_lerp(int x, int x0, int x1, int y0, int y1)
+static inline int mt6350_model_temp_bracket(int *temp_c)
 {
-	if (x0 == x1)
-		return y0;
-	return y0 + div_s64((s64)(x - x0) * (y1 - y0), x1 - x0);
+	int upper;
+
+	*temp_c = clamp(*temp_c, mt6350_profile_temps[0],
+			mt6350_profile_temps[ARRAY_SIZE(mt6350_profile_temps) - 1]);
+	for (upper = 1; upper < ARRAY_SIZE(mt6350_profile_temps) - 1; upper++)
+		if (*temp_c <= mt6350_profile_temps[upper])
+			break;
+
+	return upper;
 }
 
-static int mt6350_profile_resistance(const struct mt6350_resistance_point *p,
-				     int n, int uv)
-{
-	int i, mv = uv / 1000;
-
-	if (mv >= p[0].mv)
-		return p[0].mohms;
-	for (i = 1; i < n; i++)
-		if (mv >= p[i].mv)
-			return mt6350_lerp(mv, p[i].mv, p[i - 1].mv,
-					   p[i].mohms, p[i - 1].mohms);
-	return p[n - 1].mohms;
-}
-
-static int mt6350_model_resistance(int uv, int temp)
-{
-	int r0 = mt6350_profile_resistance(mt6350_r1, ARRAY_SIZE(mt6350_r1), uv);
-	int r25 = mt6350_profile_resistance(mt6350_r2, ARRAY_SIZE(mt6350_r2), uv);
-	int r50 = mt6350_profile_resistance(mt6350_r3, ARRAY_SIZE(mt6350_r3), uv);
-
-	if (temp <= 0)
-		return r0;
-	if (temp < 250)
-		return mt6350_lerp(temp, 0, 250, r0, r25);
-	if (temp < 500)
-		return mt6350_lerp(temp, 250, 500, r25, r50);
-	return r50;
-}
-
-/* Use fractional percent (ppm of full capacity), not integer percent, so
- * the observer does not stick at a single OCV until a whole percent changes.
+/* The factory profile constructor interpolates upwards from the smaller
+ * ordinate. Keep that rounding, including decreasing temperature curves.
  */
-static int mt6350_table_ocv(const struct power_supply_battery_ocv_table *t,
-			   int n, int ppm)
+static inline int mt6350_model_profile_lerp(int temp, int lo, int hi,
+					  int low_value, int high_value)
 {
+	if (high_value > low_value)
+		return low_value + div_s64((s64)(temp - lo) *
+					  (high_value - low_value), hi - lo);
+
+	return high_value + div_s64((s64)(hi - temp) *
+				   (low_value - high_value), hi - lo);
+}
+
+static inline void mt6350_model_build_profile(struct mt6350_battery_model *m,
+					      int temp_c)
+{
+	const struct mt6350_profile_point *lo, *hi;
+	int upper = mt6350_model_temp_bracket(&temp_c);
+	int low_temp = mt6350_profile_temps[upper - 1];
+	int high_temp = mt6350_profile_temps[upper];
 	int i;
 
-	if (ppm >= t[0].capacity * 10000)
-		return t[0].ocv;
-	for (i = 1; i < n; i++)
-		if (ppm >= t[i].capacity * 10000)
-			return mt6350_lerp(ppm, t[i].capacity * 10000,
-					   t[i - 1].capacity * 10000,
-					   t[i].ocv, t[i - 1].ocv);
-	return t[n - 1].ocv;
-}
-
-static int mt6350_model_ocv(struct power_supply_battery_info *info,
-			   int ppm, int temp)
-{
-	int i, a, b;
-
-	/* Find bracketing temperatures without depending on DT table order. */
-	a = b = -1;
-	for (i = 0; i < POWER_SUPPLY_OCV_TEMP_MAX; i++) {
-		if (!info->ocv_table[i])
-			continue;
-		if (info->ocv_temp[i] * 10 <= temp &&
-		    (a < 0 || info->ocv_temp[i] > info->ocv_temp[a]))
-			a = i;
-		if (info->ocv_temp[i] * 10 >= temp &&
-		    (b < 0 || info->ocv_temp[i] < info->ocv_temp[b]))
-			b = i;
+	lo = mt6350_factory_profiles[upper - 1];
+	hi = mt6350_factory_profiles[upper];
+	for (i = 0; i < MT6350_PROFILE_SIZE; i++) {
+		m->profile[i].dod = hi[i].dod;
+		m->profile[i].mv = mt6350_model_profile_lerp(temp_c,
+			low_temp, high_temp, lo[i].mv, hi[i].mv);
+		m->profile[i].mohms = mt6350_model_profile_lerp(temp_c,
+			low_temp, high_temp, lo[i].mohms, hi[i].mohms);
 	}
-	if (a < 0)
-		a = b;
-	if (b < 0)
-		b = a;
-	return mt6350_lerp(temp, info->ocv_temp[a] * 10, info->ocv_temp[b] * 10,
-		mt6350_table_ocv(info->ocv_table[a], info->ocv_table_size[a], ppm),
-		mt6350_table_ocv(info->ocv_table[b], info->ocv_table_size[b], ppm));
+	m->profile_temp_c = temp_c;
 }
 
-static void mt6350_model_init(struct mt6350_battery_model *m,
-			      struct power_supply_battery_info *info,
-			      int uv, int temp)
+static inline int mt6350_model_qmax(int temp_c)
 {
-	int lo = 0, hi = 1000000, mid;
+	int upper = mt6350_model_temp_bracket(&temp_c);
+	int low_temp = mt6350_profile_temps[upper - 1];
+	int high_temp = mt6350_profile_temps[upper];
+	int low_qmax = mt6350_factory_qmax[upper - 1];
+	int high_qmax = mt6350_factory_qmax[upper];
 
-	/* Invert the same temperature-interpolated OCV curve used at runtime. */
-	while (lo < hi) {
-		mid = (lo + hi) / 2;
-		if (mt6350_model_ocv(info, mid, temp) < uv)
-			lo = mid + 1;
-		else
-			hi = mid;
+	return low_qmax + div_s64((s64)(temp_c - low_temp) *
+				 (high_qmax - low_qmax), high_temp - low_temp);
+}
+
+static inline void mt6350_model_update_profile(struct mt6350_battery_model *m,
+					       int temp_c)
+{
+	int avg, i;
+
+	if (!m->temp_history_ready) {
+		for (i = 0; i < MT6350_MODEL_TEMP_WINDOW; i++)
+			m->temp_history[i] = temp_c;
+		m->temp_sum_c = temp_c * MT6350_MODEL_TEMP_WINDOW;
+		m->temp_avg_c = temp_c;
+		m->temp_history_ready = true;
 	}
-	m->full_uas = (s64)info->charge_full_design_uah * 3600;
-	m->charge_uas = div_s64(m->full_uas * lo, 1000000);
-	m->remainder = 0;
-}
 
-static int mt6350_model_ppm(const struct mt6350_battery_model *m)
-{
-	return div64_s64(m->charge_uas * 1000000, m->full_uas);
-}
-
-static void mt6350_model_step(struct mt6350_battery_model *m,
-			      struct power_supply_battery_info *info,
-			      int uv, int temp, int dt_ms, bool online,
-			      int charge_limit_ua)
-{
-	s64 delta, integral;
-	int estimated_ua;
-
-	m->ocv_uv = mt6350_model_ocv(info, mt6350_model_ppm(m), temp);
-	m->resistance_mohm = mt6350_model_resistance(m->ocv_uv, temp);
-	estimated_ua = div_s64((s64)(m->ocv_uv - uv) * 1000, m->resistance_mohm);
-	/* No charge is possible without an external source. While connected,
-	 * allow net discharge: a USB supply may not cover the system load.
-	 * Bound the observer, not the charger, to 2C discharge and configured
-	 * charge current. The latter is a limit, never a measured current.
+	m->temp_sum_c -= m->temp_history[m->temp_index];
+	m->temp_history[m->temp_index] = temp_c;
+	m->temp_sum_c += temp_c;
+	avg = m->temp_sum_c / MT6350_MODEL_TEMP_WINDOW;
+	/* As in fgauge_construct_table_by_temp: a change in the 30-sample
+	 * mean triggers reconstruction using the current temperature.
 	 */
-	m->current_ua = clamp(estimated_ua, online ? -charge_limit_ua : 0,
-			      info->charge_full_design_uah * 2);
-	delta = (s64)m->current_ua * dt_ms + m->remainder;
-	integral = div_s64(delta, 1000);
-	m->charge_uas -= integral;
-	m->remainder = delta - integral * 1000;
-	m->charge_uas = clamp_t(s64, m->charge_uas, 0, m->full_uas);
+	if (avg != m->temp_avg_c) {
+		mt6350_model_build_profile(m, temp_c);
+		m->temp_avg_c = avg;
+	}
+	m->temp_index = (m->temp_index + 1) % MT6350_MODEL_TEMP_WINDOW;
+}
+
+static inline int mt6350_model_dod_by_voltage(const struct mt6350_battery_model *m,
+					      int mv)
+{
+	const struct mt6350_profile_point *p = m->profile;
+	int i;
+
+	if (mv > p[0].mv)
+		return 0;
+	if (mv < p[MT6350_PROFILE_SIZE - 1].mv)
+		return 100;
+	for (i = 0; i < MT6350_PROFILE_SIZE - 1; i++) {
+		if (mv > p[i].mv || mv < p[i + 1].mv)
+			continue;
+		if (p[i].mv == p[i + 1].mv)
+			return p[i].dod;
+		return p[i].dod + div_s64((s64)(p[i].mv - mv) *
+			(p[i + 1].dod - p[i].dod), p[i].mv - p[i + 1].mv);
+	}
+
+	return 0;
+}
+
+static inline int mt6350_model_soc_by_voltage(const struct mt6350_battery_model *m,
+					      int mv)
+{
+	return 100 - clamp(mt6350_model_dod_by_voltage(m, mv), 0, 100);
+}
+
+static inline int mt6350_model_voltage_by_soc(const struct mt6350_battery_model *m,
+					      int soc)
+{
+	const struct mt6350_profile_point *p = m->profile;
+	int i, dod = 100 - soc;
+
+	if (dod < p[0].dod || dod > p[MT6350_PROFILE_SIZE - 1].dod)
+		return 3700;
+	for (i = 0; i < MT6350_PROFILE_SIZE - 1; i++) {
+		if (dod < p[i].dod || dod > p[i + 1].dod)
+			continue;
+		if (p[i].dod == p[i + 1].dod)
+			return p[i].mv;
+		return p[i].mv - div_s64((s64)(dod - p[i].dod) *
+			(p[i].mv - p[i + 1].mv), p[i + 1].dod - p[i].dod);
+	}
+
+	return 0;
+}
+
+static inline int mt6350_model_resistance(const struct mt6350_battery_model *m,
+					int mv)
+{
+	const struct mt6350_profile_point *p = m->profile;
+	int i;
+
+	if (mv > p[0].mv)
+		return p[0].mohms;
+	if (mv < p[MT6350_PROFILE_SIZE - 1].mv)
+		return p[MT6350_PROFILE_SIZE - 1].mohms;
+	for (i = 0; i < MT6350_PROFILE_SIZE - 1; i++) {
+		if (mv > p[i].mv || mv < p[i + 1].mv)
+			continue;
+		if (p[i].mv == p[i + 1].mv)
+			return p[i].mohms;
+		return p[i].mohms + div_s64((s64)(p[i].mv - mv) *
+			(p[i + 1].mohms - p[i].mohms), p[i].mv - p[i + 1].mv);
+	}
+
+	return 0;
+}
+
+static inline int mt6350_model_imp_tracking(const struct mt6350_battery_model *m,
+					  int mv, int current_01ma)
+{
+	int corrected_mv = mv;
+	int i, resistance;
+	s64 compensate;
+
+	for (i = 0; i < 5; i++) {
+		resistance = mt6350_model_resistance(m, corrected_mv);
+		compensate = div_s64((s64)current_01ma *
+				    (resistance + MT6350_MODEL_R_FG_MOHM), 1000);
+		compensate = div_s64(compensate + 5, 10);
+		corrected_mv = mv + compensate;
+	}
+	/* The factory FG_METER_RESISTANCE contribution is zero. */
+	resistance = mt6350_model_resistance(m, corrected_mv);
+	compensate = div_s64((s64)current_01ma *
+			    (resistance + MT6350_MODEL_R_FG_MOHM), 1000);
+
+	return div_s64(compensate + 5, 10);
+}
+
+static inline void mt6350_model_reset(struct mt6350_battery_model *m, int soc)
+{
+	m->car1_01mah = 0;
+	m->car2_01mah = 0;
+	m->dod0 = 100 - clamp(soc, 0, 100);
+	m->dod1 = m->dod0;
+	m->dod2 = m->dod0;
+	m->dod3 = m->dod0;
+	/* battery_meter_reset leaves both observer OCV/resistance states in
+	 * place. The next sample updates them from the rebased DOD/car.
+	 */
+}
+
+static inline void mt6350_model_init(struct mt6350_battery_model *m,
+				     int seed_mv, int temp_c, int initial_soc)
+{
+	memset(m, 0, sizeof(*m));
+	mt6350_model_build_profile(m, temp_c);
+	/* The factory chooses temperature Qmax at initialization, separately
+	 * from the nameplate charge-full-design value exposed to userspace.
+	 */
+	m->qmax_mah = mt6350_model_qmax(temp_c);
+	if (initial_soc < 0)
+		initial_soc = mt6350_model_soc_by_voltage(m, seed_mv);
+	mt6350_model_reset(m, initial_soc);
+	m->ocv1_mv = mt6350_model_voltage_by_soc(m, 100 - m->dod0);
+	m->ocv2_mv = m->ocv1_mv;
+	m->r1_mohm = mt6350_model_resistance(m, seed_mv);
+	m->r2_mohm = m->r1_mohm;
+}
+
+static inline int mt6350_model_car_dod(const struct mt6350_battery_model *m,
+				      s64 car_01mah)
+{
+	s64 dod = m->dod0 + div_s64(car_01mah * 10, m->qmax_mah);
+
+	return clamp_t(s64, dod, 0, 100);
+}
+
+static inline void mt6350_model_step(struct mt6350_battery_model *m,
+				     int vbat_mv, int temp_c, int elapsed_sec)
+{
+	mt6350_model_update_profile(m, temp_c);
+	m->current1_01ma = div_s64(((s64)m->ocv1_mv - vbat_mv) * 10000,
+				 m->r1_mohm);
+	m->current2_01ma = div_s64(((s64)m->ocv2_mv - vbat_mv) * 10000,
+				 m->r2_mohm);
+	/* Preserve factory whole-second, 0.1 mAh per-step truncation. */
+	m->car1_01mah += div_s64((s64)m->current1_01ma * elapsed_sec, 3600);
+	m->car2_01mah += div_s64((s64)m->current2_01ma * elapsed_sec, 3600);
+	m->dod1 = mt6350_model_car_dod(m, m->car1_01mah);
+	m->dod2 = mt6350_model_car_dod(m, m->car2_01mah);
+	m->ocv1_mv = vbat_mv + mt6350_model_imp_tracking(m, vbat_mv,
+						     m->current2_01ma);
+	m->dod3 = clamp(mt6350_model_dod_by_voltage(m, m->ocv1_mv), 0, 100);
+	m->r1_mohm = mt6350_model_resistance(m, m->ocv1_mv);
+	m->ocv2_mv = mt6350_model_voltage_by_soc(m, 100 - m->dod2);
+	m->r2_mohm = mt6350_model_resistance(m, m->ocv2_mv);
+}
+
+static inline void mt6350_model_sleep(struct mt6350_battery_model *m,
+				      int sleep_sec, int old_ocv_mv,
+				      int new_ocv_mv, bool online)
+{
+	/* The factory assumes 4 mA while asleep. This is a fixed estimate,
+	 * not measured current; it also truncates each sleep interval.
+	 */
+	if (sleep_sec > 1800 && !online && new_ocv_mv < old_ocv_mv) {
+		m->dod0 = mt6350_model_dod_by_voltage(m, new_ocv_mv);
+		m->ocv1_mv = new_ocv_mv;
+		m->ocv2_mv = new_ocv_mv;
+		m->car1_01mah = 0;
+		m->car2_01mah = 0;
+	} else {
+		m->car1_01mah += div_s64((s64)40 * sleep_sec, 3600);
+		m->car2_01mah += div_s64((s64)40 * sleep_sec, 3600);
+	}
+	/* The next normal sample updates DOD1/2 and observer resistances. */
+}
+
+static inline int mt6350_model_soc(const struct mt6350_battery_model *m)
+{
+	return 100 - m->dod2;
 }
 
 #endif

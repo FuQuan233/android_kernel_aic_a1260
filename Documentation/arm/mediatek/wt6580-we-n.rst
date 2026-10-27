@@ -3048,3 +3048,23 @@ EINT completion, then runtime power optimization and missing peripherals.
 The Android device TODO keeps detailed source paths and evidence. Runtime
 snapshots are in out/a1260-runtime-pm/soc-audit-before-normal-adb.txt; some
 optional-device probes in that snapshot intentionally report absent paths.
+
+Factory battery model reconstruction (2026-10-27, hardware test pending)
+---------------------------------------------------------------------
+
+The owner confirmed an 1850 mAh / nominal 3.7 V / 6.845 Wh cell. The board
+parameters now use its design charge and energy. The factory normal-boot
+backup supplies four 102-point OCV/resistance profiles and temperature Qmax
+1600/1798/1838/1815 mAh, replacing the old 1397 mAh reference implementation.
+Full OAM D2, impedance iteration, temperature history, sleep estimation,
+RTC persistence and UI tracking are ported using mainline interfaces.
+
+See mt6350-stock-fuel-gauge.rst for exact source digests, addresses, Evidence,
+integer arithmetic and integration differences. Independent mathematical
+comparisons and ARM kernel/DT builds passed. On-demand adb root caused the
+USB/IP attachment to disappear before flashing; the device is still on the
+previous validated #121 kernel. The candidate is
+out/a1260-runtime-pm/boot-factory-battery-1850.img, not yet a hardware-validated
+standard image. Charge-mode restoration, RTC reboot/alarm behavior and
+suspend accounting still need the device connection. Default root remains
+removed from the candidate ramdisk. No storage formatting is involved.

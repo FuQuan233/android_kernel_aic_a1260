@@ -10,6 +10,7 @@
 #include <linux/mfd/mt6397/core.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/nvmem-provider.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
@@ -17,6 +18,10 @@
 #include <linux/rtc.h>
 #include <linux/mfd/mt6397/rtc.h>
 #include <linux/mod_devicetable.h>
+
+#define MT6350_RTC_AL_HOU		0x001c
+#define MT6350_RTC_FGSOC_MASK	GENMASK(14, 8)
+#define MT6350_RTC_FGSOC_SHIFT	8
 
 static int mtk_rtc_write_trigger(struct mt6397_rtc *rtc)
 {
@@ -37,6 +42,81 @@ static int mtk_rtc_write_trigger(struct mt6397_rtc *rtc)
 			"failed to write WRTGR: %d\n", ret);
 
 	return ret;
+}
+
+static int mt6350_rtc_soc_read(void *priv, unsigned int offset,
+			       void *val, size_t bytes)
+{
+	struct mt6397_rtc *rtc = priv;
+	unsigned int data;
+	int ret;
+
+	if (offset || bytes != 1)
+		return -EINVAL;
+
+	mutex_lock(&rtc->lock);
+	ret = regmap_read(rtc->regmap, rtc->addr_base + MT6350_RTC_AL_HOU,
+			  &data);
+	if (!ret)
+		*(u8 *)val = (data & MT6350_RTC_FGSOC_MASK) >>
+			    MT6350_RTC_FGSOC_SHIFT;
+	mutex_unlock(&rtc->lock);
+
+	return ret;
+}
+
+static int mt6350_rtc_soc_write(void *priv, unsigned int offset,
+				void *val, size_t bytes)
+{
+	struct mt6397_rtc *rtc = priv;
+	unsigned int readback;
+	u8 soc;
+	int ret;
+
+	if (offset || bytes != 1)
+		return -EINVAL;
+	soc = *(u8 *)val;
+	if (soc > 100)
+		return -EINVAL;
+
+	/* The factory gauge shares AL_HOU with the alarm hour. Serialize the
+	 * masked write and commit with all RTC time/alarm operations; zero
+	 * remains available to invalidate a saved state.
+	 */
+	mutex_lock(&rtc->lock);
+	ret = regmap_update_bits(rtc->regmap,
+				 rtc->addr_base + MT6350_RTC_AL_HOU,
+				 MT6350_RTC_FGSOC_MASK,
+				 soc << MT6350_RTC_FGSOC_SHIFT);
+	if (!ret)
+		ret = mtk_rtc_write_trigger(rtc);
+	if (!ret)
+		ret = regmap_read(rtc->regmap, rtc->addr_base + MT6350_RTC_AL_HOU,
+				  &readback);
+	if (!ret && ((readback & MT6350_RTC_FGSOC_MASK) >>
+		     MT6350_RTC_FGSOC_SHIFT) != soc)
+		ret = -EIO;
+	mutex_unlock(&rtc->lock);
+
+	return ret;
+}
+
+static int mt6350_rtc_soc_register(struct mt6397_rtc *rtc)
+{
+	struct nvmem_config config = {
+		.name = "mt6350-rtc-soc",
+		.id = NVMEM_DEVID_AUTO,
+		.type = NVMEM_TYPE_BATTERY_BACKED,
+		.root_only = true,
+		.size = 1,
+		.word_size = 1,
+		.stride = 1,
+		.reg_read = mt6350_rtc_soc_read,
+		.reg_write = mt6350_rtc_soc_write,
+		.priv = rtc,
+	};
+
+	return devm_rtc_nvmem_register(rtc->rtc_dev, &config);
 }
 
 /* MT6350's MMIO PWRAP regmap uses a spinlock and atomic polling. */
@@ -380,6 +460,12 @@ static int mtk_rtc_probe(struct platform_device *pdev)
 	ret = devm_rtc_register_device(rtc->rtc_dev);
 	if (ret)
 		return ret;
+	if (of_device_is_compatible(pdev->dev.of_node, "mediatek,mt6350-rtc")) {
+		ret = mt6350_rtc_soc_register(rtc);
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret,
+					     "Failed to register RTC SOC storage\n");
+	}
 	if (rtc->data->poweroff)
 		return devm_register_sys_off_handler(&pdev->dev,
 			SYS_OFF_MODE_POWER_OFF, SYS_OFF_PRIO_DEFAULT,
