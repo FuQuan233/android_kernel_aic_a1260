@@ -922,7 +922,7 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 spm->cpu0.l2ctlr_after, spm->cpu0.cache_config, spm->cpu0.cache_after,
 			 spm->cpu0.wdt_before, spm->cpu0.wdt_armed, spm->cpu0.wdt_after,
 			 spm->cpu0.wdt_length);
-	return len + sysfs_emit_at(buf, len,
+	len += sysfs_emit_at(buf, len,
 			 "mainpll requested=%u off=%u power_downs=%u power_ups=%u\n"
 			 "mainpll_restore automatic=%u software_enable=%u\n"
 			 "mainpll_off=%08x/%08x/%08x/%08x/%08x\n"
@@ -934,6 +934,18 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 spm->axi.pll_off[3], spm->axi.pll_off[4],
 			 spm->axi.pll_wake[0], spm->axi.pll_wake[1], spm->axi.pll_wake[2],
 			 spm->axi.pll_wake[3], spm->axi.pll_wake[4]);
+	return len + sysfs_emit_at(buf, len,
+			 "dcm active=%u paused=%u pauses=%u restores=%u\n"
+			 "dcm_before=%08x/%08x/%08x/%08x/%08x/%08x\n"
+			 "dcm_after=%08x/%08x/%08x/%08x/%08x/%08x\n",
+			 spm->axi.dcm_active, spm->axi.dcm_paused,
+			 spm->axi.dcm_pauses, spm->axi.dcm_restores,
+			 spm->axi.dcm_before[0], spm->axi.dcm_before[1],
+			 spm->axi.dcm_before[2], spm->axi.dcm_before[3],
+			 spm->axi.dcm_before[4], spm->axi.dcm_before[5],
+			 spm->axi.dcm_after[0], spm->axi.dcm_after[1],
+			 spm->axi.dcm_after[2], spm->axi.dcm_after[3],
+			 spm->axi.dcm_after[4], spm->axi.dcm_after[5]);
 }
 static DEVICE_ATTR_RO(state);
 

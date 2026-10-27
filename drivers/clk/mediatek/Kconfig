@@ -29,6 +29,14 @@ config COMMON_CLK_MT6580_USB
 	  path. MMSYS0 clocks retain the BSP always-on policy. Enable this
 	  for the wt6580_we_n bring-up images.
 
+config COMMON_CLK_MT6580_DCM
+	bool "MT6580 CPU and infra/peripheral bus dynamic clock management"
+	depends on COMMON_CLK_MT6580_USB
+	help
+	  Own the BSP CPU Mode 1 and infra/peripheral automatic slow/gate
+	  controls, with checked masked updates and PLL/suspend handoff.
+	  Does not change CPU/L2 dividers, MCUSYS, EMI/DRAMC or USB/PMIC DCM.
+
 config COMMON_CLK_MT2701
 	bool "Clock driver for MediaTek MT2701"
 	depends on (ARCH_MEDIATEK && ARM) || COMPILE_TEST

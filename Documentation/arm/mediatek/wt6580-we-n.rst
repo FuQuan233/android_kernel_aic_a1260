@@ -3235,3 +3235,53 @@ windows, bounded cipher waits and stage failures; actual hardware reset
 and analog timing are established by the above on-device run, not the model.
 The standard product boot/kernel now use ordinary boot-pwrap-cold.img and
 kernel-pwrap-cold, build #132; the forced-init image is kept separately.
+
+CPU Mode 1 and infra/peripheral bus DCM (build #133)
+----------------------------------------------------
+
+CONFIG_COMMON_CLK_MT6580_DCM now owns the six documented CPU/bus field
+groups through the existing TOPCKGEN/INFRACFG clock owners. The normal
+kernel backup confirms default CPU Mode 1, infra/peri automatic slow/gate
+with debounce7 and slow /32, and no default MCUSYS configuration action.
+CPU/L2 dividers, MCUSYS gating and EMI/DRAMC policy were not enabled as
+part of this port. Source/binary evidence and exact masks are documented
+in mt6580-dcm.rst, including the reference peripheral off-mask typo.
+
+The #132 baseline had the main CPU/bus controls off. #133 booted Android
+as shell with four CPUs and dcm_state owned=1 valid=1 applies=1. Actual
+fields were Mode1=1, Mode2 WFI/WFE=0, ARMPLL auto gate=1,
+bus control=0x0c100c10 and debounce=0x8003cf06, retaining unrelated bits.
+Seven frequency requests 604500--1300000 kHz matched, with four pinned
+CPU hashes/coherent count correct and 400 cross-CPU time migrations per
+check without backward time. CPU1--3 off/on and a subsequent SMP check
+also passed, and schedutil/604500--1300000 plus four CPUs were restored.
+
+Two explicit deep intervals stopped clocks 9.019785421 and 9.115886352
+seconds. An additional automatic interval lasted 26.600534933 seconds.
+Final statistics were success3/fail0, CPU0/L2 cold3, MAINPLL down/up3/3,
+and DCM pause/restore3/3 with paused=0. The owned fields were restored by
+the finisher; applies remained1 and resume_fixes0. The 8 MiB RAM hash
+matched, PMIC link checks had no error, and the default remained deep.
+
+The existing EGL workload completed 1762 frames before deep and 1853 after,
+with green readback 0,255,0,255 and GL_ERROR0. Aligned 4 MiB direct write,
+fsync and two direct reads matched SHA256 before and after deep; MMC stayed
+8-bit/52 MHz with error0. The first toybox dd O_DIRECT read returned EINVAL:
+its source allocates the buffer with xmalloc without 4096-byte alignment.
+The CPU/GPU portions had passed but that combined script ended at I/O;
+the targeted I/O checks then used the existing posix_memalign-based
+aligned-io fixture and completed. No storage-driver workaround was added.
+The post-resume display had zero RDMA underflow/abnormal events. MCUSYS
+DCM bits remained off and its L2 divider remained0x12; unowned misc bits
+are not claimed invariant across CPU power-down.
+
+The host model passed 10000 randomized masked-update/live-bit preservation
+and register-reset restoration cases, plus six partial-write failures and
+rollback under ASAN/UBSAN. No hardware bus fault or electrical saving was
+measured. Test files, RAM/I/O data, alarm and wake locks were cleaned; the
+final ADB UID was shell, stay-on0. Standard product boot/kernel now use
+boot-dcm.img/kernel-dcm, build #133. Evidence is in
+out/a1260-runtime-pm/dcm, including first-boot.txt, active.log, io.log,
+deep.log, after-deep.txt, io-after-deep.log, gpu-after-deep.log,
+normal-adb.txt, stock-core.json and summary.json. Deeper runtime cpuidle
+and MCUSYS/memory DCM remain separate work.

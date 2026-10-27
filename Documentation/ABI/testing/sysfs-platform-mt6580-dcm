@@ -1,0 +1,21 @@
+What:		/sys/bus/platform/devices/10000000.clock-controller/dcm_state
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Read-only MT6580 clock-driver CPU/bus DCM diagnostics. owned=1
+		means the configured driver applied CPU Mode 1 and infra/peri
+		policy. valid=1 means all owned control bits currently match it.
+		applies counts initial/resume-noirq policy applications;
+		resume_fixes counts mismatches repaired at resume-noirq. Deep
+		finisher pause/restores have separate counters in the SPM state
+		attribute; they are not late repair applications.
+
+		The six before/current words are ordered INFRACFG offsets
+		0x14/0x10/0xa00 and TOPCKGEN 0x20/0x28/0x2c. before is the
+		initial firmware snapshot. current is read under the shared
+		clock lock; unrelated bits may legitimately change with other
+		clock consumers. With owned=0 no policy is promised; zero words
+		without an acquired mapping are not measured register values.
+
+		This reports control bits, not time spent gated or electrical
+		power consumption. It exposes no write or runtime mode switch.

@@ -9,6 +9,7 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/smp.h>
 #include <linux/soc/mediatek/mt6580-mainpll.h>
 #include <linux/soc/mediatek/mt6580-pwrap.h>
@@ -26,6 +27,9 @@ struct mt6580_clk_provider {
 	void __iomem *infra;
 	struct clk_hw_onecell_data *hws;
 	bool top, apmixed;
+	bool dcm_owned;
+	u32 dcm_before[6];
+	u32 dcm_applies, dcm_resume_fixes;
 };
 
 static struct platform_driver mt6580_usb_clk_driver;
@@ -34,6 +38,189 @@ static struct platform_driver mt6580_usb_clk_driver;
  */
 static struct device *mt6580_top_device;
 static struct device *mt6580_pll_device;
+
+/* CPU Mode 1 and infra/peri policy from MT6580 mt_dcm.c and the normal
+ * kernel backup. The six fields span existing TOPCKGEN/INFRACFG owners.
+ * Do not own CPU/L2 mux/dividers, MCUSYS, EMI/DRAMC, PMIC or USB DCM.
+ */
+static const u16 mt6580_dcm_offsets[] = { 0x14, 0x10, 0xa00, 0x20, 0x28, 0x2c };
+static const u32 mt6580_dcm_masks[] = {
+	BIT(0), GENMASK(2, 1), BIT(2), BIT(30),
+	GENMASK(11, 5) | GENMASK(27, 21), GENMASK(19, 8),
+};
+static const u32 mt6580_dcm_on[] = {
+	BIT(0), 0, BIT(2), 0, BIT(11) | BIT(10) | BIT(27) | BIT(26),
+	(7 << 9) | BIT(8) | (7 << 15) | BIT(14),
+};
+static const u8 mt6580_dcm_enable_order[] = { 5, 4, 2, 1, 3, 0 };
+static const u8 mt6580_dcm_pause_order[] = { 0, 1, 2, 3, 4, 5 };
+
+static void __iomem *mt6580_dcm_reg(void __iomem *top, void __iomem *infra, unsigned int i)
+{
+	return (i < 3 ? infra : top) + mt6580_dcm_offsets[i];
+}
+
+static void mt6580_dcm_snapshot(void __iomem *top, void __iomem *infra, u32 values[6])
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(mt6580_dcm_offsets); i++)
+		values[i] = readl(mt6580_dcm_reg(top, infra, i));
+}
+
+static bool mt6580_dcm_matches(const u32 values[6], const u32 expected[6])
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(mt6580_dcm_offsets); i++)
+		if ((values[i] ^ expected[i]) & mt6580_dcm_masks[i])
+			return false;
+	return true;
+}
+
+/* Caller owns the shared clock lock, or is the sole CPU with IRQs disabled
+ * in the coherency-off finisher. No locking, allocation or CCF in this helper.
+ */
+static int mt6580_dcm_write(void __iomem *top, void __iomem *infra,
+			   const u32 values[6], const u8 order[6])
+{
+	unsigned int n;
+
+	for (n = 0; n < ARRAY_SIZE(mt6580_dcm_offsets); n++) {
+		unsigned int i = order[n];
+		void __iomem *reg = mt6580_dcm_reg(top, infra, i);
+		u32 mask = mt6580_dcm_masks[i];
+		u32 value = (readl(reg) & ~mask) | (values[i] & mask);
+
+		writel(value, reg);
+		if ((readl(reg) ^ value) & mask)
+			return -EIO;
+	}
+	return 0;
+}
+
+static void mt6580_dcm_put_supplier(void *data)
+{
+	put_device(data);
+}
+
+static int mt6580_dcm_init(struct device *dev, struct mt6580_clk_provider *top)
+{
+	struct device *pll = READ_ONCE(mt6580_pll_device);
+	struct mt6580_clk_provider *ap;
+	unsigned long flags;
+	u32 bus, values[6];
+	int ret, restore;
+
+	if (!IS_ENABLED(CONFIG_COMMON_CLK_MT6580_DCM))
+		return 0;
+	if (!pll || !device_is_bound(pll))
+		return -EPROBE_DEFER;
+	get_device(pll);
+	ret = devm_add_action_or_reset(dev, mt6580_dcm_put_supplier, pll);
+	if (ret)
+		return ret;
+	if (!device_link_add(dev, pll, DL_FLAG_AUTOREMOVE_CONSUMER))
+		return -EINVAL;
+	if (pll->driver != &mt6580_usb_clk_driver.driver)
+		return -ENODEV;
+	ap = dev_get_drvdata(pll);
+	if (!ap || !ap->apmixed || !ap->infra)
+		return -ENODEV;
+	/* This mapping remains owned by the held APMIXEDSYS supplier. */
+	top->infra = ap->infra;
+	spin_lock_irqsave(&mt6580_usb_clk_lock, flags);
+	mt6580_dcm_snapshot(top->base, top->infra, top->dcm_before);
+	bus = top->dcm_before[4];
+	/* Qualify the existing full-rate selections and absence of forced
+	 * slow/off. Never silently replace a firmware bus ratio or CPU source.
+	 */
+	if ((readl(top->infra) & GENMASK(3, 2)) != BIT(2) ||
+	    (bus & (GENMASK(4, 0) | GENMASK(20, 16))) != (BIT(4) | BIT(20)) ||
+	    (bus & (BIT(31) | BIT(29) | BIT(28) | BIT(15) | BIT(13) | BIT(12)))) {
+		ret = -EBUSY;
+		goto out;
+	}
+	ret = mt6580_dcm_write(top->base, top->infra, mt6580_dcm_on, mt6580_dcm_enable_order);
+	if (ret) {
+		restore = mt6580_dcm_write(top->base, top->infra, top->dcm_before,
+					  mt6580_dcm_enable_order);
+		if (restore)
+			dev_err(dev, "DCM rollback failed: %d\n", restore);
+		goto out;
+	}
+	mt6580_dcm_snapshot(top->base, top->infra, values);
+	top->dcm_owned = true;
+	top->dcm_applies++;
+out:
+	spin_unlock_irqrestore(&mt6580_usb_clk_lock, flags);
+	return ret;
+}
+
+static ssize_t dcm_state_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct mt6580_clk_provider *top = dev_get_drvdata(dev);
+	unsigned long flags;
+	u32 values[6] = { 0 };
+	ssize_t len;
+
+	spin_lock_irqsave(&mt6580_usb_clk_lock, flags);
+	if (top->infra)
+		mt6580_dcm_snapshot(top->base, top->infra, values);
+	len = sysfs_emit(buf, "owned=%u valid=%u applies=%u resume_fixes=%u\n"
+		"regs=infra:0014/0010/0a00 top:0020/0028/002c\n"
+		"before=%08x/%08x/%08x/%08x/%08x/%08x\n"
+		"current=%08x/%08x/%08x/%08x/%08x/%08x\n",
+		top->dcm_owned, top->dcm_owned && mt6580_dcm_matches(values, mt6580_dcm_on),
+		top->dcm_applies, top->dcm_resume_fixes,
+		top->dcm_before[0], top->dcm_before[1], top->dcm_before[2],
+		top->dcm_before[3], top->dcm_before[4], top->dcm_before[5],
+		values[0], values[1], values[2], values[3], values[4], values[5]);
+	spin_unlock_irqrestore(&mt6580_usb_clk_lock, flags);
+	return len;
+}
+static DEVICE_ATTR_RO(dcm_state);
+
+static umode_t mt6580_clk_attr_visible(struct kobject *kobj, struct attribute *attr, int n)
+{
+	/* MFGCFG uses a different private struct despite sharing this driver. */
+	return of_device_is_compatible(kobj_to_dev(kobj)->of_node,
+				      "mediatek,mt6580-topckgen") ? attr->mode : 0;
+}
+
+static struct attribute *mt6580_clk_attrs[] = { &dev_attr_dcm_state.attr, NULL };
+static const struct attribute_group mt6580_clk_group = {
+	.attrs = mt6580_clk_attrs,
+	.is_visible = mt6580_clk_attr_visible,
+};
+static const struct attribute_group *mt6580_clk_groups[] = { &mt6580_clk_group, NULL };
+
+static int mt6580_clk_resume_noirq(struct device *dev)
+{
+	struct mt6580_clk_provider *top;
+	unsigned long flags;
+	u32 values[6];
+	int ret = 0;
+
+	if (!of_device_is_compatible(dev->of_node, "mediatek,mt6580-topckgen"))
+		return 0;
+	top = dev_get_drvdata(dev);
+	if (!top->dcm_owned)
+		return 0;
+	spin_lock_irqsave(&mt6580_usb_clk_lock, flags);
+	mt6580_dcm_snapshot(top->base, top->infra, values);
+	if (!mt6580_dcm_matches(values, mt6580_dcm_on)) {
+		ret = mt6580_dcm_write(top->base, top->infra, mt6580_dcm_on,
+					mt6580_dcm_enable_order);
+		if (!ret) {
+			top->dcm_applies++;
+			top->dcm_resume_fixes++;
+		}
+	}
+	spin_unlock_irqrestore(&mt6580_usb_clk_lock, flags);
+	return ret;
+}
+static DEFINE_NOIRQ_DEV_PM_OPS(mt6580_clk_pm, NULL, mt6580_clk_resume_noirq);
 
 struct mt6580_cpu_clk {
 	struct clk_hw hw;
@@ -90,7 +277,7 @@ static int mt6580_cpu_set_rate(struct clk_hw *hw, unsigned long rate,
 {
 	struct mt6580_cpu_clk *cpu = container_of(hw, struct mt6580_cpu_clk, hw);
 	unsigned long flags;
-	u32 mux, div, gate, con;
+	u32 mux, div, gate, con, dcm;
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(mt6580_cpu_rates); i++)
@@ -105,10 +292,15 @@ static int mt6580_cpu_set_rate(struct clk_hw *hw, unsigned long rate,
 	 * Preserve unrelated mux, gate and divider bits, including firmware DCM.
 	 */
 	spin_lock_irqsave(&mt6580_usb_clk_lock, flags);
+	/* Suspend automatic ARMPLL gating while both PLLs are manipulated.
+	 * CPU Mode 1 is restored only after the CPU has returned to ARMPLL.
+	 */
+	dcm = readl(cpu->infra + 0x14);
+	writel(dcm & ~BIT(0), cpu->infra + 0x14);
 	mux = readl(cpu->infra);
 	div = readl(cpu->infra + 8);
 	gate = readl(cpu->infra + 0xa00);
-	writel(gate & ~BIT(1), cpu->infra + 0xa00);
+	writel(gate & ~(BIT(1) | BIT(2)), cpu->infra + 0xa00);
 	writel((mux & ~GENMASK(3, 2)) | (3 << 2), cpu->infra);
 	readl(cpu->infra);
 	con = readl(cpu->pll + 0x104);
@@ -119,6 +311,8 @@ static int mt6580_cpu_set_rate(struct clk_hw *hw, unsigned long rate,
 	writel((mux & ~GENMASK(3, 2)) | BIT(2), cpu->infra);
 	readl(cpu->infra);
 	writel(gate, cpu->infra + 0xa00);
+	writel(dcm, cpu->infra + 0x14);
+	readl(cpu->infra + 0x14);
 	spin_unlock_irqrestore(&mt6580_usb_clk_lock, flags);
 	return 0;
 }
@@ -988,6 +1182,12 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 		if (IS_ERR(data->hws[i]))
 			return PTR_ERR(data->hws[i]);
 
+	platform_set_drvdata(pdev, provider);
+	if (top) {
+		ret = mt6580_dcm_init(dev, provider);
+		if (ret)
+			return dev_err_probe(dev, ret, "DCM configuration failed\n");
+	}
 	ret = devm_of_clk_add_hw_provider(dev, of_clk_hw_onecell_get, data);
 	if (ret)
 		return ret;
@@ -1307,6 +1507,13 @@ int mt6580_axi_sleep_prepare(struct device *top, struct device *pll,
 	ctx->cpu_mux_after = 0;
 	ctx->mainpll_auto_restored = false;
 	ctx->mainpll_enable_written = false;
+	ctx->dcm_active = top_data->dcm_owned;
+	ctx->dcm_paused = false;
+	if (ctx->dcm_active) {
+		mt6580_dcm_snapshot(top_data->base, pll_data->infra, ctx->dcm_before);
+		if (!mt6580_dcm_matches(ctx->dcm_before, mt6580_dcm_on))
+			return mt6580_axi_error(ctx, -EBUSY);
+	}
 	for (i = 0; i < ARRAY_SIZE(ctx->pll_after); i++) {
 		ctx->pll_after[i] = 0;
 		ctx->pll_off[i] = 0;
@@ -1326,7 +1533,7 @@ int mt6580_axi_sleep_enter(struct device *top, struct device *pll,
 			   struct mt6580_axi_context *ctx)
 {
 	struct mt6580_clk_provider *top_data, *pll_data;
-	u32 mainpll[5], parked;
+	u32 mainpll[5], parked, off[6];
 	int ret;
 
 	if (!ctx)
@@ -1346,6 +1553,24 @@ int mt6580_axi_sleep_enter(struct device *top, struct device *pll,
 	 * Keep divider enables, audio and all unrelated mux bits intact.
 	 * PLL power is touched only by the separately requested sequence below.
 	 */
+	if (ctx->dcm_active) {
+		memcpy(off, ctx->dcm_before, sizeof(off));
+		off[0] &= ~BIT(0);
+		off[1] &= ~GENMASK(2, 1);
+		off[2] &= ~BIT(2);
+		off[3] |= BIT(30);
+		off[4] &= ~(BIT(11) | BIT(10) | BIT(27) | BIT(26));
+		off[5] &= ~(BIT(8) | BIT(14));
+		/* Own the partial state before the first write so abort cleanup
+		 * still restores it if readback fails before AXI was parked.
+		 */
+		ctx->dcm_paused = true;
+		ctx->dcm_pauses++;
+		ret = mt6580_dcm_write(top_data->base, pll_data->infra, off,
+					mt6580_dcm_pause_order);
+		if (ret)
+			return mt6580_axi_error(ctx, ret);
+	}
 	parked = (ctx->mux_before & ~MT6580_AXI_MUX_MASK) | MT6580_AXI_26M;
 	ctx->parked = true;
 	ctx->entries++;
@@ -1373,7 +1598,7 @@ int mt6580_axi_sleep_resume(struct device *top, struct device *pll,
 	if (!ctx)
 		return -EINVAL;
 	/* Also used for aborted preparation and idempotent post-return cleanup. */
-	if (!ctx->parked && !ctx->mainpll_off) {
+	if (!ctx->parked && !ctx->mainpll_off && !ctx->dcm_paused) {
 		ctx->prepared = false;
 		return 0;
 	}
@@ -1403,9 +1628,19 @@ int mt6580_axi_sleep_resume(struct device *top, struct device *pll,
 	ctx->mux_after = mt6580_axi_write_mux(top_data, ctx->mux_before);
 	if (ctx->mux_after != ctx->mux_before)
 		goto keep_26m;
+	if (ctx->dcm_paused) {
+		ret = mt6580_dcm_write(top_data->base, pll_data->infra, ctx->dcm_before,
+					mt6580_dcm_enable_order);
+		mt6580_dcm_snapshot(top_data->base, pll_data->infra, ctx->dcm_after);
+		if (ret || !mt6580_dcm_matches(ctx->dcm_after, ctx->dcm_before))
+			goto keep_26m;
+		ctx->dcm_paused = false;
+		ctx->dcm_restores++;
+	}
+	if (ctx->parked)
+		ctx->resumes++;
 	ctx->parked = false;
 	ctx->prepared = false;
-	ctx->resumes++;
 	return ctx->error;
 
 keep_26m:
@@ -1441,6 +1676,8 @@ static struct platform_driver mt6580_usb_clk_driver = {
 	.driver = {
 		.name = "mt6580-usb-clocks",
 		.of_match_table = mt6580_usb_clk_match,
+		.dev_groups = mt6580_clk_groups,
+		.pm = pm_sleep_ptr(&mt6580_clk_pm),
 	},
 };
 module_platform_driver(mt6580_usb_clk_driver);
