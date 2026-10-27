@@ -173,7 +173,8 @@
 
 	vcodec: video-codec@1500b000 {
 		compatible = "mediatek,mt6580-vcodec";
-		reg = <0 0x1500b000 0 0x2000>;
+		reg = <0 0x1500b000 0 0x2000>, <0 0x15009000 0 0x1000>;
+		reg-names = "vdec", "mp4-venc";
 		interrupts = <GIC_SPI 137 IRQ_TYPE_LEVEL_LOW>;
 		clocks = <&imgsys CLK_MT6580_IMG_VCODEC>;
 		clock-names = "vcodec";

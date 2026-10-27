@@ -1,3 +1,7 @@
 /libval-buffer-bridge.so
 /buffer-check
 /stock-create-check
+/libval-decode-bridge.so
+/stock-decode-probe
+
+/job-check

@@ -12,16 +12,23 @@ maintainers:
 description:
   MT6580 decoder MISC and VLD share a two-page window in the ISP domain.
   Its memory traffic uses LARB1 POST0, CDMA and WDMA ports. The initial
-  driver only prepares owned DMA buffers through M4U; the register window,
-  interrupt and functional clock describe the hardware, not implemented
-  decode job support. This is not compatible with MT8173 V4L2 hardware.
+  driver manages owned DMA buffers and decoder jobs through M4U. H.264 also
+  uses the separate MP4-VENC register block as an auxiliary engine. This is
+  not compatible with MT8173 V4L2 hardware.
 
 properties:
   compatible:
     const: mediatek,mt6580-vcodec
 
   reg:
-    maxItems: 1
+    items:
+      - description: VDEC MISC and VLD register window
+      - description: MP4-VENC auxiliary register window
+
+  reg-names:
+    items:
+      - const: vdec
+      - const: mp4-venc
 
   interrupts:
     maxItems: 1
@@ -44,6 +51,7 @@ properties:
 required:
   - compatible
   - reg
+  - reg-names
   - interrupts
   - clocks
   - clock-names

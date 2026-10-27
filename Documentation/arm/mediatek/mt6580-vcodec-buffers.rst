@@ -141,3 +141,73 @@ injection is claimed. The standard product boot/kernel are #178; private
 libraries/scripts are removed and ordinary shell/default CPU/deep policy
 restored. Full dt-schema validation tools were unavailable; binding YAML
 syntax and normal kernel/DTB compilation passed.
+
+Native hybrid job bring-up (#179--#181)
+-------------------------------------
+
+The native UAPI now binds owned coherent OAL memory, serializes actual
+H.264 hardware ownership, enables the VCODEC/ISP/LARB supplier chain and
+waits for the real level-low IRQ. Validated register-result offsets select
+only the two declared resources. The VDEC MISC/VLD window remains at
+0x1500b000 (8 KiB); the XA H.264 binary additionally accesses MP4-VENC at
+0x15009000 (4 KiB). It is mapped as a separate resource and opaque AUX
+mmap token, never as a larger physical mapping across intervening blocks.
+MMIO requires CAP_SYS_RAWIO, a shared non-executable mapping and an active
+job by the private caller contract. MMIO VMAs do not retain power.
+
+The 64-bit opaque mmap token needs FOP_UNSIGNED_OFFSET on ARM32: without
+it mm/mmap.c rejects this character-device offset with EOVERFLOW before
+the driver's mmap callback. #180 verified the corrected VDEC mapping;
+#181 adds the exact auxiliary mapping needed by the actual decoder.
+
+An IRQ completion masks IRQ, publishes coherent results/completed and
+releases clocks/runtime PM. A timeout, cancellation or file close masks
+and synchronizes IRQ before power release. The old BSP does not establish
+a usable reset sequence, so an abort must observe a fresh real ISP OFF
+notification. If stopping cannot be proven, all possibly active buffers
+(including RELEASEd but still mapped objects) are quarantined and a wake
+source is retained until reboot. No unsafe DMA mapping is freed as though
+cancellation alone were proof that the hardware stopped.
+
+The isolated legacy adapter translates actual locks, thread registration,
+OAL binding, register mappings and WAIT into this native ABI. It does not
+fabricate a successful completion. The 8.1 driver requires SetParam(0xf)
+with the packed Linux OMX TIDs before Init. External frame descriptors
+are 0x88 bytes. Input and DPB descriptors remain stable until their distinct
+free-input and free-frame queries return them; display notification alone
+does not release a referenced DPB frame.
+
+As with the earlier GPU port, the original DRVB library validates this
+device's real dev_info words. The private packaging adapts only the old
+sysfs pathname to the existing same-device /vendor/etc/mt6580-devinfo.bin.
+It preserves the validation code. Missing that input produced error 0x1004
+and the original library's deliberate 0xddeeaadd caller-stack poisoning;
+no memory allocator padding or disabled validation is used to hide it.
+
+The successful evidence is vcodec-next/decode-181-aux.txt: eight Baseline
+128x96 non-I_PCM H.264 frames match an independent libavc software-decoded
+I420 reference exactly. IRQs increase by eight during Decode (excluding
+Init), timeouts/cancellations/spurious/power errors stay zero, and DeInit /
+Release leave VMA/buffer/byte counts at zero. The private socket worker
+then passes 20 reset/EOS cycles (160 frames) and two continuous 128-frame
+runs, matching pixels, originating tokens and PTS. The cumulative hardware
+count is 432 jobs/432 IRQs, no faults, taint0 and no remaining live buffers.
+This establishes native hardware decode and repeated descriptor reuse;
+Android MediaCodec integration is still being qualified separately.
+
+All proprietary DSOs and same-device efuses remain outside this repository.
+
+Build #182 corrects zero-timeout WAIT into a non-cancelling EAGAIN poll.
+job-poll-182.txt checks an acquired empty lock (no DMA command), unchanged
+pending OAL words, then explicit cancellation with a fresh ISP OFF and no
+live objects. Its one cancellation is deliberate, not a decode timeout.
+worker-182-720p.txt then verifies eight 1280x720 Baseline frames against
+independent I420 pixels/token/PTS with eight real IRQs, timeouts0 and live0.
+The 8.1 library actually selects its dual-thread XB implementation for this
+sample; this is not a performance or all-profile/stream qualification.
+
+worker-182-720p-final.txt repeats two continuous 32-frame 720p runs with the
+final adapter (unused/uninitialized thread-array words are no longer copied
+or logged). All 64 frames/token/PTS match; cumulative #182 counters become
+jobs73/IRQs72/timeouts0/cancellations1 (the preceding explicit empty-lock
+check), no faults/power errors and live0. Android integration remains pending.

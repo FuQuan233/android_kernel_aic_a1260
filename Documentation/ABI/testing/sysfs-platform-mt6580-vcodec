@@ -9,3 +9,11 @@ Description:
                 coherent mapping still counts as live until its last unmap.
                 Counters are individually sampled. Reading does not access
                 MMIO, enable VCODEC clocks, or submit a codec DMA operation.
+
+                The second line reports active-job state and cumulative jobs,
+                real IRQ completions, WAIT timeouts, explicit cancellations,
+                spurious interrupts and runtime-PM failures. The third reports
+                a latched device fault, real ISP-domain OFF generations and
+                failures to establish a fresh OFF after an aborted job. A fault
+                retains the possible DMA objects and wake source until reboot;
+                these counters are observations, never simulated completion.

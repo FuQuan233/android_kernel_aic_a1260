@@ -15,6 +15,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include "../../include/uapi/linux/mt6580-vcodec.h"
+#include "val-buffer-bridge.h"
 
 struct val_memory {
 	uint32_t signature, type;
@@ -59,10 +60,24 @@ static int sync_cpu(struct allocation *a, int start)
 	return 0;
 }
 
+static int buffer_request(unsigned long command, struct mt6580_vcodec_buffer *request)
+{
+	int rc;
+	/* Legacy software workers may allocate while the previous HW job ends.
+	 * The kernel refuses buffer mutations until IRQ/timeout returns ownership.
+	 */
+	for (unsigned int attempt = 0; ; attempt++) {
+		rc = ioctl(codec_fd, command, request);
+		if (!rc || errno != EBUSY || attempt == 2000)
+			return rc;
+		usleep(1000);
+	}
+}
+
 static int release_buffer(uint32_t id)
 {
 	struct mt6580_vcodec_buffer request = { .id = id };
-	return ioctl(codec_fd, MT6580_VCODEC_RELEASE, &request);
+	return buffer_request(MT6580_VCODEC_RELEASE, &request);
 }
 
 static int open_codec(void)
@@ -81,6 +96,46 @@ static struct allocation *find_range(uint64_t va, uint64_t size)
 			return a;
 	}
 	return NULL;
+}
+
+int mt6580_bridge_fd(void)
+{
+	int fd;
+	if (owner_pid != getpid()) { errno = EPERM; return -1; }
+	pthread_mutex_lock(&lock);
+	fd = open_codec();
+	pthread_mutex_unlock(&lock);
+	return fd;
+}
+
+int mt6580_bridge_buffer(uintptr_t va, size_t bytes, uint32_t *id,
+			 uint32_t *offset, int require_coherent)
+{
+	struct allocation *a;
+	int rc = -1;
+	if (owner_pid != getpid()) { errno = EPERM; return -1; }
+	pthread_mutex_lock(&lock);
+	a = find_range(va, bytes);
+	if (a && (!require_coherent || a->fd < 0)) {
+		*id = a->buffer.id;
+		*offset = va - (uintptr_t)a->va;
+		rc = 0;
+	}
+	pthread_mutex_unlock(&lock);
+	if (rc) errno = EFAULT;
+	return rc;
+}
+
+int mt6580_bridge_sync(int cpu)
+{
+	struct allocation *a;
+	int rc = 0;
+	if (owner_pid != getpid()) { errno = EPERM; return -1; }
+	pthread_mutex_lock(&lock);
+	for (a = allocations; a; a = a->next)
+		if (sync_cpu(a, cpu)) rc = -1;
+	pthread_mutex_unlock(&lock);
+	return rc;
 }
 
 int eVideoMemAlloc(struct val_memory *m, uint32_t size)
@@ -111,7 +166,7 @@ int eVideoMemAlloc(struct val_memory *m, uint32_t size)
 	a->length = ((uint64_t)bytes + 4095) & ~(uint64_t)4095;
 	if (m->type == 3) {
 		a->buffer.size = a->length;
-		if (ioctl(codec_fd, MT6580_VCODEC_ALLOC, &a->buffer))
+		if (buffer_request(MT6580_VCODEC_ALLOC, &a->buffer))
 			goto out;
 		imported = 1;
 		a->va = mmap(NULL, a->length, PROT_READ | PROT_WRITE, MAP_SHARED,
@@ -125,7 +180,7 @@ int eVideoMemAlloc(struct val_memory *m, uint32_t size)
 			goto out;
 		a->fd = heap.fd;
 		a->buffer.fd = a->fd;
-		if (ioctl(codec_fd, MT6580_VCODEC_IMPORT, &a->buffer))
+		if (buffer_request(MT6580_VCODEC_IMPORT, &a->buffer))
 			goto out;
 		imported = 1;
 		a->va = mmap(NULL, a->length, PROT_READ | PROT_WRITE, MAP_SHARED, a->fd, 0);
@@ -263,7 +318,8 @@ static int cache_access(struct val_memory *m, uint32_t size, uint32_t operation,
 {
 	struct allocation *a;
 	int rc = VAL_INVALID_MEMORY;
-	if (owner_pid != getpid() || !m || size != sizeof(*m) || operation > 1)
+	if (owner_pid != getpid() || operation > 1 ||
+	    (operation == 1 && (!m || size != sizeof(*m))))
 		return VAL_INVALID_PARAMETER;
 	pthread_mutex_lock(&lock);
 	if (!operation) {

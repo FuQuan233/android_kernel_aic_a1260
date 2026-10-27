@@ -671,12 +671,14 @@ config PKVM_IOMMU_TEMPLATE
 		Say N here unless you know what you are doing.
 
 config MT6580_VCODEC
-	bool "MediaTek MT6580 codec DMA buffer bridge"
+	bool "MediaTek MT6580 codec DMA buffers and hybrid jobs"
 	depends on ARM_DMA_USE_IOMMU && OF && MTK_IOMMU=y && DMA_SHARED_BUFFER
 	help
 	  Provide privileged, per-file DMA-BUF imports and coherent allocations
-	  for MT6580 codec bring-up. Requires a real M4U DMA domain. This only
-	  prepares buffers; it does not program or run the video codec engine.
+	  for MT6580 codec bring-up, plus owned hybrid H.264 locks, OAL memory,
+	  validated MMIO and real IRQ completion. Requires a real M4U DMA
+	  domain. This is a privileged debug interface, not an MT8173 V4L2
+	  decoder or a replacement for the Android media framework.
 
 source "drivers/misc/c2port/Kconfig"
 source "drivers/misc/eeprom/Kconfig"
