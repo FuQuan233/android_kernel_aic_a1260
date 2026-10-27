@@ -319,3 +319,30 @@ Description:
 		although the prepared bank policy is still restored on return.
 		The 0.85 V value is a programmed sleep target, not a rail measurement
 		made while the CPU is powered off. Awake OPP limits are unchanged.
+
+What:		/sys/bus/platform/devices/.../mcusys_state
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Read-only MT6580 APMIXEDSYS MCUSYS/BIU DCM diagnostics. owned
+		indicates opt-in ownership; valid requires MCUCFG+0x5c bit9 and
+		BIU+0 bit12 enabled, with MCUCFG+0x60[4:0]=0x12. before/current
+		contain those three raw words in that order; unowned live bits
+		can change and are not constant configuration expectations.
+
+		applies counts initialization and late resume repairs;
+		resume_fixes counts the latter separately. dvfs pauses/restores/
+		failures count CPU frequency handovers. degraded means a failed
+		post-clock gate restoration latched the optional policy off after
+		checking full-clock operation; the actual new CPU rate remains
+		committed. This preserves OPP frequency/voltage accounting.
+		SPM state additionally
+		reports mcusys active/paused/pauses/restores and before/after
+		snapshots for the early AXI/PLL transaction; it includes partial
+		pause ownership before the first register write. Runtime
+		idle_state blocked clocks counts policy admission failures. Its
+		separate clocks active/paused/pauses/restores and before/after
+		snapshots report the runtime pause before CPU PM and restore in
+		the PCM wait callback before arch/GIC clients exit CPU PM;
+		outer cleanup also covers early-WFI or notifier aborts. Counters wrap at32
+		bits. Reading the attribute changes no policy or divider.

@@ -37,6 +37,14 @@ config COMMON_CLK_MT6580_DCM
 	  controls, with checked masked updates and PLL/suspend handoff.
 	  Does not change CPU/L2 dividers, MCUSYS, EMI/DRAMC or USB/PMIC DCM.
 
+config COMMON_CLK_MT6580_MCUSYS_DCM
+	bool "MT6580 MCUSYS and BIU automatic clock gating"
+	depends on COMMON_CLK_MT6580_DCM
+	help
+	  Own the BSP CG1 whole-bus and CG3 BIU DCM enables, preserving
+	  the firmware /2 L2 divider. Pause/restore around CPU DVFS and
+	  AXI/MAINPLL system sleep. L2 SRAM gating is not enabled.
+
 config COMMON_CLK_MT6580_EMI_DCM
 	bool "MT6580 EMI automatic clock gating"
 	depends on COMMON_CLK_MT6580_DCM

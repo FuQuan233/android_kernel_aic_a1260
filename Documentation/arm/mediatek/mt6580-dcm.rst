@@ -8,7 +8,8 @@ CONFIG_COMMON_CLK_MT6580_DCM opts into the CPU Mode 1 and infra/peripheral
 bus policy, implemented by the existing clock-bank owners. DDR/EMI block
 configuration, MCUSYS/L2 divider and gating, USB/PMIC DCM and memory PLL
 policy are outside the six CPU/bus fields described here. EMI is managed
-separately; see mt6580-memory-dcm.rst. Four online CPUs use WFI/DCM; the
+separately; see mt6580-memory-dcm.rst. The additional CG1/BIU bus policy
+is described in mt6580-mcusys-dcm.rst; it does not enable SRAM CG2. Four online CPUs use WFI/DCM; the
 separate CPU0-only dormant path is described in mt6580-cpuidle.rst. System
 deep sleep remains a separate path.
 
@@ -106,6 +107,8 @@ out/a1260-runtime-pm/dcm.
 
 Control-bit ownership and successful workload/resume checks do not measure
 electrical savings. CPU-off voltage and board standby current still need
-instruments. MCUSYS/L2 DCM and memory frequency scaling remain outside this policy.
+instruments. The separate MCUSYS/BIU bus policy is now documented in
+mt6580-mcusys-dcm.rst; SRAM gating and memory frequency scaling remain
+outside these policies.
 Separate EMI and CPU0-only runtime idle implementations are documented in
 mt6580-memory-dcm.rst and mt6580-cpuidle.rst.

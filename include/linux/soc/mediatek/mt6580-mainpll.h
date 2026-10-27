@@ -6,6 +6,12 @@
 
 struct device;
 
+struct mt6580_mcusys_context {
+	u32 before[3], after[3];
+	u32 pauses, restores;
+	bool active, paused;
+};
+
 struct mt6580_axi_context {
 	u32 mux_before, mux_parked, mux_wake, mux_after;
 	u32 cpu_mux_before, cpu_mux_after;
@@ -19,6 +25,9 @@ struct mt6580_axi_context {
 	u32 dcm_before[6], dcm_after[6];
 	u32 dcm_pauses, dcm_restores;
 	bool dcm_active, dcm_paused;
+	u32 mcusys_before[3], mcusys_after[3];
+	u32 mcusys_pauses, mcusys_restores;
+	bool mcusys_active, mcusys_paused;
 	u32 emi_before[2], emi_after[2];
 	u32 emi_pauses, emi_restores;
 	bool emi_active, emi_paused;
@@ -42,8 +51,16 @@ struct mt6580_axi_context {
  * retry cleanup must also handle it when AXI was never parked.
  * EMI automatic gating/debounce/idle ratio are separately paused before AXI
  * changes and restored after clock recovery, with emi_paused also retaining
- * partial ownership on error. DDR PLL/timings and DRAMC policy are preserved.
+ * partial ownership on error. MCUSYS CG1/BIU CG3 are separately paused
+ * before the same transaction and restored before CPU Mode1 and L2/device
+ * recovery. Their /2 divider is validated but never written. Partial MCUSYS
+ * ownership is retained on failure too. DDR PLL/timings and DRAMC are preserved.
  */
+/* Read-only, single CPU with IRQs disabled, holding the bound PLL supplier. */
+int mt6580_mcusys_idle_check(struct device *pll);
+int mt6580_mcusys_idle_pause(struct device *pll, struct mt6580_mcusys_context *ctx);
+int mt6580_mcusys_idle_restore(struct device *pll, struct mt6580_mcusys_context *ctx);
+
 int mt6580_axi_sleep_prepare(struct device *top, struct device *pll,
 			     struct mt6580_axi_context *ctx);
 int mt6580_axi_sleep_enter(struct device *top, struct device *pll,

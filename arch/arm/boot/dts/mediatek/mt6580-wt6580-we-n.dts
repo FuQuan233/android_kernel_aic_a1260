@@ -488,7 +488,9 @@
 
 	apmixedsys: clock-controller@10018000 {
 		compatible = "mediatek,mt6580-apmixedsys";
-		reg = <0 0x10018000 0 0x1000>, <0 0x10001000 0 0x1000>;
+		reg = <0 0x10018000 0 0x1000>, <0 0x10001000 0 0x1000>,
+		      <0 0x1020005c 0 0x8>, <0 0x1020d000 0 0x4>;
+		reg-names = "apmixedsys", "infracfg", "mcusys-dcm", "biu";
 		#clock-cells = <1>;
 	};
 

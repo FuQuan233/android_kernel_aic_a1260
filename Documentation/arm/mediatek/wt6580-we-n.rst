@@ -3318,3 +3318,30 @@ No physical error IRQ/CRC/stuck-wire injection or analog current/voltage
 measurement is claimed. USB recovery required manual host intervention;
 adbd start delay and Windows/WSL ownership observations are separately
 recorded. Evidence: out/a1260-runtime-pm/pwrap-runtime/summary.json.
+
+MCUSYS/BIU bus DCM (#161, 2026-10-27)
+-----------------------------------
+
+The BSP /2 enable branch now supplies ownership of MCUCFG+0x5c bit9 and
+BIU+0 bit12. These were off at #157; the compiled stock default argument1
+was a no-op. This deliberate enable leaves the L2 divider at0x12 and SRAM
+CG2 untouched. APMIXEDSYS holds narrow named resources, with shared-lock
+DVFS pause/restore and early AXI/MAINPLL suspend recovery. See
+mt6580-mcusys-dcm.rst for reference evidence, failure behavior and limits.
+
+Actual qualification found BIU loses bit12 on CPU0 runtime reset even with
+L2 retained. #160 detected the mismatch and rejected further operations;
+#161 adds pause before CPU PM and restoration in the PCM wait callback
+before architecture/GIC clients exit CPU PM, plus idempotent abort cleanup.
+
+Seven OPP/four-core checks, two 1 GiB memory passes including GPU concurrency,
+1539 GPU frames with correct readback, and aligned4 MiB direct I/O/two
+matching reads passed. Two deep cycles stopped CNT8.345361923/9.017725205
+seconds; suspend success/fail2/0, early MCUSYS2/2, late repairs0 and RAM hash
+matched. Runtime idle completed911 reset/restores plus one early return,
+with MCUSYS912/912 and failures0; RAM, four-core, then memory/GPU1587 frames
+and eMMC checks passed. Final DVFS was9015 matched pauses/restores, failures0
+and no degradation; display active with zero underflow. Standard boot/kernel
+are #161, default shell/four cores/schedutil604500..1300000/deep retained,
+with tests cleaned up. No physical fault injection or electrical measurement
+is claimed. Evidence: out/a1260-runtime-pm/mcusys-dcm/summary.json.

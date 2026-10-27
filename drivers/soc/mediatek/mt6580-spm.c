@@ -146,8 +146,9 @@ struct mt6580_runtime_idle {
 	u32 saved[ARRAY_SIZE(pcm_saved_regs)];
 	struct mt6580_cpu0_context cpu;
 	struct mt6580_gic_idle_context gic;
+	struct mt6580_mcusys_context clocks;
 	u32 attempts, entries, pcm_runs, rejected, failures;
-	u32 blocked_cpus, blocked_domains, blocked_irq, blocked_pcm, blocked_cirq, blocked_gic;
+	u32 blocked_cpus, blocked_domains, blocked_irq, blocked_pcm, blocked_cirq, blocked_gic, blocked_clocks;
 	int admission_error;
 	u32 r11, r12, assert_pc, ticks, isr, forced;
 	u32 power_before, power_after, power2_before, power2_after;
@@ -355,8 +356,10 @@ static int __cpuidle mt6580_idle_wait(unsigned long arg)
 		spm->idle.forced++;
 		writel(1, spm->base + SPM_CPU_WAKE);
 	}
-	return readl_poll_timeout_atomic(spm->base + SPM_ISR_STATUS, val,
-					val & PCM_RETURN, 1, 10000);
+	if (readl_poll_timeout_atomic(spm->base + SPM_ISR_STATUS, val,
+				     val & PCM_RETURN, 1, 10000))
+		return -ETIMEDOUT;
+	return mt6580_mcusys_idle_restore(spm->clock_ctl[1], &spm->idle.clocks);
 }
 
 static int __cpuidle mt6580_idle_finish(unsigned long arg)
@@ -419,6 +422,12 @@ int mt6580_spm_cpu0_idle(void)
 		idle->blocked_pcm++;
 		return -EBUSY;
 	}
+	ret = mt6580_mcusys_idle_check(spm->clock_ctl[1]);
+	if (ret) {
+		idle->blocked_clocks++;
+		idle->admission_error = ret;
+		return ret;
+	}
 	ret = mt6580_cirq_idle_enter();
 	if (ret) {
 		idle->blocked_cirq++;
@@ -478,6 +487,9 @@ int mt6580_spm_cpu0_idle(void)
 	con1 = readl(spm->base + PCM_CON1) | PCM_TIMER_EN;
 	writel(PCM_KEY | con1, spm->base + PCM_CON1);
 	writel(PCM_R7_OUTPUT, spm->base + PCM_PWR_IO_EN);
+	ret = mt6580_mcusys_idle_pause(spm->clock_ctl[1], &idle->clocks);
+	if (ret)
+		goto restore;
 	if (idle->powerdown)
 		ret = mt6580_cpu0_idle(&idle->cpu, mt6580_idle_finish, mt6580_idle_wait,
 				     (unsigned long)spm);
@@ -509,6 +521,9 @@ int mt6580_spm_cpu0_idle(void)
 			ret = -EIO;
 	}
 restore:
+	restore = mt6580_mcusys_idle_restore(spm->clock_ctl[1], &idle->clocks);
+	if (restore)
+		panic("MT6580 runtime MCUSYS restore failed: %d", restore);
 	restore = mt6580_pcm_restore_regs(spm, idle->saved, &irq_restore);
 	if (!restore)
 		restore = irq_restore;
@@ -529,6 +544,8 @@ restore:
 			    NSEC_PER_SEC, arch_timer_get_rate()) + NSEC_PER_MSEC <
 	    div_u64((u64)idle->ticks * NSEC_PER_SEC, 32768))
 		ret = -EIO;
+	if (!ret)
+		ret = mt6580_mcusys_idle_check(spm->clock_ctl[1]);
 	idle->error = ret == -EBUSY ? 0 : ret;
 	if (ret && ret != -EBUSY) {
 		idle->failures++;
@@ -556,9 +573,9 @@ static ssize_t idle_state_show(struct device *dev, struct device_attribute *attr
 		      "powerdown=%u attempts=%u entries=%u pcm_runs=%u rejected=%u failures=%u error=%d\n",
 		      s->disabled, READ_ONCE(runtime_cpu_powerdown), s->attempts,
 		      s->entries, s->pcm_runs, s->rejected, s->failures, s->error);
-	n += sysfs_emit_at(buf, n, "blocked cpus=%u domains=%u irq=%u pcm=%u cirq=%u gic=%u error=%d\n",
+	n += sysfs_emit_at(buf, n, "blocked cpus=%u domains=%u irq=%u pcm=%u cirq=%u gic=%u clocks=%u error=%d\n",
 			  s->blocked_cpus, s->blocked_domains, s->blocked_irq, s->blocked_pcm,
-			  s->blocked_cirq, s->blocked_gic, s->admission_error);
+			  s->blocked_cirq, s->blocked_gic, s->blocked_clocks, s->admission_error);
 #if IS_ENABLED(CONFIG_ARM_MT6580_CPUIDLE)
 	{
 		struct cpuidle_device *cpu0 = per_cpu(cpuidle_devices, 0);
@@ -570,6 +587,11 @@ static ssize_t idle_state_show(struct device *dev, struct device_attribute *attr
 					  drv->states[2].flags, cpuidle_governor_latency_req(0));
 	}
 #endif
+	n += sysfs_emit_at(buf, n, "clocks active=%u paused=%u pauses=%u restores=%u\n"
+			  "clocks_before=%08x/%08x/%08x after=%08x/%08x/%08x\n",
+			  s->clocks.active, s->clocks.paused, s->clocks.pauses, s->clocks.restores,
+			  s->clocks.before[0], s->clocks.before[1], s->clocks.before[2],
+			  s->clocks.after[0], s->clocks.after[1], s->clocks.after[2]);
 	n += sysfs_emit_at(buf, n, "cpu retained=%u aborted=%u l2_lost=%u errata=%u "
 			  "boot=%08x/%08x cache=%08x/%08x timer=%x/%x watchdog=%x/%x\n",
 			  s->cpu.retained_resumes, s->cpu.aborts, s->cpu.cold_resumes,
@@ -953,6 +975,8 @@ static int mt6580_pcm_run(struct mt6580_spm *spm, enum mt6580_pcm_profile profil
 	 */
 	if (spm->axi.mainpll_off)
 		panic("MT6580: MAINPLL recovery failed (%d), AXI retained at 26M", ret);
+	if (spm->axi.mcusys_paused)
+		panic("MT6580: MCUSYS DCM recovery failed (%d), AXI retained at 26M", ret);
 	if (spm->axi.emi_paused)
 		panic("MT6580: EMI DCM recovery failed (%d), AXI retained at 26M", ret);
 	mt6580_pcm_account_time(spm);
@@ -1255,6 +1279,13 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr, cha
 			 spm->axi.dcm_after[0], spm->axi.dcm_after[1],
 			 spm->axi.dcm_after[2], spm->axi.dcm_after[3],
 			 spm->axi.dcm_after[4], spm->axi.dcm_after[5]);
+	len += sysfs_emit_at(buf, len,
+			 "mcusys active=%u paused=%u pauses=%u restores=%u\n"
+			 "mcusys_before=%08x/%08x/%08x after=%08x/%08x/%08x\n",
+			 spm->axi.mcusys_active, spm->axi.mcusys_paused,
+			 spm->axi.mcusys_pauses, spm->axi.mcusys_restores,
+			 spm->axi.mcusys_before[0], spm->axi.mcusys_before[1], spm->axi.mcusys_before[2],
+			 spm->axi.mcusys_after[0], spm->axi.mcusys_after[1], spm->axi.mcusys_after[2]);
 	return len + sysfs_emit_at(buf, len,
 			 "emi active=%u paused=%u pauses=%u restores=%u\n"
 			 "emi_before=%08x/%08x after=%08x/%08x\n",

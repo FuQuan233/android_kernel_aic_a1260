@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/clock/mediatek,mt6580-apmixedsys.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: MediaTek MT6580 analog PLL and CPU clock controller
+
+maintainers:
+  - FuQuan <i@fuquan.moe>
+
+description: |
+  Provides firmware-configured MAINPLL/UNIVPLL, ARMPLL CPU frequency changes
+  and USB/MIPI reference gates. INFRACFG contains the CPU mux/divider and
+  ARMPLL auto-gating controls. Optional narrow MCUCFG and BIU regions permit
+  ownership of the MT6580 CG1 and CG3 bus DCM bits. The existing L2 /2 divider
+  is checked but never written. The MCUCFG region excludes offset0, whose
+  L2 reset/retention policy is owned by CPU PM. It does not enable SRAM DCM.
+
+properties:
+  compatible:
+    const: mediatek,mt6580-apmixedsys
+  reg:
+    minItems: 2
+    maxItems: 4
+    items:
+      - description: APMIXEDSYS
+      - description: INFRACFG AO
+      - description: MCUCFG MISC_CONFIG and ACLKEN_DIV, offset0x5c, size8
+      - description: BIU CON, offset0, size4
+  reg-names:
+    minItems: 2
+    maxItems: 4
+    items:
+      - const: apmixedsys
+      - const: infracfg
+      - const: mcusys-dcm
+      - const: biu
+  '#clock-cells':
+    const: 1
+
+required:
+  - compatible
+  - reg
+  - '#clock-cells'
+
+allOf:
+  - if:
+      properties:
+        reg:
+          minItems: 3
+    then:
+      properties:
+        reg:
+          minItems: 4
+      required:
+        - reg-names
+
+additionalProperties: false
