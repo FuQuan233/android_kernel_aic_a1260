@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* MT6580 DISP context, from the BSP SMI and M4U save/restore lists.
- * Included after struct mtk_mmsys. Only this physical-address scanout path
- * owns LARB0 here; a future IOMMU/SMI driver must take over that ownership.
+ * Included after struct mtk_mmsys. Separate SMI nodes own LARB/COMMON when the DT supplies them;
+ * legacy three-resource DTs retain the original context path.
  */
 
 static const u16 mt6580_common_offsets[] = {
@@ -58,19 +58,22 @@ static int mt6580_mmsys_runtime_suspend(struct device *dev)
 	if (!pm)
 		return 0;
 	/* Children/clock users have stopped. Do not cut an outstanding DMA. */
-	ret = readl_poll_timeout(pm->larb, status, !status, 10, 10000);
+	ret = pm->larb ? readl_poll_timeout(pm->larb, status, !status, 10, 10000) : 0;
 	if (ret) {
 		pm->busy++;
 		return -EBUSY;
 	}
 	pm->cg0 = readl(mmsys->regs + 0x100);
 	pm->cg1 = readl(mmsys->regs + 0x110);
-	pm->larb_con = readl(pm->larb + 0x10);
+	if (pm->larb)
+		pm->larb_con = readl(pm->larb + 0x10);
 	mt6580_context_save(mmsys->regs, mt6580_mmsys_offsets,
 			    pm->mmsys_save, ARRAY_SIZE(mt6580_mmsys_offsets));
-	mt6580_context_save(pm->common, mt6580_common_offsets,
+	if (pm->common)
+		mt6580_context_save(pm->common, mt6580_common_offsets,
 			    pm->common_save, ARRAY_SIZE(mt6580_common_offsets));
-	mt6580_context_save(pm->larb, mt6580_larb_offsets,
+	if (pm->larb)
+		mt6580_context_save(pm->larb, mt6580_larb_offsets,
 			    pm->larb_save, ARRAY_SIZE(mt6580_larb_offsets));
 	pm->valid = true;
 	pm->saves++;
@@ -89,18 +92,23 @@ static int mt6580_mmsys_runtime_resume(struct device *dev)
 	/* genpd has restored SMI's source and SRAM. Open COMMON/LARB before
 	 * touching their context; do not call CCF from this clock-provider path.
 	 */
-	writel(BIT(0) | BIT(1), mmsys->regs + 0x108);
+	if (pm->larb)
+		writel(BIT(0) | BIT(1), mmsys->regs + 0x108);
 	mt6580_context_restore(mmsys->regs, mt6580_mmsys_offsets,
 			       pm->mmsys_save, ARRAY_SIZE(mt6580_mmsys_offsets));
-	ret = readl_poll_timeout(pm->larb, status, !status, 10, 10000);
+	ret = pm->larb ? readl_poll_timeout(pm->larb, status, !status, 10, 10000) : 0;
 	if (ret)
 		return dev_err_probe(dev, ret, "LARB0 busy after DISP power-on\n");
-	writel(~pm->larb_con, pm->larb + 0x18);
-	writel(pm->larb_con, pm->larb + 0x14);
-	writel(~0U, pm->larb + 0x64); /* BSP OSTD init, only while idle */
-	mt6580_context_restore(pm->common, mt6580_common_offsets,
+	if (pm->larb) {
+		writel(~pm->larb_con, pm->larb + 0x18);
+		writel(pm->larb_con, pm->larb + 0x14);
+		writel(~0U, pm->larb + 0x64); /* BSP OSTD init, only while idle */
+	}
+	if (pm->common)
+		mt6580_context_restore(pm->common, mt6580_common_offsets,
 			       pm->common_save, ARRAY_SIZE(mt6580_common_offsets));
-	mt6580_context_restore(pm->larb, mt6580_larb_offsets,
+	if (pm->larb)
+		mt6580_context_restore(pm->larb, mt6580_larb_offsets,
 			       pm->larb_save, ARRAY_SIZE(mt6580_larb_offsets));
 	/* Restore gates last. RDMA/mutex/routes/DSI are rebuilt by DRM. */
 	writel(~pm->cg0, mmsys->regs + 0x108);
@@ -171,12 +179,14 @@ static int mt6580_mmsys_pm_init(struct platform_device *pdev,
 	pm = devm_kzalloc(dev, sizeof(*pm), GFP_KERNEL);
 	if (!pm)
 		return -ENOMEM;
-	pm->larb = devm_platform_ioremap_resource(pdev, 1);
-	if (IS_ERR(pm->larb))
-		return PTR_ERR(pm->larb);
-	pm->common = devm_platform_ioremap_resource(pdev, 2);
-	if (IS_ERR(pm->common))
-		return PTR_ERR(pm->common);
+	if (platform_get_resource(pdev, IORESOURCE_MEM, 1)) {
+		pm->larb = devm_platform_ioremap_resource(pdev, 1);
+		if (IS_ERR(pm->larb))
+			return PTR_ERR(pm->larb);
+		pm->common = devm_platform_ioremap_resource(pdev, 2);
+		if (IS_ERR(pm->common))
+			return PTR_ERR(pm->common);
+	}
 	mmsys->mt6580_pm = pm;
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)

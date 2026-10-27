@@ -1,0 +1,25 @@
+What:           /sys/devices/platform/10203000.iommu/state
+Date:           October 2026
+Contact:        FuQuan233
+Description:
+                Read-only last domain configuration flag and cached TTBR,
+                cumulative mapped/unmapped bytes, error IRQ count and
+                range TLB invalidation timeouts for MT6580 M4U. Mapping
+                totals include freed and live buffers; they do not measure
+                instantaneous DMA traffic. Counters are individually sampled.
+                Reading does not access powered-off device registers.
+
+What:           /sys/devices/platform/14016000.larb/context
+Date:           October 2026
+Contact:        FuQuan233
+Description:
+                Read-only LARB0 context-valid flag, save/restore and busy
+                counters, last requested MMU bitmap and programmed readback.
+                The latter is a cached value, not a live register access.
+
+What:           /sys/devices/platform/14017000.smi/context
+Date:           October 2026
+Contact:        FuQuan233
+Description:
+                Read-only SMI COMMON context-valid flag and save/restore
+                counters. Reading does not power on the DISP domain.

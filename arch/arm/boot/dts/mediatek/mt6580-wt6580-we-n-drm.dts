@@ -2,6 +2,7 @@
 #include "mt6580-wt6580-we-n.dts"
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/power/mt6580-power.h>
+#include <dt-bindings/memory/mt6580-larb-port.h>
 
 / {
 	/delete-node/ display@14007000;
@@ -119,13 +120,37 @@
 
 	mmsys: syscon@14000000 {
 		compatible = "mediatek,mt6580-mmsys", "syscon";
-		reg = <0 0x14000000 0 0x1000>,
-		      <0 0x14016000 0 0x1000>,
-		      <0 0x14017000 0 0x1000>;
-		reg-names = "mmsys", "larb0", "smi-common";
+		reg = <0 0x14000000 0 0x1000>;
+		reg-names = "mmsys";
 		#clock-cells = <1>;
 		gpio-controller;
 		#gpio-cells = <2>;
+		power-domains = <&scpsys MT6580_POWER_DOMAIN_DISP>;
+	};
+
+	m4u: iommu@10203000 {
+		compatible = "mediatek,mt6580-m4u";
+		reg = <0 0x10203000 0 0x1000>;
+		interrupts = <GIC_SPI 81 IRQ_TYPE_LEVEL_LOW>;
+		#iommu-cells = <1>;
+		mediatek,larbs = <&larb0>;
+	};
+
+	smi_common: smi@14017000 {
+		compatible = "mediatek,mt6580-smi-common";
+		reg = <0 0x14017000 0 0x1000>;
+		clocks = <&mmsys CLK_MT6580_MM_SMI_COMMON>, <&mmsys CLK_MT6580_MM_SMI_COMMON>;
+		clock-names = "apb", "smi";
+		power-domains = <&scpsys MT6580_POWER_DOMAIN_DISP>;
+	};
+
+	larb0: larb@14016000 {
+		compatible = "mediatek,mt6580-smi-larb";
+		reg = <0 0x14016000 0 0x1000>;
+		clocks = <&mmsys CLK_MT6580_MM_SMI_LARB0>, <&mmsys CLK_MT6580_MM_SMI_LARB0>;
+		clock-names = "apb", "smi";
+		mediatek,smi = <&smi_common>;
+		mediatek,larb-id = <0>;
 		power-domains = <&scpsys MT6580_POWER_DOMAIN_DISP>;
 	};
 
@@ -134,6 +159,7 @@
 		reg = <0 0x14009000 0 0x1000>;
 		interrupts = <GIC_SPI 121 IRQ_TYPE_LEVEL_LOW>;
 		clocks = <&mmsys CLK_MT6580_MM_RDMA0>;
+		iommus = <&m4u M4U_PORT_DISP_RDMA0>;
 	};
 
 	dsi0: dsi@14012000 {

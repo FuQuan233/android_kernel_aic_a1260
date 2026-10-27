@@ -522,7 +522,7 @@ static int mtk_mmsys_probe(struct platform_device *pdev)
 	mmsys->drm_pdev = drm;
 
 out_probe_done:
-	if (mmsys->mt6580_pm)
+	if (mmsys->mt6580_pm && mmsys->mt6580_pm->larb)
 		mt6580_mmsys_drop_bootstrap(dev);
 	return 0;
 }
@@ -562,11 +562,21 @@ static const struct of_device_id of_match_mtk_mmsys[] = {
 };
 MODULE_DEVICE_TABLE(of, of_match_mtk_mmsys);
 
+static void mtk_mmsys_sync_state(struct device *dev)
+{
+	struct mtk_mmsys *mmsys = dev_get_drvdata(dev);
+
+	/* Keep LK context until the separate SMI consumers have captured it. */
+	if (mmsys->mt6580_pm)
+		mt6580_mmsys_drop_bootstrap(dev);
+}
+
 static struct platform_driver mtk_mmsys_drv = {
 	.driver = {
 		.name = "mtk-mmsys",
 		.of_match_table = of_match_mtk_mmsys,
 		.pm = &mt6580_mmsys_pm_ops,
+		.sync_state = mtk_mmsys_sync_state,
 	},
 	.probe = mtk_mmsys_probe,
 	.remove = mtk_mmsys_remove,

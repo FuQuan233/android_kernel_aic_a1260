@@ -164,6 +164,7 @@
 #define MTK_IOMMU_BANK_MAX	5
 
 enum mtk_iommu_plat {
+	M4U_MT6580,
 	M4U_MT2712,
 	M4U_MT6779,
 	M4U_MT6795,
@@ -183,6 +184,8 @@ struct mtk_iommu_iova_region {
 };
 
 struct mtk_iommu_suspend_reg {
+	bool valid;
+	u32 in_order_wr;
 	u32			misc_ctrl;
 	u32			dcm_dis;
 	u32			ctrl_reg;
@@ -251,6 +254,9 @@ struct mtk_iommu_bank_data {
 };
 
 struct mtk_iommu_data {
+	atomic64_t map_bytes, unmap_bytes;
+	atomic_t faults, tlb_timeouts;
+	u32 diagnostic_ttbr;
 	struct device			*dev;
 	struct clk			*bclk;
 	phys_addr_t			protect_base; /* protect memory base */
@@ -443,6 +449,7 @@ static void mtk_iommu_tlb_flush_range_sync(unsigned long iova, size_t size,
 		spin_unlock_irqrestore(&curbank->tlb_lock, flags);
 
 		if (ret) {
+			atomic_inc(&data->tlb_timeouts);
 			dev_warn(data->dev,
 				 "Partial TLB flush timed out, falling back to full flush\n");
 			mtk_iommu_tlb_flush_all(data);
@@ -465,6 +472,7 @@ static irqreturn_t mtk_iommu_isr(int irq, void *dev_id)
 	u64 fault_iova, fault_pa;
 	bool layer, write;
 
+	atomic_inc(&data->faults);
 	/* Read error info from registers */
 	int_state = readl_relaxed(base + REG_MMU_FAULT_ST1);
 	if (int_state & F_REG_MMU0_FAULT_MASK) {
@@ -667,7 +675,7 @@ static int mtk_iommu_domain_finalise(struct mtk_iommu_domain *dom,
 	if (MTK_IOMMU_HAS_FLAG(data->plat_data, HAS_4GB_MODE))
 		dom->cfg.oas = data->enable_4GB ? 33 : 32;
 	else
-		dom->cfg.oas = 35;
+		dom->cfg.oas = data->plat_data->m4u_plat == M4U_MT6580 ? 32 : 35;
 
 	dom->iop = alloc_io_pgtable_ops(ARM_V7S, &dom->cfg, data);
 	if (!dom->iop) {
@@ -751,6 +759,7 @@ static int mtk_iommu_attach_device(struct iommu_domain *domain,
 			goto err_unlock;
 		}
 		bank->m4u_dom = dom;
+		WRITE_ONCE(data->diagnostic_ttbr, dom->cfg.arm_v7s_cfg.ttbr);
 		writel(dom->cfg.arm_v7s_cfg.ttbr, bank->base + REG_MMU_PT_BASE_ADDR);
 
 		pm_runtime_put(m4udev);
@@ -805,7 +814,14 @@ static int mtk_iommu_map(struct iommu_domain *domain, unsigned long iova,
 		paddr |= BIT_ULL(32);
 
 	/* Synchronize with the tlb_lock */
-	return dom->iop->map_pages(dom->iop, iova, paddr, pgsize, pgcount, prot, gfp, mapped);
+	{
+		size_t before = *mapped;
+		int ret = dom->iop->map_pages(dom->iop, iova, paddr, pgsize, pgcount,
+					   prot, gfp, mapped);
+
+		atomic64_add(*mapped - before, &dom->bank->parent_data->map_bytes);
+		return ret;
+	}
 }
 
 static size_t mtk_iommu_unmap(struct iommu_domain *domain,
@@ -813,9 +829,13 @@ static size_t mtk_iommu_unmap(struct iommu_domain *domain,
 			      struct iommu_iotlb_gather *gather)
 {
 	struct mtk_iommu_domain *dom = to_mtk_domain(domain);
+	size_t unmapped;
 
 	iommu_iotlb_gather_add_range(gather, iova, pgsize * pgcount);
-	return dom->iop->unmap_pages(dom->iop, iova, pgsize, pgcount, gather);
+	unmapped = dom->iop->unmap_pages(dom->iop, iova, pgsize, pgcount, gather);
+
+	atomic64_add(unmapped, &dom->bank->parent_data->unmap_bytes);
+	return unmapped;
 }
 
 static void mtk_iommu_flush_iotlb_all(struct iommu_domain *domain)
@@ -967,6 +987,16 @@ static int mtk_iommu_of_xlate(struct device *dev,
 		return -EINVAL;
 	}
 
+	if (of_device_is_compatible(args->np, "mediatek,mt6580-m4u")) {
+		unsigned int id = args->args[0];
+		unsigned int larb = MTK_M4U_TO_LARB(id);
+		unsigned int port = MTK_M4U_TO_PORT(id);
+
+		if (larb > 1 || port >= (larb ? 11 : 6) ||
+		    id != MTK_M4U_ID(larb, port))
+			return -EINVAL;
+	}
+
 	if (!dev_iommu_priv_get(dev)) {
 		/* Get the m4u device */
 		m4updev = of_find_device_by_node(args->np);
@@ -1084,6 +1114,13 @@ static int mtk_iommu_hw_init(const struct mtk_iommu_data *data, unsigned int ban
 	}
 	writel_relaxed(regval, bank0->base + REG_MMU_MISC_CTRL);
 
+	/* MT6580 has a separate in-order register and only MMU0. */
+	if (data->plat_data->m4u_plat == M4U_MT6580) {
+		writel_relaxed(0, bank0->base + 0x84);
+		regval = readl_relaxed(bank0->base + REG_MMU_WR_LEN_CTRL);
+		writel_relaxed(regval & ~BIT(5), bank0->base + REG_MMU_WR_LEN_CTRL);
+	}
+
 	/* Independent settings for each bank */
 	regval = F_L2_MULIT_HIT_EN |
 		F_TABLE_WALK_FAULT_INT_EN |
@@ -1100,6 +1137,8 @@ static int mtk_iommu_hw_init(const struct mtk_iommu_data *data, unsigned int ban
 		F_INT_TLB_MISS_FAULT |
 		F_INT_MISS_TRANSACTION_FIFO_FAULT |
 		F_INT_PRETETCH_TRANSATION_FIFO_FAULT;
+	if (data->plat_data->m4u_plat == M4U_MT6580)
+		regval &= GENMASK(6, 0);
 	writel_relaxed(regval, bankx->base + REG_MMU_INT_MAIN_CONTROL);
 
 	if (MTK_IOMMU_HAS_FLAG(data->plat_data, HAS_LEGACY_IVRP_PADDR))
@@ -1247,6 +1286,20 @@ err_larbdev_put:
 	return ret;
 }
 
+static ssize_t state_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct mtk_iommu_data *data = dev_get_drvdata(dev);
+	u32 ttbr = READ_ONCE(data->diagnostic_ttbr);
+
+	return sysfs_emit(buf, "configured=%u ttbr=%08x mapped_bytes=%lld unmapped_bytes=%lld faults=%d tlb_timeouts=%d\n",
+		!!ttbr, ttbr,
+		atomic64_read(&data->map_bytes), atomic64_read(&data->unmap_bytes),
+		atomic_read(&data->faults), atomic_read(&data->tlb_timeouts));
+}
+static DEVICE_ATTR_RO(state);
+static struct attribute *mt6580_iommu_attrs[] = { &dev_attr_state.attr, NULL };
+ATTRIBUTE_GROUPS(mt6580_iommu);
+
 static int mtk_iommu_probe(struct platform_device *pdev)
 {
 	struct mtk_iommu_data   *data;
@@ -1384,6 +1437,11 @@ static int mtk_iommu_probe(struct platform_device *pdev)
 		data->hw_list = &data->hw_list_head;
 	}
 
+	if (data->plat_data->m4u_plat == M4U_MT6580) {
+		ret = devm_device_add_group(dev, mt6580_iommu_groups[0]);
+		if (ret)
+			goto out_list_del;
+	}
 	ret = iommu_device_sysfs_add(&data->iommu, dev, NULL,
 				     "mtk-iommu.%pa", &ioaddr);
 	if (ret)
@@ -1452,6 +1510,9 @@ static int __maybe_unused mtk_iommu_runtime_suspend(struct device *dev)
 	int i = 0;
 
 	base = data->bank[i].base;
+	reg->valid = true;
+	if (data->plat_data->m4u_plat == M4U_MT6580)
+		reg->in_order_wr = readl_relaxed(base + 0x84);
 	reg->wr_len_ctrl = readl_relaxed(base + REG_MMU_WR_LEN_CTRL);
 	reg->misc_ctrl = readl_relaxed(base + REG_MMU_MISC_CTRL);
 	reg->dcm_dis = readl_relaxed(base + REG_MMU_DCM_DIS);
@@ -1487,7 +1548,7 @@ static int __maybe_unused mtk_iommu_runtime_resume(struct device *dev)
 	 * Uppon first resume, only enable the clk and return, since the values of the
 	 * registers are not yet set.
 	 */
-	if (!reg->wr_len_ctrl)
+	if (!reg->valid)
 		return 0;
 
 	base = data->bank[i].base;
@@ -1495,7 +1556,10 @@ static int __maybe_unused mtk_iommu_runtime_resume(struct device *dev)
 	writel_relaxed(reg->misc_ctrl, base + REG_MMU_MISC_CTRL);
 	writel_relaxed(reg->dcm_dis, base + REG_MMU_DCM_DIS);
 	writel_relaxed(reg->ctrl_reg, base + REG_MMU_CTRL_REG);
-	writel_relaxed(reg->vld_pa_rng, base + REG_MMU_VLD_PA_RNG);
+	if (data->plat_data->m4u_plat == M4U_MT6580)
+		writel_relaxed(reg->in_order_wr, base + 0x84);
+	else
+		writel_relaxed(reg->vld_pa_rng, base + REG_MMU_VLD_PA_RNG);
 	do {
 		m4u_dom = data->bank[i].m4u_dom;
 		if (!data->plat_data->banks_enable[i] || !m4u_dom)
@@ -1520,6 +1584,17 @@ static const struct dev_pm_ops mtk_iommu_pm_ops = {
 	SET_RUNTIME_PM_OPS(mtk_iommu_runtime_suspend, mtk_iommu_runtime_resume, NULL)
 	SET_LATE_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
 				     pm_runtime_force_resume)
+};
+
+static const struct mtk_iommu_plat_data mt6580_data = {
+	.m4u_plat = M4U_MT6580,
+	.flags = RESET_AXI | HAS_LEGACY_IVRP_PADDR | PM_CLK_AO | MTK_IOMMU_TYPE_MM,
+	.inv_sel_reg = REG_MMU_INV_SEL_GEN1,
+	.banks_num = 1,
+	.banks_enable = {true},
+	.iova_region = single_domain,
+	.iova_region_nr = ARRAY_SIZE(single_domain),
+	.larbid_remap = {{0}, {1}},
 };
 
 static const struct mtk_iommu_plat_data mt2712_data = {
@@ -1798,6 +1873,7 @@ static const struct mtk_iommu_plat_data mt8365_data = {
 };
 
 static const struct of_device_id mtk_iommu_of_ids[] = {
+	{ .compatible = "mediatek,mt6580-m4u", .data = &mt6580_data },
 	{ .compatible = "mediatek,mt2712-m4u", .data = &mt2712_data},
 	{ .compatible = "mediatek,mt6779-m4u", .data = &mt6779_data},
 	{ .compatible = "mediatek,mt6795-m4u", .data = &mt6795_data},

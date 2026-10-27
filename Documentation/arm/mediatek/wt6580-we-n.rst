@@ -3022,7 +3022,8 @@ This audit does not establish complete SoC support. Remaining areas are:
 * Runtime coordinated CPU deep idle and a complete CPU/interconnect/memory
   DCM policy. cpuidle currently exposes hardware WFI only; the separately
   validated system deep-suspend path must not be confused with runtime idle.
-* M4U/IOMMU and video codecs remain unimplemented. HACC software-key AES
+* Display M4U/SMI is connected and qualified; see mt6580-m4u.rst. LARB1
+  and video codecs remain unimplemented. HACC software-key AES
   is described in mt6580-hacc.rst; its PIO path retains lower priority than
   software AES. hw_random still has no provider: the TRNG register protocol
   and entropy quality are unresolved. eMMC stays at qualified 8-bit 52 MHz;
@@ -3366,3 +3367,32 @@ slower than software AES, so software remains preferred (hardware priority50).
 Standard boot/kernel are #165, with ordinary shell and normal CPU/deep policy
 retained. M4U, codecs and hardware RNG remain unresolved. Evidence:
 out/a1260-runtime-pm/hacc/summary.json.
+
+Display M4U/SMI (#166 qualification, #168 final, 2026-10-27)
+----------------------------------------------------------
+
+The existing two-level mtk_iommu/ARM_V7S implementation now supports MT6580's
+32-bit M4U, legacy protect PA, single MMU and separate in-order register.
+SMI COMMON/LARB0 take over their physical resources and BSP QoS/context
+from MMSYS, with real CG0 gates0/1 and ordered PM links. MMSYS bootstrap
+lasts until sync_state to preserve LK context, then releases normally.
+Only display RDMA port1 is attached; LARB1 and codec paths remain pending.
+
+Normal Android scanout now uses a translated IOVA, with actual page walks
+showing3 then9 noncontiguous physical boundaries across400 pages. The user
+confirmed normal picture. DRM allocation/CPU mmap/dma-buf handle checks,
+three display cycles, two actual deep intervals (9.564051273/9.561976155s),
+RAM/held-buffer preservation,1153 CPU0 runtime resets plus one early return,
+Mali before/after and aligned eMMC I/O passed. No M4U fault, TLB timeout,
+SMI busy, RDMA underflow/abnormal or kernel taint. A diagnostic page walk
+first ran after Android had timed out the screen and exited3; the corrected
+follow-up explicitly wakes first and passed the remaining checks.
+
+#167 adds DT port bounds and repeats normal boot, buffers, page walk
+and DISP power-off/on. Final #168 caches numeric diagnostics rather than
+dereferencing page-table objects from sysfs. Standard boot/kernel use #168,
+default shell,
+four cores, schedutil604500..1300000 and automatic deep retained; test locks,
+files, alarms and trace are cleaned. See mt6580-m4u.rst and
+out/a1260-runtime-pm/m4u/summary.json for evidence and limits, including
+NO_PERMS, same-device import scope and unqualified codec/LARB1 paths.

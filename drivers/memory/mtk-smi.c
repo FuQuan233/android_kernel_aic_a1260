@@ -121,6 +121,7 @@ static const char * const mtk_smi_common_clks[] = {"apb", "smi", "gals0", "gals1
 #define MTK_SMI_SUB_COM_GALS_REQ_CLK_NR 3
 
 struct mtk_smi_common_plat {
+	bool mt6580;
 	enum mtk_smi_type	type;
 	bool			has_gals;
 	u32			bus_sel; /* Balance some larbs to enter mmu0 or mmu1 */
@@ -129,6 +130,7 @@ struct mtk_smi_common_plat {
 };
 
 struct mtk_smi_larb_gen {
+	bool mt6580;
 	int port_in_larb[MTK_LARB_NR_MAX + 1];
 	int				(*config_port)(struct device *dev);
 	unsigned int			larb_direct_to_common_mask;
@@ -137,6 +139,8 @@ struct mtk_smi_larb_gen {
 };
 
 struct mtk_smi {
+	bool context_valid;
+	u32 context[8], saves, restores;
 	struct device			*dev;
 	unsigned int			clk_num;
 	struct clk_bulk_data		clks[MTK_SMI_CLK_NR_MAX];
@@ -150,6 +154,8 @@ struct mtk_smi {
 };
 
 struct mtk_smi_larb { /* larb: local arbiter */
+	bool context_valid;
+	u32 context[15], control, saves, restores, busy, requested_mmu, programmed_mmu;
 	struct mtk_smi			smi;
 	void __iomem			*base;
 	struct device			*smi_common_dev; /* common or sub-common dev */
@@ -158,6 +164,8 @@ struct mtk_smi_larb { /* larb: local arbiter */
 	u32				*mmu;
 	unsigned char			*bank;
 };
+
+#include "mt6580-smi-context.h"
 
 static int
 mtk_smi_larb_bind(struct device *dev, struct device *master, void *data)
@@ -504,6 +512,11 @@ static const struct mtk_smi_larb_gen mtk_smi_larb_mt6893 = {
 	.ostd		            = mtk_smi_larb_mt6893_ostd,
 };
 
+static const struct mtk_smi_larb_gen mtk_smi_larb_mt6580 = {
+	.mt6580 = true,
+	.config_port = mt6580_smi_larb_config,
+};
+
 static const struct mtk_smi_larb_gen mtk_smi_larb_mt8167 = {
 	/* mt8167 do not need the port in larb */
 	.config_port = mtk_smi_larb_config_port_mt8167,
@@ -546,6 +559,7 @@ static const struct mtk_smi_larb_gen mtk_smi_larb_mt8195 = {
 };
 
 static const struct of_device_id mtk_smi_larb_of_ids[] = {
+	{.compatible = "mediatek,mt6580-smi-larb", .data = &mtk_smi_larb_mt6580},
 	{.compatible = "mediatek,mt2701-smi-larb", .data = &mtk_smi_larb_mt2701},
 	{.compatible = "mediatek,mt2712-smi-larb", .data = &mtk_smi_larb_mt2712},
 	{.compatible = "mediatek,mt6779-smi-larb", .data = &mtk_smi_larb_mt6779},
@@ -666,6 +680,19 @@ static int mtk_smi_larb_probe(struct platform_device *pdev)
 
 	pm_runtime_enable(dev);
 	platform_set_drvdata(pdev, larb);
+	if (larb->larb_gen->mt6580) {
+		ret = clk_bulk_prepare_enable(larb->smi.clk_num, larb->smi.clks);
+		if (ret)
+			goto err_pm_disable;
+		larb->control = readl(larb->base + 0x10);
+		mt6580_smi_save(larb->base, mt6580_smi_larb_offsets,
+				larb->context, ARRAY_SIZE(mt6580_smi_larb_offsets));
+		larb->context_valid = true;
+		clk_bulk_disable_unprepare(larb->smi.clk_num, larb->smi.clks);
+		ret = devm_device_add_group(dev, mt6580_smi_groups[0]);
+		if (ret)
+			goto err_pm_disable;
+	}
 	ret = component_add(dev, &mtk_smi_larb_component_ops);
 	if (ret)
 		goto err_pm_disable;
@@ -701,14 +728,39 @@ static int __maybe_unused mtk_smi_larb_resume(struct device *dev)
 	if (MTK_SMI_CAPS(larb->larb_gen->flags_general, MTK_SMI_FLAG_SLEEP_CTL))
 		mtk_smi_larb_sleep_ctrl_disable(larb);
 
-	/* Configure the basic setting for this larb */
-	return larb_gen->config_port(dev);
+	if (larb_gen->mt6580 && larb->context_valid) {
+		writel(~larb->control, larb->base + 0x18);
+		writel(larb->control, larb->base + 0x14);
+		writel(~0U, larb->base + 0x64);
+		mt6580_smi_restore(larb->base, mt6580_smi_larb_offsets,
+				   larb->context, ARRAY_SIZE(mt6580_smi_larb_offsets));
+		larb->restores++;
+	}
+	/* Configure ports after context, before any consumer starts DMA. */
+	ret = larb_gen->config_port(dev);
+	if (ret)
+		clk_bulk_disable_unprepare(larb->smi.clk_num, larb->smi.clks);
+	return ret;
 }
 
 static int __maybe_unused mtk_smi_larb_suspend(struct device *dev)
 {
 	struct mtk_smi_larb *larb = dev_get_drvdata(dev);
+	u32 status;
 	int ret;
+
+	if (larb->larb_gen->mt6580) {
+		ret = readl_poll_timeout(larb->base, status, !status, 10, 10000);
+		if (ret) {
+			larb->busy++;
+			return -EBUSY;
+		}
+		larb->control = readl(larb->base + 0x10);
+		mt6580_smi_save(larb->base, mt6580_smi_larb_offsets,
+				larb->context, ARRAY_SIZE(mt6580_smi_larb_offsets));
+		larb->context_valid = true;
+		larb->saves++;
+	}
 
 	if (MTK_SMI_CAPS(larb->larb_gen->flags_general, MTK_SMI_FLAG_SLEEP_CTL)) {
 		ret = mtk_smi_larb_sleep_ctrl_enable(larb);
@@ -837,7 +889,13 @@ static const struct mtk_smi_common_plat mtk_smi_common_mt8365 = {
 	.bus_sel  = F_MMU1_LARB(2) | F_MMU1_LARB(4),
 };
 
+static const struct mtk_smi_common_plat mtk_smi_common_mt6580 = {
+	.type = MTK_SMI_GEN2,
+	.mt6580 = true,
+};
+
 static const struct of_device_id mtk_smi_common_of_ids[] = {
+	{.compatible = "mediatek,mt6580-smi-common", .data = &mtk_smi_common_mt6580},
 	{.compatible = "mediatek,mt2701-smi-common", .data = &mtk_smi_common_gen1},
 	{.compatible = "mediatek,mt2712-smi-common", .data = &mtk_smi_common_gen2},
 	{.compatible = "mediatek,mt6779-smi-common", .data = &mtk_smi_common_mt6779},
@@ -909,6 +967,21 @@ static int mtk_smi_common_probe(struct platform_device *pdev)
 
 	pm_runtime_enable(dev);
 	platform_set_drvdata(pdev, common);
+	if (common->plat->mt6580) {
+		ret = clk_bulk_prepare_enable(common->clk_num, common->clks);
+		if (ret) {
+			pm_runtime_disable(dev);
+			return ret;
+		}
+		mt6580_smi_save(common->base, mt6580_smi_common_offsets,
+				common->context, ARRAY_SIZE(mt6580_smi_common_offsets));
+		common->context_valid = true;
+		clk_bulk_disable_unprepare(common->clk_num, common->clks);
+		ret = devm_device_add_group(dev, mt6580_smi_groups[0]);
+		if (ret)
+			pm_runtime_disable(dev);
+		return ret;
+	}
 	return 0;
 }
 
@@ -933,6 +1006,14 @@ static int __maybe_unused mtk_smi_common_resume(struct device *dev)
 	if (ret)
 		return ret;
 
+	if (common->plat->mt6580) {
+		if (common->context_valid) {
+			mt6580_smi_restore(common->base, mt6580_smi_common_offsets,
+				common->context, ARRAY_SIZE(mt6580_smi_common_offsets));
+			common->restores++;
+		}
+		return 0;
+	}
 	if (common->plat->type != MTK_SMI_GEN2)
 		return 0;
 
@@ -946,6 +1027,13 @@ static int __maybe_unused mtk_smi_common_resume(struct device *dev)
 static int __maybe_unused mtk_smi_common_suspend(struct device *dev)
 {
 	struct mtk_smi *common = dev_get_drvdata(dev);
+
+	if (common->plat->mt6580) {
+		mt6580_smi_save(common->base, mt6580_smi_common_offsets,
+				common->context, ARRAY_SIZE(mt6580_smi_common_offsets));
+		common->context_valid = true;
+		common->saves++;
+	}
 
 	clk_bulk_disable_unprepare(common->clk_num, common->clks);
 	return 0;

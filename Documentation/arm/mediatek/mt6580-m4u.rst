@@ -1,0 +1,113 @@
+MT6580 M4U and display SMI
+=========================
+
+Hardware references and ownership
+---------------------------------
+
+The reference BSP is android_kernel_mediatek_k80: arch/arm/boot/dts/mt6580.dts,
+drivers/misc/mediatek/m4u/mt6580/{m4u_reg.h,m4u_hw.c,m4u_platform.h,m4u_port.h},
+m4u/2.0/{m4u_pgtable.c,m4u_pgtable.h}, and the MT6580 clock manager. Its M4U
+is at 0x10203000, SPI81 level-low, with one MMU and two larbs. LARB0 is
+0x14016000, SMI COMMON 0x14017000; display RDMA is larb0 port1. LARB1 and the
+shared camera/codec ports are described by the port binding, but are not
+instantiated by this display-only change.
+
+This is the two-level short-descriptor M4U, not the flat MT2701 IOMMU v1.
+BSP PGD is 16 KiB; table descriptors point to 1 KiB L2 tables. The reference
+supports 4 KiB/64 KiB/1 MiB/16 MiB mappings. Mainline ARM_V7S and the existing
+mtk_iommu generation-two implementation are reused, with 32-bit IOVA/PA,
+legacy IVRP PA>>1, INV_SEL+0x38, MMU0 IRQ mask only, and the separate
+IN_ORDER_WR_EN+0x84. WR_LEN bit5 is cleared, STANDARD_AXI+0x48 is zero and
+DCM_DIS+0x50 is zero per BSP. No greater-than 4 GiB PA or IOVA is advertised.
+The existing NO_PERMS page-table quirk means this does not promise per-page
+read/write permission enforcement. Port numbers outside the BSP's two
+known larbs (6 and 11 ports) are rejected during DT translation.
+
+The BSP M4U clock callback explicitly does nothing (infra block, no M4U/SMI
+CG). No dummy M4U gate or guessed parent is added. PM_CLK_AO permits TLB
+maintenance even when runtime PM bookkeeping is suspended; system late
+suspend/resume still saves and restores the owned M4U context after infra
+recovery. Resume uses an explicit context-valid bit: WR_LEN can validly be
+zero and must not act as the uninitialized-context sentinel. The new port
+stays disabled until a domain has been set up; DMA uses Linux's ARM IOMMU
+mapping and scatterlist APIs. Strict TLB invalidation remains selected.
+
+SMI COMMON and LARB0 are separate devices on the DISP domain. The clock
+manager identifies real MMSYS CG0 gates bits0/1; unlike RDMA's AO operations,
+these two are gated. Each bus uses one combined hardware gate for its apb
+and smi consumers, with the verified SMI source as parent. Consumer links
+order RDMA -> LARB -> COMMON -> M4U; the CCF provider orders MMSYS context
+before these gates open. The original standalone MMSYS save/restore path
+no longer maps or writes these two physical blocks in the new DT. Legacy
+three-resource DTs retain their original behavior.
+
+COMMON preserves its BSP QoS/DCM offsets. LARB preserves control, QoS/OSTD
+and security/domain context, checks outstanding transactions before suspend,
+restores OSTD only before the consumer starts DMA, then programs the active
+Linux MMU mask. Nonsecure/domain3 are applied only to the declared translated
+ports. Unknown upper MMU bits are retained: the #165 baseline was 0x78;
+with RDMA port1 owned the actual value is 0x42 (bit6 retained). MMSYS keeps
+LK powered through sync_state so both separate SMI probes can capture the
+initial context. This bootstrap reference is subsequently released; it is
+not a permanent DISP power hold. State attributes report saved software
+counters without waking/accessing an off SMI block.
+
+Qualification
+-------------
+
+Build #166 booted full Android; the user confirmed the screen is normal.
+TTBR readback was 0x8248c000 (software config also carries low cache bits).
+A read-only walk of the actual RDMA frame mapped IOVA 0x00200000 to
+PA 0x8e600000 and followed all 400 pages (2048-byte pitch, 800 lines), including
+three noncontiguous physical boundaries. Both section and second-level
+large-page entries were observed. This proves actual nonidentity scanout,
+not just a registered IOMMU device. MMU_EN=0x42, SEC_EN=0, domain0=0x30.
+
+An eight-buffer concurrent allocation fixture completed 32 buffers per run,
+52,352,960 bytes written/read through CPU mmap, exported dma-bufs and
+re-imported them into the same DRM device, then released them. That import
+checks handle identity, not a separate-device DMA path; real Android/Mali
+composition exercises shared graphics buffers. Three display off/on rounds
+passed with COMMON/LARB runtime suspended and clock references 0 while off,
+correct scanout after resume, buffer checks after each round and zero RDMA
+underflow/abnormal or M4U faults/TLB timeouts. Mali pbuffer rendering gave
+1788 frames and green readback/GL error 0 before deep.
+
+Two explicit full deep cycles stopped the counter 9.564051273/9.561976155
+seconds, CPU0/L2 cold 2, matching early MCUSYS/DCM/EMI and PMIC restoration,
+with an 8 MiB RAM hash unchanged. Eight mapped graphic buffers were retained
+by a separate process across these sleeps and verified afterward; all 32
+allocations in that run completed. The first combined script then stopped
+at its page walk because the 35-second buffer hold had allowed Android's
+screen timeout to stop RDMA. No failed deep or mapping error was observed;
+the original EXIT_STATUS=3 log is retained. A follow-up wakes the screen
+before the page walk and runs the remaining checks, not another deep pass.
+
+Runtime menu completed 1153 CPU0 reset/restores plus one early WFI return,
+with 1154 matched clock phases, zero failures, matching separate RAM hash,
+four CPUs restored and the SMP check passing. Post-resume buffer checks,
+Mali 1724 frames/green readback/GL error 0, and aligned 4 MiB direct eMMC write
+with two matching reads passed. Final #166 M4U counters were 484216832 mapped
+bytes/448974848 unmapped (live Android buffers remain), faults0/timeouts0;
+SMI saves/restores 11/11, busy0. System suspend success/fail 2/0, taint0, no
+kernel WARNING/Oops and no display underflow. A later off-screen snapshot
+confirmed DISP, MFG, ISP and MD1 genpd off, including MMSYS/COMMON/LARB all
+runtime suspended. No physical current or fault injection is claimed.
+
+#167 adds only port-range validation over the same data path. Evidence
+and hardware fixtures are in out/a1260-runtime-pm/m4u. LARB1, codec devices,
+Android hardware decoder integration and their power/clock paths remain
+separate work; this change does not enable video decoding or remap Mali's
+own MMU through M4U.
+
+The #167 normal boot repeated 32 DRM buffer allocations/CPU mmap,
+dma-buf export/same-device import and a complete 400-page scanout walk:
+IOVA 0x00400000 -> PA 0x8b000000, with nine physical discontinuities. One more
+display off/on confirmed DISP genpd off and subsequent scanout recovery;
+M4U faults/timeouts0, SMI busy0, RDMA underflow/abnormal0 and taint0. HACC
+ordinary boot selftests also passed. Final #168 changes diagnostics to cached numeric snapshots, avoiding any
+page-table object dereference from sysfs during teardown. It repeats normal
+boot and hardware state checks. Standard boot/kernel were updated to
+#168; ordinary ADB shell, four CPUs, schedutil 604500..1300000, default
+deep and stay-on0 retained. Temporary files, wake locks, alarm and trace
+were removed. Default Windows ADB recovered without physical intervention.

@@ -7,6 +7,10 @@
 #include "clk-gate.h"
 #include "clk-mtk.h"
 
+static const struct mtk_gate_regs mm0_regs = {
+	.sta_ofs = 0x100, .set_ofs = 0x104, .clr_ofs = 0x108,
+};
+
 static const struct mtk_gate_regs mm1_regs = {
 	.sta_ofs = 0x110,
 	.set_ofs = 0x114,
@@ -14,7 +18,11 @@ static const struct mtk_gate_regs mm1_regs = {
 };
 
 static const struct mtk_gate mm_clks[] = {
-	/* MT6580's BSP treats MMSYS0 clocks as always on. */
+	/* BSP gates COMMON/LARB0; RDMA itself has AO clock operations. */
+	GATE_MTK(CLK_MT6580_MM_SMI_COMMON, "mt6580_smi_common", "mt6580_smi",
+		 &mm0_regs, 0, &mtk_clk_gate_ops_setclr),
+	GATE_MTK(CLK_MT6580_MM_SMI_LARB0, "mt6580_smi_larb0", "mt6580_smi",
+		 &mm0_regs, 1, &mtk_clk_gate_ops_setclr),
 	GATE_DUMMY(CLK_MT6580_MM_RDMA0, "mt6580_mm_rdma0"),
 	GATE_MTK(CLK_MT6580_MM_DSI_ENGINE, "mt6580_dsi_engine", NULL,
 		 &mm1_regs, 2, &mtk_clk_gate_ops_setclr),
