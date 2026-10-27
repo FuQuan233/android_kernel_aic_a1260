@@ -30,6 +30,9 @@ struct mt6580_clk_provider {
 	bool dcm_owned;
 	u32 dcm_before[6];
 	u32 dcm_applies, dcm_resume_fixes;
+	void __iomem *emi;
+	bool emi_owned;
+	u32 emi_before[2], emi_applies, emi_resume_fixes;
 };
 
 static struct platform_driver mt6580_usb_clk_driver;
@@ -41,7 +44,8 @@ static struct device *mt6580_pll_device;
 
 /* CPU Mode 1 and infra/peri policy from MT6580 mt_dcm.c and the normal
  * kernel backup. The six fields span existing TOPCKGEN/INFRACFG owners.
- * Do not own CPU/L2 mux/dividers, MCUSYS, EMI/DRAMC, PMIC or USB DCM.
+ * These six fields do not own CPU/L2 dividers, MCUSYS, DRAMC or PMIC/USB
+ * DCM. EMI has its own policy and command-latch helper below.
  */
 static const u16 mt6580_dcm_offsets[] = { 0x14, 0x10, 0xa00, 0x20, 0x28, 0x2c };
 static const u32 mt6580_dcm_masks[] = {
@@ -181,6 +185,129 @@ static ssize_t dcm_state_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(dcm_state);
 
+/* MT6580 dcm_emi(): DBC latch, EMI_CONH ratio, then DCM enable latch.
+ * Bits 0/2/3 are the command interface, not persistent policy fields.
+ * Never replay force-on/full/idle-frequency commands from another owner.
+ */
+#define MT6580_EMI_CTL		0x00c
+#define MT6580_EMI_CONH		0x038
+#define MT6580_EMI_ENABLE		(BIT(27) | BIT(7))
+#define MT6580_EMI_DBC		GENMASK(15, 8)
+#define MT6580_EMI_POLICY		(MT6580_EMI_ENABLE | MT6580_EMI_DBC)
+#define MT6580_EMI_OTHER_CMD	(BIT(1) | BIT(4) | BIT(5))
+
+static const u32 mt6580_emi_on[2] = {
+	MT6580_EMI_ENABLE | (15 << 9) | BIT(8), 3,
+};
+
+static void mt6580_emi_snapshot(struct mt6580_clk_provider *top, u32 values[2])
+{
+	values[0] = readl(top->base + MT6580_EMI_CTL);
+	values[1] = readl(top->emi + MT6580_EMI_CONH);
+}
+
+static bool mt6580_emi_matches(const u32 a[2], const u32 b[2])
+{
+	return !(a[0] & (BIT(26) | MT6580_EMI_OTHER_CMD)) &&
+	       !((a[0] ^ b[0]) & MT6580_EMI_POLICY) && !((a[1] ^ b[1]) & 3);
+}
+
+static void mt6580_emi_latch(struct mt6580_clk_provider *top)
+{
+	u32 value = readl(top->base + MT6580_EMI_CTL);
+
+	writel(value & ~BIT(0), top->base + MT6580_EMI_CTL);
+	writel(value | BIT(0), top->base + MT6580_EMI_CTL);
+}
+
+/* Shared clock lock, or single-CPU coherency-off finisher ownership. */
+static int mt6580_emi_write(struct mt6580_clk_provider *top, const u32 values[2])
+{
+	u32 value, after[2];
+
+	value = readl(top->base + MT6580_EMI_CTL);
+	if (value & (BIT(26) | MT6580_EMI_OTHER_CMD))
+		return -EBUSY;
+	value = (value & ~MT6580_EMI_DBC) | (values[0] & MT6580_EMI_DBC) | BIT(3);
+	writel(value, top->base + MT6580_EMI_CTL);
+	mt6580_emi_latch(top);
+	if ((readl(top->base + MT6580_EMI_CTL) ^ value) & MT6580_EMI_DBC)
+		return -EIO;
+	value = readl(top->emi + MT6580_EMI_CONH);
+	writel((value & ~3U) | (values[1] & 3), top->emi + MT6580_EMI_CONH);
+	if ((readl(top->emi + MT6580_EMI_CONH) ^ values[1]) & 3)
+		return -EIO;
+	value = readl(top->base + MT6580_EMI_CTL);
+	value = (value & ~MT6580_EMI_ENABLE) | (values[0] & MT6580_EMI_ENABLE) | BIT(2);
+	writel(value, top->base + MT6580_EMI_CTL);
+	mt6580_emi_latch(top);
+	mt6580_emi_snapshot(top, after);
+	return mt6580_emi_matches(after, values) ? 0 : -EIO;
+}
+
+static void mt6580_emi_release(void *data)
+{
+	struct device *dev = data;
+	struct mt6580_clk_provider *top = dev_get_drvdata(dev);
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&mt6580_usb_clk_lock, flags);
+	ret = mt6580_emi_write(top, top->emi_before);
+	top->emi_owned = false;
+	spin_unlock_irqrestore(&mt6580_usb_clk_lock, flags);
+	if (ret)
+		dev_err(dev, "EMI DCM release failed: %d\n", ret);
+}
+
+static int mt6580_emi_init(struct device *dev, struct mt6580_clk_provider *top)
+{
+	unsigned long flags;
+	int ret, restore;
+
+	if (!IS_ENABLED(CONFIG_COMMON_CLK_MT6580_EMI_DCM))
+		return 0;
+	spin_lock_irqsave(&mt6580_usb_clk_lock, flags);
+	mt6580_emi_snapshot(top, top->emi_before);
+	/* Forced-off and foreign latch selectors are not safe initial states. */
+	if (top->emi_before[0] & (BIT(26) | MT6580_EMI_OTHER_CMD)) {
+		ret = -EBUSY;
+		goto out;
+	}
+	ret = mt6580_emi_write(top, mt6580_emi_on);
+	if (ret) {
+		restore = mt6580_emi_write(top, top->emi_before);
+		if (restore)
+			dev_err(dev, "EMI DCM rollback failed: %d\n", restore);
+		goto out;
+	}
+	top->emi_owned = true;
+	top->emi_applies++;
+out:
+	spin_unlock_irqrestore(&mt6580_usb_clk_lock, flags);
+	return ret ? ret : devm_add_action_or_reset(dev, mt6580_emi_release, dev);
+}
+
+static ssize_t emi_state_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct mt6580_clk_provider *top = dev_get_drvdata(dev);
+	unsigned long flags;
+	u32 values[2] = { 0 };
+	ssize_t len;
+
+	spin_lock_irqsave(&mt6580_usb_clk_lock, flags);
+	if (top->emi)
+		mt6580_emi_snapshot(top, values);
+	len = sysfs_emit(buf, "owned=%u valid=%u applies=%u resume_fixes=%u\n"
+			 "regs=top:000c emi:0038 before=%08x/%08x current=%08x/%08x\n",
+			 top->emi_owned, top->emi_owned && mt6580_emi_matches(values, mt6580_emi_on),
+			 top->emi_applies, top->emi_resume_fixes, top->emi_before[0],
+			 top->emi_before[1], values[0], values[1]);
+	spin_unlock_irqrestore(&mt6580_usb_clk_lock, flags);
+	return len;
+}
+static DEVICE_ATTR_RO(emi_state);
+
 static umode_t mt6580_clk_attr_visible(struct kobject *kobj, struct attribute *attr, int n)
 {
 	/* MFGCFG uses a different private struct despite sharing this driver. */
@@ -188,7 +315,9 @@ static umode_t mt6580_clk_attr_visible(struct kobject *kobj, struct attribute *a
 				      "mediatek,mt6580-topckgen") ? attr->mode : 0;
 }
 
-static struct attribute *mt6580_clk_attrs[] = { &dev_attr_dcm_state.attr, NULL };
+static struct attribute *mt6580_clk_attrs[] = {
+	&dev_attr_dcm_state.attr, &dev_attr_emi_state.attr, NULL,
+};
 static const struct attribute_group mt6580_clk_group = {
 	.attrs = mt6580_clk_attrs,
 	.is_visible = mt6580_clk_attr_visible,
@@ -205,16 +334,25 @@ static int mt6580_clk_resume_noirq(struct device *dev)
 	if (!of_device_is_compatible(dev->of_node, "mediatek,mt6580-topckgen"))
 		return 0;
 	top = dev_get_drvdata(dev);
-	if (!top->dcm_owned)
-		return 0;
 	spin_lock_irqsave(&mt6580_usb_clk_lock, flags);
-	mt6580_dcm_snapshot(top->base, top->infra, values);
-	if (!mt6580_dcm_matches(values, mt6580_dcm_on)) {
+	if (top->dcm_owned)
+		mt6580_dcm_snapshot(top->base, top->infra, values);
+	if (top->dcm_owned && !mt6580_dcm_matches(values, mt6580_dcm_on)) {
 		ret = mt6580_dcm_write(top->base, top->infra, mt6580_dcm_on,
 					mt6580_dcm_enable_order);
 		if (!ret) {
 			top->dcm_applies++;
 			top->dcm_resume_fixes++;
+		}
+	}
+	if (!ret && top->emi_owned) {
+		mt6580_emi_snapshot(top, values);
+		if (!mt6580_emi_matches(values, mt6580_emi_on)) {
+			ret = mt6580_emi_write(top, mt6580_emi_on);
+			if (!ret) {
+				top->emi_applies++;
+				top->emi_resume_fixes++;
+			}
 		}
 	}
 	spin_unlock_irqrestore(&mt6580_usb_clk_lock, flags);
@@ -1065,6 +1203,11 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	provider->base = base;
 	provider->top = top;
+	if (top && IS_ENABLED(CONFIG_COMMON_CLK_MT6580_EMI_DCM)) {
+		provider->emi = devm_platform_ioremap_resource_byname(pdev, "emi");
+		if (IS_ERR(provider->emi))
+			return PTR_ERR(provider->emi);
+	}
 	provider->apmixed = of_device_is_compatible(dev->of_node, "mediatek,mt6580-apmixedsys");
 	if (!top) {
 		provider->infra = devm_platform_ioremap_resource(pdev, 1);
@@ -1187,6 +1330,9 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 		ret = mt6580_dcm_init(dev, provider);
 		if (ret)
 			return dev_err_probe(dev, ret, "DCM configuration failed\n");
+		ret = mt6580_emi_init(dev, provider);
+		if (ret)
+			return dev_err_probe(dev, ret, "EMI DCM configuration failed\n");
 	}
 	ret = devm_of_clk_add_hw_provider(dev, of_clk_hw_onecell_get, data);
 	if (ret)
@@ -1509,6 +1655,13 @@ int mt6580_axi_sleep_prepare(struct device *top, struct device *pll,
 	ctx->mainpll_enable_written = false;
 	ctx->dcm_active = top_data->dcm_owned;
 	ctx->dcm_paused = false;
+	ctx->emi_active = top_data->emi_owned;
+	ctx->emi_paused = false;
+	if (ctx->emi_active) {
+		mt6580_emi_snapshot(top_data, ctx->emi_before);
+		if (!mt6580_emi_matches(ctx->emi_before, mt6580_emi_on))
+			return mt6580_axi_error(ctx, -EBUSY);
+	}
 	if (ctx->dcm_active) {
 		mt6580_dcm_snapshot(top_data->base, pll_data->infra, ctx->dcm_before);
 		if (!mt6580_dcm_matches(ctx->dcm_before, mt6580_dcm_on))
@@ -1533,7 +1686,7 @@ int mt6580_axi_sleep_enter(struct device *top, struct device *pll,
 			   struct mt6580_axi_context *ctx)
 {
 	struct mt6580_clk_provider *top_data, *pll_data;
-	u32 mainpll[5], parked, off[6];
+	u32 mainpll[5], parked, off[6], emi_off[2] = { 0, 0 };
 	int ret;
 
 	if (!ctx)
@@ -1553,6 +1706,16 @@ int mt6580_axi_sleep_enter(struct device *top, struct device *pll,
 	 * Keep divider enables, audio and all unrelated mux bits intact.
 	 * PLL power is touched only by the separately requested sequence below.
 	 */
+	if (ctx->emi_active) {
+		/* Disable automatic EMI division before changing AXI/MAINPLL.
+		 * The DDR PLL and all DRAMC timings remain owned by firmware.
+		 */
+		ctx->emi_paused = true;
+		ctx->emi_pauses++;
+		ret = mt6580_emi_write(top_data, emi_off);
+		if (ret)
+			return mt6580_axi_error(ctx, ret);
+	}
 	if (ctx->dcm_active) {
 		memcpy(off, ctx->dcm_before, sizeof(off));
 		off[0] &= ~BIT(0);
@@ -1598,7 +1761,7 @@ int mt6580_axi_sleep_resume(struct device *top, struct device *pll,
 	if (!ctx)
 		return -EINVAL;
 	/* Also used for aborted preparation and idempotent post-return cleanup. */
-	if (!ctx->parked && !ctx->mainpll_off && !ctx->dcm_paused) {
+	if (!ctx->parked && !ctx->mainpll_off && !ctx->dcm_paused && !ctx->emi_paused) {
 		ctx->prepared = false;
 		return 0;
 	}
@@ -1636,6 +1799,14 @@ int mt6580_axi_sleep_resume(struct device *top, struct device *pll,
 			goto keep_26m;
 		ctx->dcm_paused = false;
 		ctx->dcm_restores++;
+	}
+	if (ctx->emi_paused) {
+		ret = mt6580_emi_write(top_data, ctx->emi_before);
+		mt6580_emi_snapshot(top_data, ctx->emi_after);
+		if (ret || !mt6580_emi_matches(ctx->emi_after, ctx->emi_before))
+			goto keep_26m;
+		ctx->emi_paused = false;
+		ctx->emi_restores++;
 	}
 	if (ctx->parked)
 		ctx->resumes++;

@@ -37,6 +37,14 @@ config COMMON_CLK_MT6580_DCM
 	  controls, with checked masked updates and PLL/suspend handoff.
 	  Does not change CPU/L2 dividers, MCUSYS, EMI/DRAMC or USB/PMIC DCM.
 
+config COMMON_CLK_MT6580_EMI_DCM
+	bool "MT6580 EMI automatic clock gating"
+	depends on COMMON_CLK_MT6580_DCM
+	help
+	  Apply the BSP EMI debounce, /32 idle ratio and automatic gate policy.
+	  Pause and restore it around AXI/MAINPLL system-sleep transitions.
+	  DDR PLL, timings and preloader DRAMC policy remain unchanged.
+
 config COMMON_CLK_MT2701
 	bool "Clock driver for MediaTek MT2701"
 	depends on (ARCH_MEDIATEK && ARM) || COMPILE_TEST

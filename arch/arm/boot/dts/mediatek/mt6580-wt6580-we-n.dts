@@ -477,7 +477,8 @@
 
 	topckgen: clock-controller@10000000 {
 		compatible = "mediatek,mt6580-topckgen";
-		reg = <0 0x10000000 0 0x1000>;
+		reg = <0 0x10000000 0 0x1000>, <0 0x10205000 0 0x1000>;
+		reg-names = "topckgen", "emi";
 		clocks = <&apmixedsys CLK_MT6580_APMIXED_MAINPLL>,
 			 <&apmixedsys CLK_MT6580_APMIXED_UNIVPLL>, <&ddrclk>;
 		clock-names = "mainpll", "univpll", "memory";

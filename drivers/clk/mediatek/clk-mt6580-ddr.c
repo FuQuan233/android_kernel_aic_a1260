@@ -5,11 +5,51 @@
 #include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/soc/mediatek/mt6580-ddr.h>
 
 struct mt6580_ddr_clk {
 	struct clk_hw hw;
 	void __iomem *base[3];
+	u32 dcm_before, dcm_checks, dcm_failures;
+};
+
+#define MT6580_DRAMC_PD_CTRL	0x1dc
+#define MT6580_DRAMC_DCM_MASK	(BIT(31) | BIT(30) | BIT(25))
+
+static ssize_t dcm_state_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct mt6580_ddr_clk *ddr = dev_get_drvdata(dev);
+	u32 value = readl(ddr->base[1] + MT6580_DRAMC_PD_CTRL);
+
+	return sysfs_emit(buf, "source=firmware owned=0 valid=%u checks=%u failures=%u\n"
+			 "pd_ctrl=%08x/%08x non_freerun=%u phy_dynamic=%u comb_dynamic=%u\n",
+			 !((value ^ ddr->dcm_before) & MT6580_DRAMC_DCM_MASK),
+			 ddr->dcm_checks, ddr->dcm_failures, ddr->dcm_before, value,
+			 !!(value & BIT(25)), !!(value & BIT(30)), !!(value & BIT(31)));
+}
+static DEVICE_ATTR_RO(dcm_state);
+
+static struct attribute *mt6580_ddr_attrs[] = { &dev_attr_dcm_state.attr, NULL };
+ATTRIBUTE_GROUPS(mt6580_ddr);
+
+static int mt6580_ddr_resume_noirq(struct device *dev)
+{
+	struct mt6580_ddr_clk *ddr = dev_get_drvdata(dev);
+	u32 value = readl(ddr->base[1] + MT6580_DRAMC_PD_CTRL);
+
+	ddr->dcm_checks++;
+	if ((value ^ ddr->dcm_before) & MT6580_DRAMC_DCM_MASK) {
+		ddr->dcm_failures++;
+		dev_err(dev, "Firmware DRAMC DCM changed: %08x -> %08x\n",
+			ddr->dcm_before, value);
+		return -EIO;
+	}
+	return 0;
+}
+
+static const struct dev_pm_ops mt6580_ddr_pm = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(NULL, mt6580_ddr_resume_noirq)
 };
 
 static struct platform_driver mt6580_ddr_clk_driver;
@@ -95,6 +135,7 @@ static int mt6580_ddr_clk_probe(struct platform_device *pdev)
 		if (IS_ERR(ddr->base[i]))
 			return PTR_ERR(ddr->base[i]);
 	}
+	ddr->dcm_before = readl(ddr->base[1] + MT6580_DRAMC_PD_CTRL);
 	if (!mt6580_ddr_recalc_rate(&ddr->hw, 26000000))
 		return dev_err_probe(dev, -EINVAL, "Invalid firmware memory PLL setup\n");
 	platform_set_drvdata(pdev, ddr);
@@ -116,6 +157,8 @@ static struct platform_driver mt6580_ddr_clk_driver = {
 	.driver = {
 		.name = "mt6580-ddr-clocks",
 		.of_match_table = mt6580_ddr_clk_match,
+		.dev_groups = mt6580_ddr_groups,
+		.pm = pm_sleep_ptr(&mt6580_ddr_pm),
 	},
 };
 module_platform_driver(mt6580_ddr_clk_driver);

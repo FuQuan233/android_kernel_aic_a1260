@@ -1,0 +1,20 @@
+What:           /sys/devices/platform/10000000.clock-controller/emi_state
+Date:           October 2026
+Contact:        FuQuan233
+Description:
+                Read-only owned EMI DCM policy, masked readback validity,
+                probe/application count and late resume-repair count.
+                Reports initial/current TOPCKGEN+0x0c and EMI_CONH+0x38.
+                A valid policy is not an instantaneous output clock or
+                electrical power measurement. Early pause/restore counters
+                are in the existing MT6580 SPM state attribute.
+
+What:           /sys/devices/platform/10208000.clock-controller/dcm_state
+Date:           October 2026
+Contact:        FuQuan233
+Description:
+                Read-only inherited DRAMC AO PD_CTRL policy. owned=0 and
+                source=firmware indicate that this driver does not write it.
+                valid compares bits31/30/25 against the probe snapshot;
+                checks/failures count system resume policy comparisons.
+                Also reports initial/current words and the three enables.

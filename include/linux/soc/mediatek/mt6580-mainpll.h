@@ -19,6 +19,9 @@ struct mt6580_axi_context {
 	u32 dcm_before[6], dcm_after[6];
 	u32 dcm_pauses, dcm_restores;
 	bool dcm_active, dcm_paused;
+	u32 emi_before[2], emi_after[2];
+	u32 emi_pauses, emi_restores;
+	bool emi_active, emi_paused;
 	int error;
 };
 
@@ -37,6 +40,9 @@ struct mt6580_axi_context {
  * Owned CPU/bus DCM is paused before AXI/PLL changes and restored only after
  * verified clocks return. dcm_paused retains partial-write ownership on error;
  * retry cleanup must also handle it when AXI was never parked.
+ * EMI automatic gating/debounce/idle ratio are separately paused before AXI
+ * changes and restored after clock recovery, with emi_paused also retaining
+ * partial ownership on error. DDR PLL/timings and DRAMC policy are preserved.
  */
 int mt6580_axi_sleep_prepare(struct device *top, struct device *pll,
 			     struct mt6580_axi_context *ctx);
