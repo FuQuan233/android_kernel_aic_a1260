@@ -8,6 +8,12 @@ Description:
 		recalibrates timing, or retries a failed PMIC command.
 
 		init_done and wacs2 report a current raw WACS2 status snapshot.
+		source reports kernel if this probe initialized the link, or
+		firmware if the existing setup was retained. firmware_at_probe
+		records the original INIT_DONE flag. scan_mask is the 24-bit
+		successful sampling window and sample its selected center index;
+		both are zero when no scan ran. stage records the initialization
+		stage (firmware for a retained link, complete for kernel init).
 		read_test/error report the last test result; checks/failures
 		count tests since probe. Counters wrap at 32 bits. reads/writes
 		count attempted transactions, including failures and read tests.

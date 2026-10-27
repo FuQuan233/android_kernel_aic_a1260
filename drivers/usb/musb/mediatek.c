@@ -182,13 +182,24 @@ static irqreturn_t generic_interrupt(int irq, void *__hci)
 	if (glue->mt6580 && !is_host_active(musb)) {
 		if (musb->int_usb & MUSB_INTR_RESUME) {
 			pm_stay_awake(musb->controller);
-			__pm_relax(glue->enumeration_ws);
+			__pm_wakeup_event(glue->enumeration_ws, MT6580_GADGET_HANDOFF_MS);
 		}
-		if (musb->int_usb & (MUSB_INTR_SUSPEND | MUSB_INTR_DISCONNECT))
+		if (musb->int_usb & (MUSB_INTR_SUSPEND | MUSB_INTR_DISCONNECT)) {
+			/* RESET only starts enumeration; it does not prove the
+			 * replacement FunctionFS gadget is configured. A host may
+			 * suspend that unconfigured link while handling descriptors.
+			 * Keep a bounded guard across that gap, without extending
+			 * normal configured-link suspend or physical disconnect.
+			 */
+			if ((musb->int_usb & MUSB_INTR_SUSPEND) &&
+			    !(musb->int_usb & MUSB_INTR_DISCONNECT) &&
+			    musb->gadget_driver && musb->g.state != USB_STATE_CONFIGURED)
+				__pm_wakeup_event(glue->enumeration_ws, MT6580_GADGET_HANDOFF_MS);
 			pm_relax(musb->controller);
+		}
 		if (musb->int_usb & MUSB_INTR_RESET) {
 			pm_stay_awake(musb->controller);
-			__pm_relax(glue->enumeration_ws);
+			__pm_wakeup_event(glue->enumeration_ws, MT6580_GADGET_HANDOFF_MS);
 		}
 	}
 
@@ -386,8 +397,9 @@ static void mtk_musb_enable(struct musb *musb)
 		musb_writel(musb->mregs, USB_L1INTM, glue->pm_l1_mask);
 		glue->pm_masked = false;
 	}
-	/* Keep the enumeration window awake until RESET takes the normal
-	 * active-link wake reference. With no host the timeout permits sleep.
+	/* Keep the enumeration window awake through RESET and configuration.
+	 * A RESET alone does not prove a working host link. With no host the
+	 * timeout permits sleep.
 	 */
 	if (glue->enumeration_ws && musb->gadget_driver && !is_host_active(musb))
 		__pm_wakeup_event(glue->enumeration_ws, MT6580_GADGET_HANDOFF_MS);

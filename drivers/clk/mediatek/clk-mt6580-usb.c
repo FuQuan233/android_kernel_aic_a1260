@@ -11,6 +11,7 @@
 #include <linux/platform_device.h>
 #include <linux/smp.h>
 #include <linux/soc/mediatek/mt6580-mainpll.h>
+#include <linux/soc/mediatek/mt6580-pwrap.h>
 
 #include <asm/barrier.h>
 #include "clk-gate.h"
@@ -464,7 +465,8 @@ static const char * const mt6580_msdc_parents[] = {
 	"dummy26m", "mt6580_upll_d6",
 };
 
-/* Snapshot the boot muxes: there is deliberately no set_parent operation.
+/* Retain SMI/USB boot muxes decoded below; these aliases cannot reparent.
+ * PMIC SPI and MFG use separate real muxes for their qualified operations.
  * Keep unknown encodings from silently becoming unrelated fixed-rate roots.
  */
 static const char *mt6580_smi_parent(u32 sel)
@@ -746,10 +748,15 @@ static int mt6580_register_top_sources(struct device *dev, void __iomem *base,
 					  sel0 & BIT(18) ? "mt6580_upll_d12" : "dummy26m", 0);
 	if (ret)
 		return ret;
-	ret = mt6580_register_parent_alias(dev, "mt6580_pmic_spi_src",
-					  mt6580_pmic_spi_parents[(sel0 >> 24) & 3], 0);
-	if (ret)
-		return ret;
+	{
+		struct clk_hw *spi;
+
+		spi = devm_clk_hw_register_mux(dev, "mt6580_pmic_spi_src",
+			mt6580_pmic_spi_parents, ARRAY_SIZE(mt6580_pmic_spi_parents),
+			0, base, 24, 2, 0, &mt6580_usb_clk_lock);
+		if (IS_ERR(spi))
+			return PTR_ERR(spi);
+	}
 	ret = mt6580_register_parent_alias(dev, "mt6580_uart0_src",
 					  sel0 & BIT(0) ? "mt6580_upll_d24" : "dummy26m", 0);
 	if (ret)
@@ -1005,6 +1012,59 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 #define MT6580_MAINPLL_PCW_CHG	BIT(31)
 #define MT6580_PLL_PWR_ON		BIT(0)
 #define MT6580_PLL_ISO_EN		BIT(1)
+
+#define MT6580_PWRAP_CG_MASK	(BIT(20) | BIT(27) | BIT(28) | BIT(29))
+
+static struct mt6580_clk_provider *mt6580_pwrap_top(struct device *top)
+{
+	struct mt6580_clk_provider *provider;
+
+	if (!top || top != READ_ONCE(mt6580_top_device) ||
+	    top->driver != &mt6580_usb_clk_driver.driver)
+		return NULL;
+	provider = dev_get_drvdata(top);
+	return provider && provider->top ? provider : NULL;
+}
+
+int mt6580_pwrap_clocks_gate(struct device *top, u32 *enabled)
+{
+	struct mt6580_clk_provider *provider = mt6580_pwrap_top(top);
+	unsigned long flags;
+	u32 status;
+
+	if (!provider)
+		return -ENODEV;
+	spin_lock_irqsave(&mt6580_usb_clk_lock, flags);
+	*enabled = ~readl(provider->base + 0x24) & MT6580_PWRAP_CG_MASK;
+	writel(MT6580_PWRAP_CG_MASK, provider->base + 0x54);
+	status = readl(provider->base + 0x24);
+	if ((status & MT6580_PWRAP_CG_MASK) != MT6580_PWRAP_CG_MASK)
+		writel(*enabled, provider->base + 0x84);
+	spin_unlock_irqrestore(&mt6580_usb_clk_lock, flags);
+	return (status & MT6580_PWRAP_CG_MASK) == MT6580_PWRAP_CG_MASK ? 0 : -EIO;
+}
+EXPORT_SYMBOL_GPL(mt6580_pwrap_clocks_gate);
+
+int mt6580_pwrap_clocks_restore(struct device *top, u32 enabled)
+{
+	struct mt6580_clk_provider *provider = mt6580_pwrap_top(top);
+	unsigned long flags;
+	u32 status;
+
+	if (!provider)
+		return -ENODEV;
+	enabled = (enabled & MT6580_PWRAP_CG_MASK) | BIT(20);
+	spin_lock_irqsave(&mt6580_usb_clk_lock, flags);
+	writel(enabled, provider->base + 0x84);
+	status = readl(provider->base + 0x24);
+	/* BSP WHQA_00014186: PMIC bclk DCM must stay disabled. SET only
+	 * these two bits; do not replace unrelated global DCM settings.
+	 */
+	writel(BIT(1) | BIT(2), provider->base + 0x5c);
+	spin_unlock_irqrestore(&mt6580_usb_clk_lock, flags);
+	return (~status & MT6580_PWRAP_CG_MASK) == enabled ? 0 : -EIO;
+}
+EXPORT_SYMBOL_GPL(mt6580_pwrap_clocks_restore);
 
 static int mt6580_axi_get_providers(struct device *top, struct device *pll,
 				   struct mt6580_clk_provider **top_data,

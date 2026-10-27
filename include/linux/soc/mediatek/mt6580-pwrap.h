@@ -6,6 +6,12 @@
 
 struct device;
 
+/* Only before PWRAP consumers exist, holding the TOPCKGEN supplier. The
+ * hardware-only gate interval preserves CCF references and other CG bits.
+ */
+int mt6580_pwrap_clocks_gate(struct device *top, u32 *enabled);
+int mt6580_pwrap_clocks_restore(struct device *top, u32 enabled);
+
 enum mt6580_vproc_sleep_mode {
 	MT6580_VPROC_RETAIN,
 	MT6580_VPROC_BANK_MARKER,

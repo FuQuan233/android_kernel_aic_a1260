@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* MT6580 WACS2 access, retaining the bootloader's MT6350 wrapper setup. */
+/* MT6580 WACS2 access and MT6350 serial-link initialization. */
 #include <linux/bitfield.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
@@ -7,10 +7,12 @@
 #include <linux/module.h>
 #include <linux/mfd/mt6350/registers.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/panic.h>
 #include <linux/regmap.h>
+#include <linux/reset.h>
 #include <linux/soc/mediatek/mt6580-pwrap.h>
 #include <linux/spinlock.h>
 
@@ -23,6 +25,57 @@
 #define WACS_INIT_DONE	BIT(21)
 #define MT6350_DEW_READ_TEST	0x18c
 #define MT6350_READ_TEST_VALUE	0x5aa5
+#define WACS_SYNC_IDLE	BIT(20)
+
+/* MT6580 pwrap_hal.h register layout, not the MT2701 wrapper layout. */
+#define PWRAP_MUX_SEL	0x000
+#define PWRAP_WRAP_EN	0x004
+#define PWRAP_DIO_EN	0x008
+#define PWRAP_SIDLY	0x00c
+#define PWRAP_RDDMY	0x018
+#define PWRAP_SI_CK_CON	0x01c
+#define PWRAP_CSHEXT_WRITE 0x020
+#define PWRAP_CSHEXT_READ	0x024
+#define PWRAP_CSLEXT_START 0x028
+#define PWRAP_CSLEXT_END	0x02c
+#define PWRAP_STAUPD_PRD	0x030
+#define PWRAP_STAUPD_GRPEN 0x034
+#define PWRAP_ARB_EN	0x050
+#define PWRAP_MAN_EN	0x05c
+#define PWRAP_MAN_CMD	0x060
+#define PWRAP_WACS0_EN	0x06c
+#define PWRAP_INIT_DONE0	0x070
+#define PWRAP_WACS1_EN	0x080
+#define PWRAP_INIT_DONE1	0x084
+#define PWRAP_WACS2_EN	0x094
+#define PWRAP_INIT_DONE2	0x098
+#define PWRAP_INT_EN	0x0a8
+#define PWRAP_INT_CLR	0x0b4
+#define PWRAP_SIG_ADR	0x0b8
+#define PWRAP_SIG_MODE	0x0bc
+#define PWRAP_CRC_EN	0x0c8
+#define PWRAP_TIMER_EN	0x0cc
+#define PWRAP_WDT_UNIT	0x0d4
+#define PWRAP_WDT_SRC_EN	0x0d8
+#define PWRAP_CIPHER_KEY	0x124
+#define PWRAP_CIPHER_IV	0x128
+#define PWRAP_CIPHER_EN	0x12c
+#define PWRAP_CIPHER_RDY	0x130
+#define PWRAP_CIPHER_MODE	0x134
+#define PWRAP_CIPHER_SWRST 0x138
+#define PWRAP_DCM_EN	0x13c
+#define PWRAP_DCM_DBC	0x140
+#define PWRAP_ADC_CMD_ADR	0x144
+#define PWRAP_ADC_CMD	0x148
+#define PWRAP_ADC_RDY_ADR	0x14c
+#define PWRAP_ADC_DATA1	0x150
+#define PWRAP_ADC_DATA2	0x154
+#define PWRAP_SWRST	0x180
+#define PWRAP_WACS2_ARB	BIT(3)
+
+static bool force_init;
+module_param(force_init, bool, 0400);
+MODULE_PARM_DESC(force_init, "Reinitialize MT6350 serial link once at probe, before consumers");
 
 enum mt6580_pwrap_wait_stage {
 	PWRAP_WAIT_IDLE,
@@ -84,6 +137,9 @@ struct mt6580_pwrap {
 	struct mutex phase_lock;
 	spinlock_t stats_lock;
 	struct mt6580_pwrap_link_stats link;
+	bool initializing, firmware_initialized, cold_initialized;
+	u32 si_pass_mask, si_point;
+	const char *init_stage;
 	u32 saved_slots[ARRAY_SIZE(suspend_slot_regs)];
 	u32 suspend_slots[ARRAY_SIZE(suspend_slot_regs)];
 	unsigned int saved_auxadc, resume_auxadc, restored_auxadc;
@@ -565,10 +621,13 @@ static ssize_t link_state_show(struct device *dev, struct device_attribute *attr
 	status = readl(wrp->base + WACS2_RDATA);
 	return sysfs_emit(buf,
 		"init_done=%u wacs2=%08x\n"
+		"source=%s firmware_at_probe=%u scan_mask=%06x sample=%u stage=%s\n"
 		"read_test=%04x expected=%04x error=%d checks=%u failures=%u\n"
 		"reads=%u writes=%u errors=%u timeouts=%u init_lost=%u stale_valid_clears=%u\n"
 		"last_error=%d reg=%04x write=%u stage=%u status=%08x\n",
 		!!(status & WACS_INIT_DONE), status,
+		wrp->cold_initialized ? "kernel" : "firmware", wrp->firmware_initialized,
+		wrp->si_pass_mask, wrp->si_point, wrp->init_stage,
 		link.test_value, MT6350_READ_TEST_VALUE, link.test_error,
 		link.checks, link.check_errors, link.reads, link.writes,
 		link.errors, link.timeouts, link.init_lost, link.stale_valid_clears,
@@ -594,7 +653,7 @@ static u32 mt6580_pwrap_poll_status(struct mt6580_pwrap *wrp, bool clear_stale,
 	 * Only discard it before issuing the next command, never while waiting
 	 * for the current command's result. Do not touch an uninitialized bus.
 	 */
-	if (clear_stale && (status & WACS_INIT_DONE) &&
+	if (clear_stale && ((status & WACS_INIT_DONE) || wrp->initializing) &&
 	    FIELD_GET(WACS_FSM, status) == WACS_VALID) {
 		writel(1, wrp->base + WACS2_VLDCLR);
 		(*clears)++;
@@ -609,9 +668,10 @@ static int mt6580_pwrap_wait(struct mt6580_pwrap *wrp, unsigned int fsm,
 
 	/* Keep polling atomic: final PMIC power-off has interrupts disabled. */
 	ret = read_poll_timeout_atomic(mt6580_pwrap_poll_status, *status,
-			!(*status & WACS_INIT_DONE) || FIELD_GET(WACS_FSM, *status) == fsm,
+			(!wrp->initializing && !(*status & WACS_INIT_DONE)) ||
+			FIELD_GET(WACS_FSM, *status) == fsm,
 			10, 10000, false, wrp, clear_stale, clears);
-	if (!(*status & WACS_INIT_DONE))
+	if (!wrp->initializing && !(*status & WACS_INIT_DONE))
 		return -ENODEV;
 	return ret;
 }
@@ -689,11 +749,326 @@ static const struct regmap_config mt6580_pwrap_regmap = {
 	.reg_write = mt6580_pwrap_write,
 };
 
+static int mt6580_pwrap_sync_idle(struct mt6580_pwrap *wrp)
+{
+	u32 status;
+
+	return readl_poll_timeout_atomic(wrp->base + WACS2_RDATA, status,
+		FIELD_GET(WACS_FSM, status) == WACS_IDLE && (status & WACS_SYNC_IDLE),
+		10, 10000);
+}
+
+/* A nonempty, single continuous window is required before __ffs/fls or
+ * selecting a center. The BSP's empty-window arithmetic was undefined.
+ */
+static int mt6580_pwrap_select_sample(u32 mask)
+{
+	unsigned int first, last;
+
+	if (!mask || (mask & ~GENMASK(23, 0)))
+		return -EINVAL;
+	first = __ffs(mask);
+	last = fls(mask) - 1;
+	if (mask != GENMASK(last, first))
+		return -EINVAL;
+	return (first + last) / 2;
+}
+
+static int mt6580_pwrap_signature(struct mt6580_pwrap *wrp)
+{
+	unsigned int value;
+	int ret = regmap_read(wrp->regmap, MT6350_DEW_READ_TEST, &value);
+
+	return ret ?: (value == MT6350_READ_TEST_VALUE ? 0 : -EIO);
+}
+
+static int mt6580_pwrap_calibrate(struct mt6580_pwrap *wrp)
+{
+	unsigned int i, value;
+	int ret, point;
+
+	for (i = 0; i < 24; i++) {
+		writel(i >> 2, wrp->base + PWRAP_SI_CK_CON);
+		writel(3 - (i & 3), wrp->base + PWRAP_SIDLY);
+		ret = regmap_read(wrp->regmap, MT6350_DEW_READ_TEST, &value);
+		/* A completed but incorrect read is a rejected sample. A bus
+		 * timeout is different: do not change timing under an in-flight
+		 * transfer or silently count its data as a later sample.
+		 */
+		if (ret)
+			return ret;
+		if (value == MT6350_READ_TEST_VALUE)
+			wrp->si_pass_mask |= BIT(i);
+	}
+	point = mt6580_pwrap_select_sample(wrp->si_pass_mask);
+	if (point < 0)
+		return point;
+	wrp->si_point = point;
+	writel(point >> 2, wrp->base + PWRAP_SI_CK_CON);
+	writel(3 - (point & 3), wrp->base + PWRAP_SIDLY);
+	return mt6580_pwrap_signature(wrp);
+}
+
+static int mt6580_pwrap_reg_clock(struct mt6580_pwrap *wrp)
+{
+	unsigned int value;
+	int ret;
+
+	ret = regmap_write(wrp->regmap, 0x12a, 3); /* TOP_CKCON1_CLR */
+	if (ret)
+		return ret;
+	ret = regmap_read(wrp->regmap, 0x126, &value);
+	if (ret || (value & 3))
+		return ret ?: -EIO;
+	ret = regmap_write(wrp->regmap, 0x1a4, 8); /* DEW_RDDMY_NO */
+	if (ret)
+		return ret;
+	writel(8, wrp->base + PWRAP_RDDMY);
+	writel(0, wrp->base + PWRAP_CSHEXT_READ);
+	writel(7, wrp->base + PWRAP_CSHEXT_WRITE);
+	writel(0, wrp->base + PWRAP_CSLEXT_START);
+	writel(0, wrp->base + PWRAP_CSLEXT_END);
+	return mt6580_pwrap_signature(wrp);
+}
+
+static int mt6580_pwrap_dio(struct mt6580_pwrap *wrp)
+{
+	int ret = regmap_write(wrp->regmap, 0x18a, 1);
+
+	if (!ret)
+		ret = mt6580_pwrap_sync_idle(wrp);
+	if (ret)
+		return ret;
+	writel(1, wrp->base + PWRAP_DIO_EN);
+	return mt6580_pwrap_signature(wrp);
+}
+
+static int mt6580_pwrap_cipher(struct mt6580_pwrap *wrp)
+{
+	static const struct reg_sequence setup[] = {
+		{ 0x1a2, 1 }, { 0x1a2, 0 }, /* SWRST */
+		{ 0x198, 1 }, { 0x19a, 2 }, { 0x19c, 1 }, /* key, IV, EN */
+	};
+	unsigned int value, i;
+	u32 ready;
+	int ret;
+
+	writel(1, wrp->base + PWRAP_CIPHER_SWRST);
+	writel(0, wrp->base + PWRAP_CIPHER_SWRST);
+	writel(1, wrp->base + PWRAP_CIPHER_KEY);
+	writel(2, wrp->base + PWRAP_CIPHER_IV);
+	writel(1, wrp->base + PWRAP_CIPHER_EN);
+	ret = regmap_multi_reg_write(wrp->regmap, setup, ARRAY_SIZE(setup));
+	if (ret)
+		return ret;
+	ret = readl_poll_timeout_atomic(wrp->base + PWRAP_CIPHER_RDY, ready,
+					ready == 1, 10, 10000);
+	if (ret)
+		return ret;
+	/* The BSP logs timeout but loops forever here. Bound both attempts
+	 * and each underlying WACS2 transaction; propagate bus errors.
+	 */
+	for (i = 0; i < 1000; i++) {
+		ret = regmap_read(wrp->regmap, 0x19e, &value);
+		if (ret)
+			return ret;
+		if (value == 1)
+			break;
+		udelay(10);
+	}
+	if (i == 1000)
+		return -ETIMEDOUT;
+	ret = regmap_write(wrp->regmap, 0x1a0, 1);
+	if (!ret)
+		ret = mt6580_pwrap_sync_idle(wrp);
+	if (ret)
+		return ret;
+	writel(1, wrp->base + PWRAP_CIPHER_MODE);
+	return mt6580_pwrap_signature(wrp);
+}
+
+static void mt6580_pwrap_quiesce(struct mt6580_pwrap *wrp)
+{
+	/* A partially changed two-ended protocol cannot be rolled back by
+	 * restoring AP registers. Publish no INIT_DONE or children on failure.
+	 * No blind PMIC writes, command replay or online reset is attempted.
+	 */
+	writel(0, wrp->base + PWRAP_INIT_DONE0);
+	writel(0, wrp->base + PWRAP_INIT_DONE1);
+	writel(0, wrp->base + PWRAP_INIT_DONE2);
+	writel(0, wrp->base + PWRAP_INT_EN);
+	writel(0, wrp->base + PWRAP_STAUPD_GRPEN);
+	writel(0, wrp->base + PWRAP_TIMER_EN);
+	writel(0, wrp->base + PWRAP_WDT_SRC_EN);
+	writel(0, wrp->base + PWRAP_ARB_EN);
+	writel(0, wrp->base + PWRAP_WACS0_EN);
+	writel(0, wrp->base + PWRAP_WACS1_EN);
+	writel(0, wrp->base + PWRAP_WACS2_EN);
+	writel(0, wrp->base + PWRAP_MAN_EN);
+	writel(0, wrp->base + PWRAP_MUX_SEL);
+	writel(0, wrp->base + PWRAP_WRAP_EN);
+	readl(wrp->base + PWRAP_WRAP_EN);
+}
+
+static int mt6580_pwrap_cold_init(struct mt6580_pwrap *wrp, struct device *top,
+				 struct reset_control *reset, struct clk *spi, struct clk *ref)
+{
+	static const u16 manual[] = { 0x2100, 0x2800, 0x2000, 0x2800, 0x2800, 0x2800, 0x2800 };
+	unsigned int value, i;
+	struct clk *source = clk_get_parent(spi), *osc = clk_get_parent(ref);
+	u32 enabled, status;
+	int ret, restore;
+
+	if (!source || !osc)
+		return -ENODEV;
+	wrp->init_stage = "clock-reset";
+	ret = mt6580_pwrap_clocks_gate(top, &enabled);
+	if (ret)
+		return ret;
+	readl(wrp->base + PWRAP_SWRST); /* BSP delay after module clock gating */
+	writel(1, wrp->base + PWRAP_SWRST);
+	ret = reset_control_reset(reset);
+	writel(0, wrp->base + PWRAP_SWRST);
+	restore = mt6580_pwrap_clocks_restore(top, enabled);
+	if (ret || restore) {
+		ret = ret ?: restore;
+		goto fail;
+	}
+	ret = clk_set_parent(source, osc);
+	if (ret || clk_get_rate(spi) != 26000000) {
+		ret = ret ?: -EINVAL;
+		goto fail;
+	}
+
+	wrp->initializing = true;
+	wrp->init_stage = "spi-slave-reset";
+	writel(1, wrp->base + PWRAP_DCM_EN);
+	writel(0, wrp->base + PWRAP_DCM_DBC);
+	writel(0, wrp->base + PWRAP_ARB_EN);
+	writel(0, wrp->base + PWRAP_WRAP_EN);
+	writel(1, wrp->base + PWRAP_MUX_SEL);
+	writel(1, wrp->base + PWRAP_MAN_EN);
+	writel(0, wrp->base + PWRAP_DIO_EN);
+	for (i = 0; i < ARRAY_SIZE(manual); i++)
+		writel(manual[i], wrp->base + PWRAP_MAN_CMD);
+	ret = readl_poll_timeout_atomic(wrp->base + WACS2_RDATA, status,
+					status & WACS_SYNC_IDLE, 10, 10000);
+	writel(0, wrp->base + PWRAP_MAN_EN);
+	writel(0, wrp->base + PWRAP_MUX_SEL);
+	if (ret)
+		goto fail;
+	writel(1, wrp->base + PWRAP_WRAP_EN);
+	writel(PWRAP_WACS2_ARB, wrp->base + PWRAP_ARB_EN);
+	writel(1, wrp->base + PWRAP_WACS2_EN);
+	writel(15, wrp->base + PWRAP_RDDMY);
+	wrp->init_stage = "sampling";
+	ret = mt6580_pwrap_calibrate(wrp);
+	if (ret)
+		goto fail;
+	wrp->init_stage = "register-clock";
+	ret = mt6580_pwrap_reg_clock(wrp);
+	if (ret)
+		goto fail;
+	wrp->init_stage = "dio";
+	ret = mt6580_pwrap_dio(wrp);
+	if (ret)
+		goto fail;
+	wrp->init_stage = "cipher";
+	ret = mt6580_pwrap_cipher(wrp);
+	if (ret)
+		goto fail;
+	wrp->init_stage = "write-test";
+	ret = regmap_write(wrp->regmap, 0x18e, 0xa55a);
+	if (!ret)
+		ret = regmap_read(wrp->regmap, 0x18e, &value);
+	if (!ret && value != 0xa55a)
+		ret = -EIO;
+	if (ret)
+		goto fail;
+	wrp->init_stage = "crc";
+	ret = regmap_write(wrp->regmap, 0x192, 1);
+	if (ret)
+		goto fail;
+	writel(1, wrp->base + PWRAP_CRC_EN);
+	writel(0, wrp->base + PWRAP_SIG_MODE);
+	writel(0x194, wrp->base + PWRAP_SIG_ADR);
+	ret = mt6580_pwrap_signature(wrp);
+	if (ret)
+		goto fail;
+	wrp->init_stage = "status-updates";
+	writel(0x1ff, wrp->base + PWRAP_ARB_EN);
+	writel(1, wrp->base + PWRAP_WACS0_EN);
+	writel(1, wrp->base + PWRAP_WACS1_EN);
+	writel(5, wrp->base + PWRAP_STAUPD_PRD);
+	writel(0xff, wrp->base + PWRAP_STAUPD_GRPEN);
+	writel(0xf, wrp->base + PWRAP_WDT_UNIT);
+	writel(0xffffffff, wrp->base + PWRAP_WDT_SRC_EN);
+	writel(1, wrp->base + PWRAP_TIMER_EN);
+	/* No AP wrapper IRQ handler is registered yet. Do not copy the
+	 * BSP's INT_EN mask and enable an unhandled interrupt source.
+	 */
+	writel(0, wrp->base + PWRAP_INT_EN);
+	writel(0xffffffff, wrp->base + PWRAP_INT_CLR);
+	writel(0x76c, wrp->base + PWRAP_ADC_CMD_ADR);
+	writel(0x8000, wrp->base + PWRAP_ADC_CMD);
+	writel(0x72c, wrp->base + PWRAP_ADC_RDY_ADR);
+	writel(0x72e, wrp->base + PWRAP_ADC_DATA1);
+	writel(0x730, wrp->base + PWRAP_ADC_DATA2);
+	writel(1, wrp->base + PWRAP_INIT_DONE2);
+	writel(1, wrp->base + PWRAP_INIT_DONE0);
+	writel(1, wrp->base + PWRAP_INIT_DONE1);
+	wrp->initializing = false;
+	wrp->init_stage = "final-check";
+	ret = mt6580_pwrap_link_check(wrp);
+	if (ret)
+		goto fail;
+	wrp->cold_initialized = true;
+	wrp->init_stage = "complete";
+	return 0;
+fail:
+	mt6580_pwrap_quiesce(wrp);
+	wrp->initializing = false;
+	return ret;
+}
+
+static void mt6580_pwrap_put_top(void *data)
+{
+	put_device(data);
+}
+
+static struct device *mt6580_pwrap_get_top(struct platform_device *pdev)
+{
+	struct device_node *node;
+	struct platform_device *top;
+	int ret;
+
+	node = of_parse_phandle(pdev->dev.of_node, "mediatek,topckgen", 0);
+	if (!node)
+		return ERR_PTR(-EINVAL);
+	top = of_find_device_by_node(node);
+	of_node_put(node);
+	if (!top)
+		return ERR_PTR(-EPROBE_DEFER);
+	ret = devm_add_action_or_reset(&pdev->dev, mt6580_pwrap_put_top, &top->dev);
+	if (ret)
+		return ERR_PTR(ret);
+	if (!device_is_bound(&top->dev))
+		return ERR_PTR(-EPROBE_DEFER);
+	if (!device_link_add(&pdev->dev, &top->dev, DL_FLAG_AUTOREMOVE_CONSUMER))
+		return ERR_PTR(-EINVAL);
+	return &top->dev;
+}
+
 static int mt6580_pwrap_probe(struct platform_device *pdev)
 {
+	bool native = of_device_is_compatible(pdev->dev.of_node, "mediatek,mt6580-pwrap");
+	struct reset_control *reset = NULL;
+	struct device *top = NULL;
+	struct clk *spi = NULL, *ref = NULL;
 	struct clk_bulk_data *clks;
 	struct mt6580_pwrap *wrp;
 	struct regmap *regmap;
+	unsigned int before[ARRAY_SIZE(vproc_snapshot_regs)], after[ARRAY_SIZE(vproc_snapshot_regs)];
 	int ret;
 
 	wrp = devm_kzalloc(&pdev->dev, sizeof(*wrp), GFP_KERNEL);
@@ -704,18 +1079,56 @@ static int mt6580_pwrap_probe(struct platform_device *pdev)
 		return PTR_ERR(wrp->base);
 	mutex_init(&wrp->phase_lock);
 	spin_lock_init(&wrp->stats_lock);
+	wrp->init_stage = "firmware";
+	if (native) {
+		reset = devm_reset_control_get_exclusive(&pdev->dev, "spi");
+		if (IS_ERR(reset))
+			return dev_err_probe(&pdev->dev, PTR_ERR(reset), "PWRAP SPI reset unavailable\n");
+		top = mt6580_pwrap_get_top(pdev);
+		if (IS_ERR(top))
+			return dev_err_probe(&pdev->dev, PTR_ERR(top), "PWRAP TOPCKGEN unavailable\n");
+		spi = devm_clk_get(&pdev->dev, "spi");
+		if (IS_ERR(spi))
+			return PTR_ERR(spi);
+		ref = devm_clk_get(&pdev->dev, "26m");
+		if (IS_ERR(ref))
+			return PTR_ERR(ref);
+	}
 	/* Keep clocks for PMIC IRQ, regulator and final atomic power-off users.
 	 * Older bring-up DTs have no clocks and retain firmware gate ownership.
 	 */
 	ret = devm_clk_bulk_get_all_enabled(&pdev->dev, &clks);
 	if (ret < 0)
 		return dev_err_probe(&pdev->dev, ret, "PWRAP clocks unavailable\n");
-	if (!(readl(wrp->base + WACS2_RDATA) & WACS_INIT_DONE))
+	wrp->firmware_initialized = !!(readl(wrp->base + WACS2_RDATA) & WACS_INIT_DONE);
+	if (!native && !wrp->firmware_initialized)
 		return dev_err_probe(&pdev->dev, -ENODEV, "firmware PWRAP is not initialized\n");
 	regmap = devm_regmap_init(&pdev->dev, NULL, wrp, &mt6580_pwrap_regmap);
 	if (IS_ERR(regmap))
 		return PTR_ERR(regmap);
 	wrp->regmap = regmap;
+	if (native && (force_init || !wrp->firmware_initialized)) {
+		if (wrp->firmware_initialized) {
+			ret = mt6580_pwrap_snapshot_vproc(wrp, before);
+			if (ret)
+				return dev_err_probe(&pdev->dev, ret, "pre-init VPROC snapshot failed\n");
+		}
+		ret = mt6580_pwrap_cold_init(wrp, top, reset, spi, ref);
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret, "PWRAP initialization failed at %s (scan=%06x)\n",
+					     wrp->init_stage, wrp->si_pass_mask);
+		if (wrp->firmware_initialized) {
+			ret = mt6580_pwrap_snapshot_vproc(wrp, after);
+			if (!ret && memcmp(before, after, sizeof(before)))
+				ret = -EIO;
+			if (ret) {
+				mt6580_pwrap_quiesce(wrp);
+				return dev_err_probe(&pdev->dev, ret, "VPROC changed across serial-link initialization\n");
+			}
+		}
+		dev_info(&pdev->dev, "kernel initialized link: scan=%06x sample=%u\n",
+			 wrp->si_pass_mask, wrp->si_point);
+	}
 	ret = mt6580_pwrap_link_check(wrp);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "MT6350 DEW read test failed\n");
@@ -725,6 +1138,7 @@ static int mt6580_pwrap_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id mt6580_pwrap_match[] = {
+	{ .compatible = "mediatek,mt6580-pwrap" },
 	{ .compatible = "mediatek,mt6580-firmware-pwrap" },
 	{ }
 };
@@ -753,5 +1167,5 @@ bool mt6580_pwrap_infra_ready(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(mt6580_pwrap_infra_ready);
 module_platform_driver(mt6580_pwrap_driver);
-MODULE_DESCRIPTION("MT6580 firmware-initialized PMIC wrapper");
+MODULE_DESCRIPTION("MT6580 MT6350 PMIC wrapper");
 MODULE_LICENSE("GPL");

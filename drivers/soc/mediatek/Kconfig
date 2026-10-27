@@ -56,13 +56,14 @@ config MTK_PMIC_WRAP
 	  hardware to connect the PMIC.
 
 config MTK_MT6580_PMIC_WRAP
-	tristate "MT6580 firmware-initialized PMIC wrapper"
-	depends on OF
+	tristate "MT6580 MT6350 PMIC wrapper"
+	depends on OF && COMMON_CLK_MT6580_USB
+	depends on RESET_CONTROLLER
 	select REGMAP
 	help
-	  Share the firmware-initialized WACS2 channel between MT6350
-	  regulators and RTC reboot-mode control. Provide the SPM suspend
-	  command-slot handoff without reinitializing PWRAP.
+	  Share WACS2 between MT6350 regulators, IRQ, battery and RTC users.
+	  Retain a working firmware link or initialize SPI timing, DIO, cipher
+	  and CRC before registering consumers. Provide SPM command-slot handoff.
 
 config MTK_MT6580_SPM
 	bool "MT6580 SPM system suspend support"

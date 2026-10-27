@@ -3173,3 +3173,65 @@ Test files, alarm and wake lock were cleaned. Standard product boot/kernel
 are now boot-pwrap-link.img/kernel-pwrap-link, build #129. Evidence is in
 out/a1260-runtime-pm/pwrap-link/{fault-model.log,first-boot.txt,cpufreq.log,
 deep.log,post-reconnect.txt,normal-adb.txt,summary.json}.
+
+Probe-only PWRAP link reconstruction and USB handoff (build #132)
+----------------------------------------------------------------
+
+The native mediatek,mt6580-pwrap compatible can now initialize the serial
+link when INIT_DONE is absent, before exposing PMIC children. TOPRGU bit11
+is supplied by the watchdog reset controller with other unverified MT6580
+reset IDs rejected. TOPCKGEN owns the gate interval and PMIC SPI CCF mux;
+the old four-gate state is restored and the SPI source selected to 26 MHz.
+The implementation adds bounded SI calibration, register clock/dummy-cycle
+setup, DIO, cipher, write-test, CRC, status updates and autonomous ADC setup.
+An existing working link is retained during ordinary startup. See
+mt6580-pwrap-link.rst for failure containment and bootstrap limitations.
+
+Build #131 first booted the new native DT with the firmware path. A test
+which only appended force_init to the Android boot header also retained
+that path: LK ignored the header's added command line. This attempt is
+not counted as link reconstruction. The #132 qualification image placed
+mt6580_pmic_wrap.force_init=1 in a temporary appended DTB's /chosen/bootargs.
+Linux actually received it and performed the reset/setup sequence: source
+kernel, firmware_at_probe=1, pass window 0x0000ff, center 3, stage complete.
+The VPROC before/after comparison passed, and the final signature was 5aa5.
+AP DIO/cipher mode/cipher-ready/CRC read 1, SIDLY/SI_CK_CON read 0/0,
+RDDMY read 8, raw wrapper interrupt/watchdog flags read 0/0, and the gate
+status matched its pre-init value 0x98839a3c. AP bclk DCM-disable bits were
+retained. AP wrapper IRQs stay masked until a handler is implemented.
+
+Seven CPU frequencies matched their requests with VPROC 1.15--1.3 V.
+Two explicit deep intervals stopped clocks for 2.758502071 and 9.238146924
+seconds; an additional automatic interval after cleanup lasted
+46.685870696 seconds. Final statistics were three successes/zero failures,
+CPU0/L2 cold recoveries three, MAINPLL down/up three/three, no restore error,
+and identical 8 MiB RAM hashes. The post-deep snapshot recorded 22138 reads,
+4660 writes, 22 passing checks and zero transport error/timeout/init loss.
+These are normal hardware regressions, not physical fault injection.
+
+During the work, an adbd restart on #131 lost USB enumeration. The recovered
+log showed suspend at 79.676 seconds and resume by 80.135 seconds, followed
+by continuing health events: this was not a permanently dead CPU. The
+MT6580 glue previously relaxed its enumeration guard at RESET/RESUME before
+configuration was assured. #132 retains the bounded guard and renews it
+for an unconfigured SUSPEND; configured suspend and physical disconnect
+still release the active-link reference, with no permanent enumeration lock.
+
+After flashing the ordinary #132 image, /proc/cmdline had no force_init,
+normal boot was shell, and source=firmware confirmed the retained path.
+With the screen Asleep, stay_on_while_plugged_in=0 and no test wake lock,
+five successive unroot/root/unroot/root/unroot transitions restored ADB
+without manual reattachment, in 4.772/4.726/4.702/4.703/4.591 seconds. The
+times include a deliberate one-second old-transport retirement wait. System
+suspend success/failure remained 0/0 and the final UID was shell. This
+qualifies the observed restart case over the current USB/IP setup; generic
+host bus-suspend/remote-wakeup and bulk transfer remain separate items.
+
+The temporary stay-on setting used before the first qualification root
+request was restored to 0. The final normal boot had no temporary lock or
+forced-init parameter. Runtime/model evidence is in
+out/a1260-runtime-pm/pwrap-cold. The model exhaustively checked 24-bit SI
+windows, bounded cipher waits and stage failures; actual hardware reset
+and analog timing are established by the above on-device run, not the model.
+The standard product boot/kernel now use ordinary boot-pwrap-cold.img and
+kernel-pwrap-cold, build #132; the forced-init image is kept separately.

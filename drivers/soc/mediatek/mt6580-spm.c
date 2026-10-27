@@ -1251,7 +1251,8 @@ static int mt6580_spm_probe(struct platform_device *pdev)
 	node = of_parse_phandle(dev->of_node, "mediatek,pwrap", 0);
 	if (!node)
 		return -EINVAL;
-	if (!of_device_is_compatible(node, "mediatek,mt6580-firmware-pwrap")) {
+	if (!of_device_is_compatible(node, "mediatek,mt6580-firmware-pwrap") &&
+	    !of_device_is_compatible(node, "mediatek,mt6580-pwrap")) {
 		of_node_put(node);
 		return -EINVAL;
 	}

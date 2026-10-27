@@ -5,6 +5,7 @@
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/pinctrl/mt65xx.h>
+#include <dt-bindings/reset/mediatek,mt6580-resets.h>
 #include <dt-bindings/thermal/thermal.h>
 
 / {
@@ -351,18 +352,22 @@
 		memory-region = <&lk_framebuffer>;
 	};
 
-	watchdog@10007000 {
+	watchdog: watchdog@10007000 {
 		compatible = "mediatek,mt6580-wdt", "mediatek,mt6589-wdt";
 		reg = <0 0x10007000 0 0x100>;
 		timeout-sec = <30>;
+		#reset-cells = <1>;
 	};
 
 	pwrap: pmic-wrap@1000f000 {
-		compatible = "mediatek,mt6580-firmware-pwrap";
+		compatible = "mediatek,mt6580-pwrap";
 		reg = <0 0x1000f000 0 0x1000>;
 		clocks = <&topckgen CLK_MT6580_TOP_PMIC_SPI>,
 			 <&topckgen CLK_MT6580_TOP_PMIC_26M>;
 		clock-names = "spi", "26m";
+		mediatek,topckgen = <&topckgen>;
+		resets = <&watchdog MT6580_TOPRGU_PWRAP_SPI_RST>;
+		reset-names = "spi";
 
 		reboot-mode {
 			compatible = "wingtech,wt6580-reboot-mode";
