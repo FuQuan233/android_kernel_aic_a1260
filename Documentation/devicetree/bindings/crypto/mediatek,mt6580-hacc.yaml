@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/crypto/mediatek,mt6580-hacc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: MediaTek MT6580 HACC software-key AES engine
+
+maintainers:
+  - FuQuan <i@fuquan.moe>
+
+description: |
+  HACC at 0x1000a000 implements software-key AES ECB/CBC. The driver polls
+  the documented ACON2 ready bit and only accesses software-key/data control
+  registers through offset 0x5c. Hardware-bound keys, OTP, SECINIT, secure
+  boot and legacy vendor ioctls are not part of this binding. The bus clock
+  is MT6580 TOP CG_CTRL1 bit21 (SEJ). Its physical parent is unspecified;
+  the clock provider exposes the verified gate without inventing a rate.
+
+properties:
+  compatible:
+    const: mediatek,mt6580-hacc
+  reg:
+    maxItems: 1
+  clocks:
+    maxItems: 1
+  clock-names:
+    const: bus
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - clock-names
+
+additionalProperties: false

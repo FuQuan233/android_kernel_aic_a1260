@@ -1,0 +1,15 @@
+What:           /sys/devices/platform/1000a000.crypto/state
+Date:           October 2026
+Contact:        FuQuan233
+Description:
+                Read-only software counters for MT6580 HACC software-key
+                AES. broken latches a hardware READY timeout until reprobe
+                or reboot. requests counts completed queued requests; bytes
+                counts successful request bytes; blocks also includes the
+                two probe-time AES known-answer operations. errors counts
+                failed queued requests and timeouts counts READY deadlines.
+                pm resumes/suspends count runtime clock transitions.
+                API rejections before queueing are not included. Counters
+                are individually sampled, not one atomic snapshot. Reading
+                does not access gated MMIO, disclose key/data registers or
+                report measured electrical power.

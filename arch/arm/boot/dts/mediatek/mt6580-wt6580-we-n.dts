@@ -359,6 +359,13 @@
 		#reset-cells = <1>;
 	};
 
+	hacc: crypto@1000a000 {
+		compatible = "mediatek,mt6580-hacc";
+		reg = <0 0x1000a000 0 0x1000>;
+		clocks = <&topckgen CLK_MT6580_TOP_SEJ>;
+		clock-names = "bus";
+	};
+
 	pwrap: pmic-wrap@1000f000 {
 		compatible = "mediatek,mt6580-pwrap";
 		reg = <0 0x1000f000 0 0x1000>;

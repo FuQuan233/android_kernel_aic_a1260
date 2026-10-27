@@ -1456,7 +1456,7 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	if (of_device_is_compatible(dev->of_node, "mediatek,mt6580-mfgcfg"))
 		return mtk_clk_simple_probe(pdev);
 	if (top)
-		count = 20;
+		count = 21;
 
 	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
@@ -1519,6 +1519,14 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 		/* CLK_GATING_CTRL1[13]: 1 gates the USB bus clock. */
 		data->hws[CLK_MT6580_TOP_USB] = devm_clk_hw_register_gate(dev,
 			"mt6580_usb_bus", "mt6580_usb_bus_src", 0, base + 0x24, 13,
+			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
+
+		/* BSP SEJ_SW_CG at CG_CTRL1[21]. Its two-input physical source is
+		 * not established; expose the verified gate without inventing a
+		 * PLL parent or rate. HACC PM drains all work before system sleep.
+		 */
+		data->hws[CLK_MT6580_TOP_SEJ] = devm_clk_hw_register_gate(dev,
+			"mt6580_sej_bus", NULL, CLK_IGNORE_UNUSED, base + 0x24, 21,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 
 		/* AXI is divided by ten in the I2C controller. */

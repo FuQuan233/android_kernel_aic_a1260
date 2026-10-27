@@ -11,6 +11,16 @@ menuconfig CRYPTO_HW
 
 if CRYPTO_HW
 
+config CRYPTO_DEV_MT6580_HACC
+	tristate "MediaTek MT6580 HACC software-key AES"
+	depends on COMMON_CLK_MT6580_USB && PM
+	select CRYPTO_ENGINE
+	select CRYPTO_SKCIPHER
+	help
+	  Provide ECB/CBC AES with caller-supplied software keys using the
+	  MT6580 HACC engine. Includes bounded PIO, queued requests and PM.
+	  Does not expose hardware-bound keys or secure-boot interfaces.
+
 source "drivers/crypto/allwinner/Kconfig"
 
 config CRYPTO_DEV_PADLOCK

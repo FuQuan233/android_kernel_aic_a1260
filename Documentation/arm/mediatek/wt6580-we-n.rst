@@ -3022,10 +3022,11 @@ This audit does not establish complete SoC support. Remaining areas are:
 * Runtime coordinated CPU deep idle and a complete CPU/interconnect/memory
   DCM policy. cpuidle currently exposes hardware WFI only; the separately
   validated system deep-suspend path must not be confused with runtime idle.
-* M4U/IOMMU, video codecs and HACC integration. hw_random reports no provider
-  and crypto drivers are software; usable RNG hardware and HACC interfaces
-  require BSP evidence before any register programming. eMMC stays at the
-  qualified 8-bit 52 MHz mode; higher modes have not been qualified.
+* M4U/IOMMU and video codecs remain unimplemented. HACC software-key AES
+  is described in mt6580-hacc.rst; its PIO path retains lower priority than
+  software AES. hw_random still has no provider: the TRNG register protocol
+  and entropy quality are unresolved. eMMC stays at qualified 8-bit 52 MHz;
+  higher modes have not been qualified.
 * Wi-Fi, Bluetooth/HCI, physical audio, original IR functions, special-key
   application actions and AW9106 LEDs. No WLAN, sound card or video device
   is currently instantiated. An empty deferred-probe list covers only
@@ -3345,3 +3346,23 @@ and no degradation; display active with zero underflow. Standard boot/kernel
 are #161, default shell/four cores/schedutil604500..1300000/deep retained,
 with tests cleaned up. No physical fault injection or electrical measurement
 is claimed. Evidence: out/a1260-runtime-pm/mcusys-dcm/summary.json.
+
+HACC software-key AES (#165, 2026-10-27)
+---------------------------------------
+
+The BSP HACC protocol now supplies queued ECB/CBC AES with128/192/256-bit
+software keys, bounded READY polling, a probe encrypt/decrypt KAT, key/data
+clearing and runtime/system PM. Only verified TOP SEJ bit21 is owned; no
+hardware-key/OTP/secure-boot interface or guessed TRNG protocol is added.
+The gate has no invented PLL parent. See mt6580-hacc.rst and its state ABI.
+
+Full kernel crypto selftests passed on #164. Normal #165 retains ordinary
+selftests and passed14400 concurrent comparison pairs across two deep
+intervals,1203 actual CPU0 idle restores, RAM/four-core checks, GPU readback
+and direct eMMC I/O. AES errors/timeouts0, idle SEJ count0, no kernel warning
+or taint. Two explicit sleeps passed; a later automatic freeze cancellation
+on pending eventpoll is separately recorded. Measured PIO throughput is
+slower than software AES, so software remains preferred (hardware priority50).
+Standard boot/kernel are #165, with ordinary shell and normal CPU/deep policy
+retained. M4U, codecs and hardware RNG remain unresolved. Evidence:
+out/a1260-runtime-pm/hacc/summary.json.

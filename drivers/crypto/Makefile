@@ -50,3 +50,5 @@ obj-y += intel/
 obj-y += starfive/
 obj-y += cavium/
 obj-y += ti/
+
+obj-$(CONFIG_CRYPTO_DEV_MT6580_HACC) += mt6580-hacc.o
