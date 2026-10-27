@@ -6,7 +6,8 @@
 
 struct device;
 
-/* Only before PWRAP consumers exist, holding the TOPCKGEN supplier. The
+/* Only while PWRAP serial clients and autonomous requests are quiesced,
+ * holding the TOPCKGEN supplier. The
  * hardware-only gate interval preserves CCF references and other CG bits.
  */
 int mt6580_pwrap_clocks_gate(struct device *top, u32 *enabled);

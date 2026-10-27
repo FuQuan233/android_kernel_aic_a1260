@@ -3285,3 +3285,36 @@ out/a1260-runtime-pm/dcm, including first-boot.txt, active.log, io.log,
 deep.log, after-deep.txt, io-after-deep.log, gpu-after-deep.log,
 normal-adb.txt, stock-core.json and summary.json. Deeper runtime cpuidle
 and MCUSYS/memory DCM remain separate work.
+
+PWRAP online recovery (#156/#157, 2026-10-27)
+-------------------------------------------
+
+SPI108 level-high AP wrapper IRQ is now registered. Retained firmware
+INT_EN was actually 0x7ffffffd on #151 despite the older masked-IRQ claim;
+probe now masks it until the handler and worker are installed. The worker
+excludes public PMIC requests and SPM bank/slot ownership, bounds stale
+state cleanup, and reconstructs a bad serial link with native suppliers.
+It preserves all eight DVFS slots and AP autonomous configuration, compares
+readable VPROC snapshots, limits automatic rebuilds and latches failure.
+Original PMIC commands are never replayed. See mt6580-pwrap-link.rst and
+ABI/testing/sysfs-platform-mt6580-pwrap for ordering, controls and limits.
+
+On #156, three live resets including GPU/four-reader RTC concurrency and
+one soft inspection passed. One of 400 RTC reads was deliberately rejected
+by the exclusion gate, with subsequent reads restored and no bus error.
+Seven CPU OPPs and two full deep sleeps (9.701235326/9.746584370 seconds)
+passed with PMIC ownership/slots, CPU0/L2 cold, infra/DDRPHY and MAINPLL
+restored. An 8 MiB RAM hash matched. Runtime menu then completed 1218 actual
+CPU0 dormant restores, one early WFI return and zero failures; RAM and
+four-core checks passed afterward. Mali 1624 frames/green pixel/GL error 0,
+4 MiB aligned direct I/O with two matching reads and 52 MHz/8-bit eMMC,
+400000 coherent CPU increments and 400 monotonic clock migrations passed.
+
+Final #157 retains masked and raw IRQ causes together and repeated normal
+shell boot, high/low OPP resets and soft inspection successfully. Standard
+product boot/kernel use this ordinary image, without force-init; default
+shell, four cores, schedutil 604500..1300000 and automatic deep are retained.
+No physical error IRQ/CRC/stuck-wire injection or analog current/voltage
+measurement is claimed. USB recovery required manual host intervention;
+adbd start delay and Windows/WSL ownership observations are separately
+recorded. Evidence: out/a1260-runtime-pm/pwrap-runtime/summary.json.

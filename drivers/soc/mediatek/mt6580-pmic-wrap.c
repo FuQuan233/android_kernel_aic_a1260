@@ -4,17 +4,21 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/iopoll.h>
+#include <linux/interrupt.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/mfd/mt6350/registers.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeup.h>
 #include <linux/panic.h>
 #include <linux/regmap.h>
 #include <linux/reset.h>
 #include <linux/soc/mediatek/mt6580-pwrap.h>
 #include <linux/spinlock.h>
+#include <linux/workqueue.h>
 
 #define WACS2_CMD	0x9c
 #define WACS2_RDATA	0xa0
@@ -40,6 +44,8 @@
 #define PWRAP_CSLEXT_END	0x02c
 #define PWRAP_STAUPD_PRD	0x030
 #define PWRAP_STAUPD_GRPEN 0x034
+#define PWRAP_STAUPD_STA 0x03c
+#define PWRAP_WRAP_STA	0x044
 #define PWRAP_ARB_EN	0x050
 #define PWRAP_MAN_EN	0x05c
 #define PWRAP_MAN_CMD	0x060
@@ -50,7 +56,13 @@
 #define PWRAP_WACS2_EN	0x094
 #define PWRAP_INIT_DONE2	0x098
 #define PWRAP_INT_EN	0x0a8
+#define PWRAP_INT_RAW	0x0ac
+#define PWRAP_INT_FLG	0x0b0
 #define PWRAP_INT_CLR	0x0b4
+#define PWRAP_SIG_ERRVAL	0x0c4
+#define PWRAP_WDT_FLG	0x0dc
+#define PWRAP_IRQ_MASK	0x7ffffffd
+#define PWRAP_ERROR_MASK	GENMASK(30, 0)
 #define PWRAP_SIG_ADR	0x0b8
 #define PWRAP_SIG_MODE	0x0bc
 #define PWRAP_CRC_EN	0x0c8
@@ -131,9 +143,41 @@ static const u16 suspend_slot_regs[] = {
  */
 static const u16 vproc_snapshot_regs[] = { 0x216, 0x21e, 0x220, 0x222, 0x224, 0x230 };
 
+/* Only wrapper/autonomous configuration is preserved here, never pending
+ * requests or sampled WACS data. Slots 0..7 must survive an online reset.
+ */
+static const u16 recovery_regs[] = {
+	0x04c, PWRAP_ARB_EN, PWRAP_WACS0_EN, PWRAP_WACS1_EN,
+	PWRAP_STAUPD_PRD, PWRAP_STAUPD_GRPEN, PWRAP_WDT_UNIT,
+	PWRAP_WDT_SRC_EN, PWRAP_TIMER_EN, PWRAP_DCM_EN, PWRAP_DCM_DBC,
+	PWRAP_ADC_CMD_ADR, PWRAP_ADC_CMD, PWRAP_ADC_RDY_ADR,
+	PWRAP_ADC_DATA1, PWRAP_ADC_DATA2,
+	0x0e4, 0x0e8, 0x0ec, 0x0f0, 0x0f4, 0x0f8,
+	0x0fc, 0x100, 0x104, 0x108, 0x10c, 0x110,
+	0x114, 0x118, 0x11c, 0x120,
+};
+
 struct mt6580_pwrap {
 	void __iomem *base;
 	struct regmap *regmap;
+	struct device *dev, *top;
+	struct reset_control *reset;
+	struct clk *spi, *ref;
+	spinlock_t bus_lock, irq_lock;
+	unsigned long bus_flags, last_rebuild, last_recovery;
+	u32 recovery_burst;
+	u32 recovery_config[ARRAY_SIZE(recovery_regs)];
+	bool recovery_config_valid;
+	struct delayed_work recovery_work;
+	struct wakeup_source *recovery_ws;
+	int irq;
+	bool online, stopping, recovering, failed, fault_pending, force_rebuild;
+	u32 fault_flags;
+	u32 irq_count, irq_last, irq_raw, irq_wdt, irq_signature, irq_wacs;
+	u32 recovery_attempts, recovery_soft, recovery_rebuilds, recovery_failures;
+	u32 recovery_deferred, blocked, recovery_before[6], recovery_after[6];
+	int recovery_drain_error;
+	int recovery_error, recovery_snapshot_error;
 	struct mutex phase_lock;
 	spinlock_t stats_lock;
 	struct mt6580_pwrap_link_stats link;
@@ -159,6 +203,12 @@ struct mt6580_pwrap {
 	bool suspend_phase;
 };
 
+static void mt6580_pwrap_request_recovery(struct mt6580_pwrap *wrp);
+static ssize_t recovery_state_show(struct device *, struct device_attribute *, char *);
+static ssize_t recover_store(struct device *, struct device_attribute *, const char *, size_t);
+static DEVICE_ATTR_RO(recovery_state);
+static DEVICE_ATTR_WO(recover);
+
 static int mt6580_pwrap_link_check(struct mt6580_pwrap *wrp)
 {
 	unsigned int value = 0;
@@ -167,8 +217,10 @@ static int mt6580_pwrap_link_check(struct mt6580_pwrap *wrp)
 
 	/* Fixed, side-effect-free DEW signature, also used by the MT6580 BSP. */
 	ret = regmap_read(wrp->regmap, MT6350_DEW_READ_TEST, &value);
-	if (!ret && value != MT6350_READ_TEST_VALUE)
+	if (!ret && value != MT6350_READ_TEST_VALUE) {
 		ret = -EIO;
+		mt6580_pwrap_request_recovery(wrp);
+	}
 	spin_lock_irqsave(&wrp->stats_lock, flags);
 	wrp->link.checks++;
 	if (ret)
@@ -431,7 +483,8 @@ int mt6580_pwrap_prepare_suspend(struct device *dev, enum mt6580_vproc_sleep_mod
 	int i, ret;
 
 	mutex_lock(&wrp->phase_lock);
-	if (wrp->suspend_phase || wrp->bank_active) {
+	if (wrp->suspend_phase || wrp->bank_active || READ_ONCE(wrp->fault_pending) ||
+	    READ_ONCE(wrp->failed)) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -528,6 +581,8 @@ restore_slots:
 	if (!ret && check_link)
 		ret = mt6580_pwrap_link_check(wrp);
 	mutex_unlock(&wrp->phase_lock);
+	if (READ_ONCE(wrp->fault_pending))
+		mt6580_pwrap_request_recovery(wrp);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(mt6580_pwrap_finish_suspend);
@@ -613,13 +668,15 @@ static ssize_t link_state_show(struct device *dev, struct device_attribute *attr
 	struct mt6580_pwrap_link_stats link;
 	unsigned long flags;
 	u32 status;
+	ssize_t len;
 
+	mutex_lock(&wrp->phase_lock);
 	mt6580_pwrap_link_check(wrp);
 	spin_lock_irqsave(&wrp->stats_lock, flags);
 	link = wrp->link;
 	spin_unlock_irqrestore(&wrp->stats_lock, flags);
 	status = readl(wrp->base + WACS2_RDATA);
-	return sysfs_emit(buf,
+	len = sysfs_emit(buf,
 		"init_done=%u wacs2=%08x\n"
 		"source=%s firmware_at_probe=%u scan_mask=%06x sample=%u stage=%s\n"
 		"read_test=%04x expected=%04x error=%d checks=%u failures=%u\n"
@@ -633,6 +690,8 @@ static ssize_t link_state_show(struct device *dev, struct device_attribute *attr
 		link.errors, link.timeouts, link.init_lost, link.stale_valid_clears,
 		link.last_error, link.last_reg, link.last_write,
 		link.last_stage, link.last_status);
+	mutex_unlock(&wrp->phase_lock);
+	return len;
 }
 static DEVICE_ATTR_RO(link_state);
 
@@ -640,6 +699,8 @@ static struct attribute *mt6580_pwrap_attrs[] = {
 	&dev_attr_spm_phase.attr,
 	&dev_attr_sleep_voltage.attr,
 	&dev_attr_link_state.attr,
+	&dev_attr_recovery_state.attr,
+	&dev_attr_recover.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(mt6580_pwrap);
@@ -728,12 +789,67 @@ out:
 	return ret;
 }
 
+/* Public map holds bus_lock. Freeze new traffic while rebuilding, but do
+ * not prevent a healthy WDT-only suspend transaction from restoring VPROC.
+ */
+static int mt6580_pwrap_public_xfer(struct mt6580_pwrap *wrp, unsigned int reg,
+				    unsigned int *value, bool write)
+{
+	u32 raw;
+	int ret;
+
+	if (wrp->recovering || wrp->failed ||
+	    (READ_ONCE(wrp->fault_pending) && !READ_ONCE(wrp->suspend_phase))) {
+		wrp->blocked++;
+		return wrp->failed ? -EIO : -EAGAIN;
+	}
+	raw = readl(wrp->base + PWRAP_INT_RAW) | READ_ONCE(wrp->fault_flags);
+	if (raw & (PWRAP_ERROR_MASK & ~BIT(0))) {
+		mt6580_pwrap_request_recovery(wrp);
+		return -EIO;
+	}
+	ret = mt6580_pwrap_xfer(wrp, reg, value, write);
+	raw = readl(wrp->base + PWRAP_INT_RAW);
+	if (ret || (raw & PWRAP_ERROR_MASK))
+		mt6580_pwrap_request_recovery(wrp);
+	if (!ret && (raw & (PWRAP_ERROR_MASK & ~BIT(0))))
+		ret = -EIO;
+	return ret;
+}
+
 static int mt6580_pwrap_read(void *context, unsigned int reg, unsigned int *value)
+{
+	return mt6580_pwrap_public_xfer(context, reg, value, false);
+}
+
+static int mt6580_pwrap_write(void *context, unsigned int reg, unsigned int value)
+{
+	return mt6580_pwrap_public_xfer(context, reg, &value, true);
+}
+
+static void mt6580_pwrap_bus_lock(void *context)
+{
+	struct mt6580_pwrap *wrp = context;
+	unsigned long flags;
+
+	spin_lock_irqsave(&wrp->bus_lock, flags);
+	wrp->bus_flags = flags;
+}
+
+static void mt6580_pwrap_bus_unlock(void *context)
+{
+	struct mt6580_pwrap *wrp = context;
+
+	spin_unlock_irqrestore(&wrp->bus_lock, wrp->bus_flags);
+}
+
+/* Only probe or recovery under phase_lock, with public clients excluded. */
+static int mt6580_pwrap_init_read(void *context, unsigned int reg, unsigned int *value)
 {
 	return mt6580_pwrap_xfer(context, reg, value, false);
 }
 
-static int mt6580_pwrap_write(void *context, unsigned int reg, unsigned int value)
+static int mt6580_pwrap_init_write(void *context, unsigned int reg, unsigned int value)
 {
 	return mt6580_pwrap_xfer(context, reg, &value, true);
 }
@@ -747,6 +863,8 @@ static const struct regmap_config mt6580_pwrap_regmap = {
 	.max_register = 0xfffe,
 	.reg_read = mt6580_pwrap_read,
 	.reg_write = mt6580_pwrap_write,
+	.lock = mt6580_pwrap_bus_lock,
+	.unlock = mt6580_pwrap_bus_unlock,
 };
 
 static int mt6580_pwrap_sync_idle(struct mt6580_pwrap *wrp)
@@ -777,7 +895,7 @@ static int mt6580_pwrap_select_sample(u32 mask)
 static int mt6580_pwrap_signature(struct mt6580_pwrap *wrp)
 {
 	unsigned int value;
-	int ret = regmap_read(wrp->regmap, MT6350_DEW_READ_TEST, &value);
+	int ret = mt6580_pwrap_init_read(wrp, MT6350_DEW_READ_TEST, &value);
 
 	return ret ?: (value == MT6350_READ_TEST_VALUE ? 0 : -EIO);
 }
@@ -787,10 +905,11 @@ static int mt6580_pwrap_calibrate(struct mt6580_pwrap *wrp)
 	unsigned int i, value;
 	int ret, point;
 
+	wrp->si_pass_mask = 0;
 	for (i = 0; i < 24; i++) {
 		writel(i >> 2, wrp->base + PWRAP_SI_CK_CON);
 		writel(3 - (i & 3), wrp->base + PWRAP_SIDLY);
-		ret = regmap_read(wrp->regmap, MT6350_DEW_READ_TEST, &value);
+		ret = mt6580_pwrap_init_read(wrp, MT6350_DEW_READ_TEST, &value);
 		/* A completed but incorrect read is a rejected sample. A bus
 		 * timeout is different: do not change timing under an in-flight
 		 * transfer or silently count its data as a later sample.
@@ -814,13 +933,13 @@ static int mt6580_pwrap_reg_clock(struct mt6580_pwrap *wrp)
 	unsigned int value;
 	int ret;
 
-	ret = regmap_write(wrp->regmap, 0x12a, 3); /* TOP_CKCON1_CLR */
+	ret = mt6580_pwrap_init_write(wrp, 0x12a, 3); /* TOP_CKCON1_CLR */
 	if (ret)
 		return ret;
-	ret = regmap_read(wrp->regmap, 0x126, &value);
+	ret = mt6580_pwrap_init_read(wrp, 0x126, &value);
 	if (ret || (value & 3))
 		return ret ?: -EIO;
-	ret = regmap_write(wrp->regmap, 0x1a4, 8); /* DEW_RDDMY_NO */
+	ret = mt6580_pwrap_init_write(wrp, 0x1a4, 8); /* DEW_RDDMY_NO */
 	if (ret)
 		return ret;
 	writel(8, wrp->base + PWRAP_RDDMY);
@@ -833,7 +952,7 @@ static int mt6580_pwrap_reg_clock(struct mt6580_pwrap *wrp)
 
 static int mt6580_pwrap_dio(struct mt6580_pwrap *wrp)
 {
-	int ret = regmap_write(wrp->regmap, 0x18a, 1);
+	int ret = mt6580_pwrap_init_write(wrp, 0x18a, 1);
 
 	if (!ret)
 		ret = mt6580_pwrap_sync_idle(wrp);
@@ -858,9 +977,11 @@ static int mt6580_pwrap_cipher(struct mt6580_pwrap *wrp)
 	writel(1, wrp->base + PWRAP_CIPHER_KEY);
 	writel(2, wrp->base + PWRAP_CIPHER_IV);
 	writel(1, wrp->base + PWRAP_CIPHER_EN);
-	ret = regmap_multi_reg_write(wrp->regmap, setup, ARRAY_SIZE(setup));
-	if (ret)
-		return ret;
+	for (i = 0; i < ARRAY_SIZE(setup); i++) {
+		ret = mt6580_pwrap_init_write(wrp, setup[i].reg, setup[i].def);
+		if (ret)
+			return ret;
+	}
 	ret = readl_poll_timeout_atomic(wrp->base + PWRAP_CIPHER_RDY, ready,
 					ready == 1, 10, 10000);
 	if (ret)
@@ -869,7 +990,7 @@ static int mt6580_pwrap_cipher(struct mt6580_pwrap *wrp)
 	 * and each underlying WACS2 transaction; propagate bus errors.
 	 */
 	for (i = 0; i < 1000; i++) {
-		ret = regmap_read(wrp->regmap, 0x19e, &value);
+		ret = mt6580_pwrap_init_read(wrp, 0x19e, &value);
 		if (ret)
 			return ret;
 		if (value == 1)
@@ -878,7 +999,7 @@ static int mt6580_pwrap_cipher(struct mt6580_pwrap *wrp)
 	}
 	if (i == 1000)
 		return -ETIMEDOUT;
-	ret = regmap_write(wrp->regmap, 0x1a0, 1);
+	ret = mt6580_pwrap_init_write(wrp, 0x1a0, 1);
 	if (!ret)
 		ret = mt6580_pwrap_sync_idle(wrp);
 	if (ret)
@@ -891,7 +1012,7 @@ static void mt6580_pwrap_quiesce(struct mt6580_pwrap *wrp)
 {
 	/* A partially changed two-ended protocol cannot be rolled back by
 	 * restoring AP registers. Publish no INIT_DONE or children on failure.
-	 * No blind PMIC writes, command replay or online reset is attempted.
+	 * No blind PMIC writes or command replay is attempted.
 	 */
 	writel(0, wrp->base + PWRAP_INIT_DONE0);
 	writel(0, wrp->base + PWRAP_INIT_DONE1);
@@ -978,15 +1099,15 @@ static int mt6580_pwrap_cold_init(struct mt6580_pwrap *wrp, struct device *top,
 	if (ret)
 		goto fail;
 	wrp->init_stage = "write-test";
-	ret = regmap_write(wrp->regmap, 0x18e, 0xa55a);
+	ret = mt6580_pwrap_init_write(wrp, 0x18e, 0xa55a);
 	if (!ret)
-		ret = regmap_read(wrp->regmap, 0x18e, &value);
+		ret = mt6580_pwrap_init_read(wrp, 0x18e, &value);
 	if (!ret && value != 0xa55a)
 		ret = -EIO;
 	if (ret)
 		goto fail;
 	wrp->init_stage = "crc";
-	ret = regmap_write(wrp->regmap, 0x192, 1);
+	ret = mt6580_pwrap_init_write(wrp, 0x192, 1);
 	if (ret)
 		goto fail;
 	writel(1, wrp->base + PWRAP_CRC_EN);
@@ -996,16 +1117,22 @@ static int mt6580_pwrap_cold_init(struct mt6580_pwrap *wrp, struct device *top,
 	if (ret)
 		goto fail;
 	wrp->init_stage = "status-updates";
-	writel(0x1ff, wrp->base + PWRAP_ARB_EN);
-	writel(1, wrp->base + PWRAP_WACS0_EN);
-	writel(1, wrp->base + PWRAP_WACS1_EN);
+	/* An online rebuild must keep autonomous masters stopped until their
+	 * saved slots and status/ADC configuration have been restored. WACS2
+	 * alone remains available for private verification.
+	 */
+	if (!wrp->recovering) {
+		writel(0x1ff, wrp->base + PWRAP_ARB_EN);
+		writel(1, wrp->base + PWRAP_WACS0_EN);
+		writel(1, wrp->base + PWRAP_WACS1_EN);
+	}
 	writel(5, wrp->base + PWRAP_STAUPD_PRD);
-	writel(0xff, wrp->base + PWRAP_STAUPD_GRPEN);
+	writel(wrp->recovering ? 0 : 0xff, wrp->base + PWRAP_STAUPD_GRPEN);
 	writel(0xf, wrp->base + PWRAP_WDT_UNIT);
 	writel(0xffffffff, wrp->base + PWRAP_WDT_SRC_EN);
 	writel(1, wrp->base + PWRAP_TIMER_EN);
-	/* No AP wrapper IRQ handler is registered yet. Do not copy the
-	 * BSP's INT_EN mask and enable an unhandled interrupt source.
+	/* Probe has not registered the IRQ yet; recovery re-enables it only
+	 * after restoring and checking the saved autonomous configuration.
 	 */
 	writel(0, wrp->base + PWRAP_INT_EN);
 	writel(0xffffffff, wrp->base + PWRAP_INT_CLR);
@@ -1019,7 +1146,7 @@ static int mt6580_pwrap_cold_init(struct mt6580_pwrap *wrp, struct device *top,
 	writel(1, wrp->base + PWRAP_INIT_DONE1);
 	wrp->initializing = false;
 	wrp->init_stage = "final-check";
-	ret = mt6580_pwrap_link_check(wrp);
+	ret = mt6580_pwrap_signature(wrp);
 	if (ret)
 		goto fail;
 	wrp->cold_initialized = true;
@@ -1029,6 +1156,316 @@ fail:
 	mt6580_pwrap_quiesce(wrp);
 	wrp->initializing = false;
 	return ret;
+}
+
+static void mt6580_pwrap_request_recovery(struct mt6580_pwrap *wrp)
+{
+	unsigned long flags;
+	bool first;
+
+	if (!READ_ONCE(wrp->online) || READ_ONCE(wrp->stopping) ||
+	    READ_ONCE(wrp->recovering) || READ_ONCE(wrp->failed))
+		return;
+	spin_lock_irqsave(&wrp->irq_lock, flags);
+	if (READ_ONCE(wrp->stopping) || READ_ONCE(wrp->recovering) || READ_ONCE(wrp->failed)) {
+		spin_unlock_irqrestore(&wrp->irq_lock, flags);
+		return;
+	}
+	first = !wrp->fault_pending;
+	wrp->fault_pending = true;
+	wrp->fault_flags |= readl(wrp->base + PWRAP_INT_RAW) & PWRAP_ERROR_MASK;
+	spin_unlock_irqrestore(&wrp->irq_lock, flags);
+	if (first)
+		__pm_wakeup_event(wrp->recovery_ws, 1000);
+	mod_delayed_work(system_freezable_wq, &wrp->recovery_work, 0);
+}
+
+static irqreturn_t mt6580_pwrap_irq(int irq, void *data)
+{
+	struct mt6580_pwrap *wrp = data;
+	unsigned long flags;
+	u32 status;
+
+	spin_lock_irqsave(&wrp->irq_lock, flags);
+	status = readl(wrp->base + PWRAP_INT_FLG);
+	if (!status) {
+		spin_unlock_irqrestore(&wrp->irq_lock, flags);
+		return IRQ_NONE;
+	}
+	wrp->irq_count++;
+	wrp->irq_last = status;
+	wrp->irq_raw = readl(wrp->base + PWRAP_INT_RAW);
+	wrp->irq_wdt = readl(wrp->base + PWRAP_WDT_FLG);
+	wrp->irq_signature = readl(wrp->base + PWRAP_SIG_ERRVAL);
+	wrp->irq_wacs = readl(wrp->base + WACS2_RDATA);
+	wrp->fault_flags |= (status | wrp->irq_raw) & PWRAP_ERROR_MASK;
+	/* No WACS access or link reset in hard IRQ context. Mask the source
+	 * until its bounded worker has checked/repaired it, avoiding a storm.
+	 */
+	writel(0, wrp->base + PWRAP_INT_EN);
+	writel(status, wrp->base + PWRAP_INT_CLR);
+	spin_unlock_irqrestore(&wrp->irq_lock, flags);
+	mt6580_pwrap_request_recovery(wrp);
+	return IRQ_HANDLED;
+}
+
+static int mt6580_pwrap_private_vproc(struct mt6580_pwrap *wrp, u32 values[6])
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(vproc_snapshot_regs); i++) {
+		ret = mt6580_pwrap_init_read(wrp, vproc_snapshot_regs[i], &values[i]);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static void mt6580_pwrap_recovery_work(struct work_struct *work)
+{
+	struct mt6580_pwrap *wrp = container_of(to_delayed_work(work),
+					     struct mt6580_pwrap, recovery_work);
+	u32 saved[ARRAY_SIZE(recovery_regs)], causes, status;
+	unsigned int clears = 0, i;
+	unsigned long flags, irqflags;
+	bool rebuild, forced;
+	int ret, before = -ENODATA;
+
+	mutex_lock(&wrp->phase_lock);
+	if (wrp->stopping || !wrp->online)
+		goto unlock;
+	if (system_state < SYSTEM_RUNNING) {
+		mod_delayed_work(system_freezable_wq, &wrp->recovery_work, HZ / 4);
+		goto unlock;
+	}
+	if (system_state != SYSTEM_RUNNING)
+		goto unlock;
+	if (wrp->suspend_phase || wrp->bank_active) {
+		wrp->recovery_deferred++;
+		goto unlock; /* platform finish will queue the pending incident */
+	}
+	__pm_stay_awake(wrp->recovery_ws);
+	/* Wait out the last complete regmap operation, including update_bits.
+	 * Subsequent public callbacks fail transiently; the worker is the
+	 * only serial client until publication below. Do not hold IRQs off over
+	 * calibration, cipher setup, CCF or reset-controller operations.
+	 */
+	spin_lock_irqsave(&wrp->bus_lock, flags);
+	wrp->recovering = true;
+	spin_lock_irqsave(&wrp->irq_lock, irqflags);
+	causes = wrp->fault_flags | (readl(wrp->base + PWRAP_INT_RAW) & PWRAP_ERROR_MASK);
+	writel(0, wrp->base + PWRAP_INT_EN);
+	spin_unlock_irqrestore(&wrp->irq_lock, irqflags);
+	spin_unlock_irqrestore(&wrp->bus_lock, flags);
+	if (wrp->irq > 0)
+		synchronize_irq(wrp->irq);
+	wrp->recovery_attempts++;
+	if (time_before(jiffies, wrp->last_recovery + HZ))
+		wrp->recovery_burst++;
+	else
+		wrp->recovery_burst = 1;
+	wrp->last_recovery = jiffies;
+	forced = wrp->force_rebuild;
+	wrp->force_rebuild = false;
+	ret = mt6580_pwrap_wait(wrp, WACS_IDLE, true, &status, &clears);
+	if (!ret)
+		ret = mt6580_pwrap_signature(wrp);
+	/* WDT-only starvation or a delayed VALID may have recovered already.
+	 * A non-WDT integrity/error flag needs a new two-ended protocol even
+	 * if the fixed read signature happens to be correct now.
+	 */
+	/* Repeated WDT-only incidents must not create an unbounded soft
+	 * recovery/IRQ loop either. Escalate a burst, then the full-rebuild
+	 * rate limit below latches a persistent hardware fault.
+	 */
+	rebuild = forced || wrp->failed || ret || (causes & ~BIT(0)) ||
+		wrp->recovery_burst >= 4;
+	if (!rebuild) {
+		wrp->recovery_soft++;
+		goto publish;
+	}
+	if (!wrp->reset || !wrp->top || !wrp->spi || !wrp->ref) {
+		ret = -EOPNOTSUPP;
+		goto publish;
+	}
+	/* One automatic rebuild per minute, no reset/retry loop on a broken
+	 * physical bus. An explicit administrator request can retry later.
+	 */
+	if (!forced && wrp->recovery_rebuilds &&
+	    time_before(jiffies, wrp->last_rebuild + 60 * HZ)) {
+		ret = -EAGAIN;
+		goto publish;
+	}
+	/* A failed reset quiesces AP registers. Retain the last pre-reset
+	 * configuration for an explicit later retry, not that disabled state.
+	 */
+	if (!wrp->failed) {
+		for (i = 0; i < ARRAY_SIZE(recovery_regs); i++)
+			wrp->recovery_config[i] = readl(wrp->base + recovery_regs[i]);
+		wrp->recovery_config_valid = true;
+	}
+	if (!wrp->recovery_config_valid) {
+		ret = -ENODATA;
+		goto publish;
+	}
+	memcpy(saved, wrp->recovery_config, sizeof(saved));
+	/* A regulator transaction may have completed its SPI write just
+	 * before bus exclusion, while the analog selector is still settling.
+	 * Wait beyond the BSP's maximum 127-step down-ramp (259 us) before
+	 * comparing actual voltage across a reset that must not change rails.
+	 */
+	usleep_range(300, 500);
+	before = mt6580_pwrap_private_vproc(wrp, wrp->recovery_before);
+	wrp->recovery_snapshot_error = before;
+	/* Stop new autonomous status requests, then drain the shared wrapper.
+	 * A broken link may never drain: keep the bounded error as evidence
+	 * and reset with all software clients and SPM commands excluded.
+	 */
+	writel(0, wrp->base + PWRAP_STAUPD_GRPEN);
+	writel(PWRAP_WACS2_ARB, wrp->base + PWRAP_ARB_EN);
+	wrp->recovery_drain_error = readl_poll_timeout_atomic(
+		wrp->base + PWRAP_STAUPD_STA, status,
+		!(status & GENMASK(8, 6)), 10, 10000);
+	if (!wrp->recovery_drain_error)
+		wrp->recovery_drain_error = readl_poll_timeout_atomic(
+			wrp->base + PWRAP_WRAP_STA, status,
+			!(status & (GENMASK(14, 11) | GENMASK(6, 5) | GENMASK(2, 0))),
+			10, 10000);
+	wrp->last_rebuild = jiffies;
+	wrp->recovery_rebuilds++;
+	ret = mt6580_pwrap_cold_init(wrp, wrp->top, wrp->reset, wrp->spi, wrp->ref);
+	if (ret)
+		goto publish;
+	/* Restore slots/ADC routing/arbitration, not old serial/cipher state.
+	 * Background masters are enabled only after their data/configuration.
+	 */
+	writel(0, wrp->base + PWRAP_ARB_EN);
+	writel(0, wrp->base + PWRAP_STAUPD_GRPEN);
+	for (i = 0; i < ARRAY_SIZE(recovery_regs); i++) {
+		if (recovery_regs[i] != PWRAP_ARB_EN && recovery_regs[i] != PWRAP_STAUPD_GRPEN)
+			writel(saved[i], wrp->base + recovery_regs[i]);
+	}
+	for (i = 0; i < ARRAY_SIZE(recovery_regs); i++) {
+		if (recovery_regs[i] == PWRAP_STAUPD_GRPEN || recovery_regs[i] == PWRAP_ARB_EN)
+			writel(saved[i], wrp->base + recovery_regs[i]);
+	}
+	for (i = 0; i < ARRAY_SIZE(recovery_regs); i++)
+		if (readl(wrp->base + recovery_regs[i]) != saved[i]) {
+			ret = -EIO;
+			break;
+		}
+	if (!ret)
+		ret = mt6580_pwrap_private_vproc(wrp, wrp->recovery_after);
+	if (!ret && !before && memcmp(wrp->recovery_before, wrp->recovery_after,
+				      sizeof(wrp->recovery_before)))
+		ret = -EIO;
+	if (!ret)
+		ret = mt6580_pwrap_signature(wrp);
+publish:
+	wrp->recovery_error = ret;
+	if (ret)
+		wrp->recovery_failures++;
+	/* Publish under the same lock used by all public-map callbacks. A
+	 * failed reconstruction stays fail-closed; it never replays the failed
+	 * regulator/IRQ/RTC operation or fabricates that operation's result.
+	 */
+	spin_lock_irqsave(&wrp->bus_lock, flags);
+	spin_lock_irqsave(&wrp->irq_lock, irqflags);
+	if (!ret) {
+		writel(causes, wrp->base + PWRAP_INT_CLR);
+		wrp->fault_flags = 0;
+		wrp->fault_pending = false;
+		writel(wrp->irq > 0 ? PWRAP_IRQ_MASK : 0, wrp->base + PWRAP_INT_EN);
+	}
+	wrp->failed = !!ret;
+	wrp->recovering = false;
+	spin_unlock_irqrestore(&wrp->irq_lock, irqflags);
+	spin_unlock_irqrestore(&wrp->bus_lock, flags);
+	__pm_relax(wrp->recovery_ws);
+	if (ret)
+		dev_err(wrp->dev, "PWRAP recovery failed: %d (flags=%08x)\n", ret, causes);
+	else
+		dev_info(wrp->dev, "PWRAP link recovered (%s, flags=%08x)\n",
+			 rebuild ? "rebuilt" : "resynchronized", causes);
+unlock:
+	mutex_unlock(&wrp->phase_lock);
+}
+
+static ssize_t recovery_state_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct mt6580_pwrap *wrp = dev_get_drvdata(dev);
+	unsigned long flags;
+	ssize_t len;
+
+	mutex_lock(&wrp->phase_lock);
+	spin_lock_irqsave(&wrp->irq_lock, flags);
+	len = sysfs_emit(buf,
+		"irq=%d count=%u last=%08x raw=%08x wdt=%08x signature=%08x wacs=%08x\n"
+		"pending=%u recovering=%u failed=%u attempts=%u soft=%u rebuilds=%u failures=%u deferred=%u blocked=%u error=%d drain_error=%d\n"
+		"vproc_snapshot_error=%d before=%04x/%04x/%04x/%04x/%04x/%04x after=%04x/%04x/%04x/%04x/%04x/%04x\n",
+		wrp->irq, wrp->irq_count, wrp->irq_last, wrp->irq_raw, wrp->irq_wdt,
+		wrp->irq_signature, wrp->irq_wacs, wrp->fault_pending,
+		wrp->recovering, wrp->failed, wrp->recovery_attempts, wrp->recovery_soft,
+		wrp->recovery_rebuilds, wrp->recovery_failures, wrp->recovery_deferred,
+		READ_ONCE(wrp->blocked), wrp->recovery_error, wrp->recovery_drain_error,
+		wrp->recovery_snapshot_error,
+		wrp->recovery_before[0], wrp->recovery_before[1], wrp->recovery_before[2],
+		wrp->recovery_before[3], wrp->recovery_before[4], wrp->recovery_before[5],
+		wrp->recovery_after[0], wrp->recovery_after[1], wrp->recovery_after[2],
+		wrp->recovery_after[3], wrp->recovery_after[4], wrp->recovery_after[5]);
+	spin_unlock_irqrestore(&wrp->irq_lock, flags);
+	mutex_unlock(&wrp->phase_lock);
+	return len;
+}
+
+static ssize_t recover_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct mt6580_pwrap *wrp = dev_get_drvdata(dev);
+	unsigned int value;
+	unsigned long flags;
+	int ret = kstrtouint(buf, 0, &value);
+
+	if (ret || (value != 1 && value != 2))
+		return -EINVAL;
+	mutex_lock(&wrp->phase_lock);
+	if (wrp->stopping || wrp->suspend_phase || wrp->bank_active ||
+	    system_state != SYSTEM_RUNNING) {
+		ret = -EBUSY;
+	} else {
+		/* Permit an explicit retry of a latched failure; normal clients
+		 * remain blocked until the worker publishes a healthy link.
+		 */
+		wrp->force_rebuild = value == 2;
+		spin_lock_irqsave(&wrp->bus_lock, flags);
+		spin_lock(&wrp->irq_lock);
+		wrp->fault_pending = true;
+		spin_unlock(&wrp->irq_lock);
+		spin_unlock_irqrestore(&wrp->bus_lock, flags);
+		__pm_wakeup_event(wrp->recovery_ws, 1000);
+		mod_delayed_work(system_freezable_wq, &wrp->recovery_work, 0);
+	}
+	mutex_unlock(&wrp->phase_lock);
+	return ret ? ret : count;
+}
+
+static void mt6580_pwrap_stop(struct mt6580_pwrap *wrp)
+{
+	WRITE_ONCE(wrp->stopping, true);
+	writel(0, wrp->base + PWRAP_INT_EN);
+	if (wrp->irq > 0)
+		synchronize_irq(wrp->irq);
+	cancel_delayed_work_sync(&wrp->recovery_work);
+	writel(0, wrp->base + PWRAP_INT_EN);
+}
+
+static void mt6580_pwrap_cleanup(void *data)
+{
+	struct mt6580_pwrap *wrp = data;
+
+	mt6580_pwrap_stop(wrp);
+	wakeup_source_unregister(wrp->recovery_ws);
 }
 
 static void mt6580_pwrap_put_top(void *data)
@@ -1068,6 +1505,7 @@ static int mt6580_pwrap_probe(struct platform_device *pdev)
 	struct clk_bulk_data *clks;
 	struct mt6580_pwrap *wrp;
 	struct regmap *regmap;
+	struct regmap_config config = mt6580_pwrap_regmap;
 	unsigned int before[ARRAY_SIZE(vproc_snapshot_regs)], after[ARRAY_SIZE(vproc_snapshot_regs)];
 	int ret;
 
@@ -1077,8 +1515,14 @@ static int mt6580_pwrap_probe(struct platform_device *pdev)
 	wrp->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(wrp->base))
 		return PTR_ERR(wrp->base);
+	wrp->dev = &pdev->dev;
+	wrp->irq = -1;
+	INIT_DELAYED_WORK(&wrp->recovery_work, mt6580_pwrap_recovery_work);
 	mutex_init(&wrp->phase_lock);
+	spin_lock_init(&wrp->bus_lock);
+	spin_lock_init(&wrp->irq_lock);
 	spin_lock_init(&wrp->stats_lock);
+	wrp->recovery_snapshot_error = -ENODATA;
 	wrp->init_stage = "firmware";
 	if (native) {
 		reset = devm_reset_control_get_exclusive(&pdev->dev, "spi");
@@ -1100,10 +1544,20 @@ static int mt6580_pwrap_probe(struct platform_device *pdev)
 	ret = devm_clk_bulk_get_all_enabled(&pdev->dev, &clks);
 	if (ret < 0)
 		return dev_err_probe(&pdev->dev, ret, "PWRAP clocks unavailable\n");
+	/* Firmware can leave INT_EN=0x7ffffffd. Mask it before Linux takes
+	 * ownership, including the retained-link path. Never expose an IRQ
+	 * source without a registered handler.
+	 */
+	writel(0, wrp->base + PWRAP_INT_EN);
+	wrp->top = top;
+	wrp->reset = reset;
+	wrp->spi = spi;
+	wrp->ref = ref;
 	wrp->firmware_initialized = !!(readl(wrp->base + WACS2_RDATA) & WACS_INIT_DONE);
 	if (!native && !wrp->firmware_initialized)
 		return dev_err_probe(&pdev->dev, -ENODEV, "firmware PWRAP is not initialized\n");
-	regmap = devm_regmap_init(&pdev->dev, NULL, wrp, &mt6580_pwrap_regmap);
+	config.lock_arg = wrp;
+	regmap = devm_regmap_init(&pdev->dev, NULL, wrp, &config);
 	if (IS_ERR(regmap))
 		return PTR_ERR(regmap);
 	wrp->regmap = regmap;
@@ -1132,9 +1586,40 @@ static int mt6580_pwrap_probe(struct platform_device *pdev)
 	ret = mt6580_pwrap_link_check(wrp);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "MT6350 DEW read test failed\n");
-	dev_info(&pdev->dev, "firmware link verified (DEW=%04x)\n", MT6350_READ_TEST_VALUE);
+	dev_info(&pdev->dev, "link verified (DEW=%04x)\n", MT6350_READ_TEST_VALUE);
+	wrp->recovery_ws = wakeup_source_register(&pdev->dev, "mt6580-pwrap-recovery");
+	if (!wrp->recovery_ws)
+		return -ENOMEM;
+	ret = platform_get_irq_optional(pdev, 0);
+	if (ret <= 0 && (native || (ret != -ENXIO && ret != -ENODATA))) {
+		wakeup_source_unregister(wrp->recovery_ws);
+		return ret ?: -ENXIO;
+	}
+	if (ret > 0) {
+		wrp->irq = ret;
+		ret = devm_request_irq(&pdev->dev, wrp->irq, mt6580_pwrap_irq, 0,
+				       dev_name(&pdev->dev), wrp);
+		if (ret) {
+			wakeup_source_unregister(wrp->recovery_ws);
+			return dev_err_probe(&pdev->dev, ret, "PWRAP IRQ unavailable\n");
+		}
+	}
+	/* Registered after the IRQ so cleanup stops work before freeing it;
+	 * children registered below are removed before this action runs.
+	 */
+	ret = devm_add_action_or_reset(&pdev->dev, mt6580_pwrap_cleanup, wrp);
+	if (ret)
+		return ret;
 	platform_set_drvdata(pdev, wrp);
-	return devm_of_platform_populate(&pdev->dev);
+	ret = devm_of_platform_populate(&pdev->dev);
+	if (ret)
+		return ret;
+	WRITE_ONCE(wrp->online, true);
+	if (wrp->irq > 0)
+		writel(PWRAP_IRQ_MASK, wrp->base + PWRAP_INT_EN);
+	if (readl(wrp->base + PWRAP_INT_RAW) & PWRAP_ERROR_MASK)
+		mt6580_pwrap_request_recovery(wrp);
+	return 0;
 }
 
 static const struct of_device_id mt6580_pwrap_match[] = {
@@ -1144,8 +1629,15 @@ static const struct of_device_id mt6580_pwrap_match[] = {
 };
 MODULE_DEVICE_TABLE(of, mt6580_pwrap_match);
 
+static void mt6580_pwrap_remove(struct platform_device *pdev)
+{
+	mt6580_pwrap_stop(platform_get_drvdata(pdev));
+}
+
 static struct platform_driver mt6580_pwrap_driver = {
 	.probe = mt6580_pwrap_probe,
+	.remove = mt6580_pwrap_remove,
+	.shutdown = mt6580_pwrap_remove,
 	.driver = {
 		.name = "mt6580-firmware-pwrap",
 		.of_match_table = mt6580_pwrap_match,
@@ -1163,7 +1655,9 @@ bool mt6580_pwrap_infra_ready(struct device *dev)
 	wrp = dev_get_drvdata(dev);
 	status = readl(wrp->base + WACS2_RDATA);
 	return READ_ONCE(wrp->suspend_phase) && (status & WACS_INIT_DONE) &&
-		FIELD_GET(WACS_FSM, status) == WACS_IDLE;
+		FIELD_GET(WACS_FSM, status) == WACS_IDLE &&
+		!READ_ONCE(wrp->fault_pending) && !READ_ONCE(wrp->recovering) &&
+		!READ_ONCE(wrp->failed);
 }
 EXPORT_SYMBOL_GPL(mt6580_pwrap_infra_ready);
 module_platform_driver(mt6580_pwrap_driver);

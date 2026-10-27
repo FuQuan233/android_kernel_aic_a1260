@@ -362,6 +362,7 @@
 	pwrap: pmic-wrap@1000f000 {
 		compatible = "mediatek,mt6580-pwrap";
 		reg = <0 0x1000f000 0 0x1000>;
+		interrupts = <GIC_SPI 108 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&topckgen CLK_MT6580_TOP_PMIC_SPI>,
 			 <&topckgen CLK_MT6580_TOP_PMIC_26M>;
 		clock-names = "spi", "26m";

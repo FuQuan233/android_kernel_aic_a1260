@@ -4,15 +4,15 @@ Contact:	FuQuan <i@fuquan.moe>
 Description:
 		Read-only MT6580 firmware PWRAP link diagnostics. Reading the
 		attribute performs one serialized, side-effect-free MT6350 DEW
-		read test at 0x018c, expecting 0x5aa5. It never resets the bus,
-		recalibrates timing, or retries a failed PMIC command.
+		read test at 0x018c, expecting 0x5aa5. It never forces a reset or retries a failed PMIC command.
+		A failed check can queue the bounded online recovery worker.
 
 		init_done and wacs2 report a current raw WACS2 status snapshot.
-		source reports kernel if this probe initialized the link, or
+		source reports kernel if the kernel initialized/rebuilt the link, or
 		firmware if the existing setup was retained. firmware_at_probe
 		records the original INIT_DONE flag. scan_mask is the 24-bit
 		successful sampling window and sample its selected center index;
-		both are zero when no scan ran. stage records the initialization
+		both are zero when no scan ran. A rebuild replaces the scan information. stage records the initialization
 		stage (firmware for a retained link, complete for kernel init).
 		read_test/error report the last test result; checks/failures
 		count tests since probe. Counters wrap at 32 bits. reads/writes
@@ -31,5 +31,50 @@ Description:
 
 		Counters and the saved failure are snapshotted under a spinlock;
 		the live WACS2 status is sampled separately and can change as
-		other PMIC users run. The attribute makes no cold-initialization
-		or destructive-recovery capability available to userspace.
+		other PMIC users run. The attribute itself never forces destructive recovery;
+		control and recovery state are separate attributes below.
+
+What:		/sys/bus/platform/devices/.../recovery_state
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Read-only state of MT6580 bounded online PWRAP recovery. Reading
+		waits for the SPM/recovery phase mutex and performs no hardware
+		transaction. irq is the Linux IRQ, negative when not supplied.
+		count/last/raw/wdt/signature/wacs snapshot AP error IRQs. Raw flags
+		are generic except watchdog bit0; the remaining layout is not
+		claimed as a decoded CRC syndrome.
+
+		pending/recovering/failed indicate queued, running or latched
+		failed recovery. attempts/soft/rebuilds/failures/deferred count
+		worker attempts, resynchronizations, full serial resets, failures
+		and live SPM-phase deferrals. blocked counts rejected public-map
+		callbacks; they issue no command and are not transaction errors.
+		error is the last recovery result; drain_error is the last full
+		rebuild's bounded autonomous-wrapper drain result. A broken bus
+		can fail to drain but subsequently reconstruct successfully.
+
+		vproc_snapshot_error and before/after refer to the latest full
+		rebuild, not a soft inspection. -ENODATA initially means no full
+		rebuild was attempted. Six hex fields are PMIC 0x216/21e/220/222/
+		224/230 (control, selectors/actual and transition). A failed before
+		read is recorded without claiming a successful comparison.
+		Other error fields retain kernel errno. Counters wrap at 32 bits.
+
+What:		/sys/bus/platform/devices/.../recover
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Root-writable, asynchronous PWRAP recovery request. Write 1 to
+		inspect/resynchronize the link, allowing a necessary full rebuild;
+		write 2 to force full two-ended serial reconstruction, bypassing
+		the automatic once-per-minute limit. Read recovery_state for the
+		result. Invalid values return EINVAL. Live SPM voltage/command
+		ownership, shutdown or a system not yet running returns EBUSY.
+
+		A native binding with reset/clock suppliers is required for a full
+		rebuild; otherwise that attempt records EOPNOTSUPP. Public clients
+		are excluded, saved slots/configuration restored and verified,
+		and readable VPROC snapshots compared. No failed original command
+		is replayed. A failed recovery remains latched; an administrator
+		can explicitly request another attempt after resolving the cause.

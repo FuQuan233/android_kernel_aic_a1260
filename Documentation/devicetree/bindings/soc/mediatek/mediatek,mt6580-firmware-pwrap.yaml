@@ -14,7 +14,8 @@ description: |
   compatible requires an initialized link and never initializes or resets it.
   The mt6580-pwrap compatible can initialize an unconfigured link before any
   PMIC consumers are registered, using the TOPRGU SPI reset and TOPCKGEN
-  gates. An already initialized link is retained during normal startup.
+  gates. It can also reconstruct a failed link after excluding public PMIC
+  requests and live SPM voltage/command ownership. An already initialized link is retained during normal startup.
   When clocks are supplied, they remain enabled for PMIC IRQ, regulator and
   final power-off register access throughout the wrapper's lifetime.
 
@@ -25,6 +26,9 @@ properties:
       - mediatek,mt6580-pwrap
   reg:
     maxItems: 1
+  interrupts:
+    maxItems: 1
+    description: PWRAP error/watchdog interrupt, SPI 108, level high
   clocks:
     items:
       - description: AP PMIC SPI clock using the firmware-selected source
@@ -72,6 +76,7 @@ allOf:
           const: mediatek,mt6580-pwrap
     then:
       required:
+        - interrupts
         - clocks
         - clock-names
         - resets
