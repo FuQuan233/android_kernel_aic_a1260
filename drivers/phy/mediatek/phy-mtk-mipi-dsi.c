@@ -133,6 +133,9 @@ static int mtk_mipi_tx_probe(struct platform_device *pdev)
 	if (IS_ERR(ref_clk))
 		return dev_err_probe(dev, PTR_ERR(ref_clk),
 				     "Failed to get reference clock\n");
+	if (mipi_tx->driver_data->mt6580 && !clk_get_rate(ref_clk))
+		return dev_err_probe(dev, -EPROBE_DEFER,
+				     "MIPI reference clock parent unavailable\n");
 
 	ret = of_property_read_u32(dev->of_node, "drive-strength-microamp",
 				   &mipi_tx->mipitx_drive);
@@ -174,7 +177,9 @@ static int mtk_mipi_tx_probe(struct platform_device *pdev)
 
 	mipi_tx->dev = dev;
 
-	mtk_mipi_tx_get_calibration_datal(mipi_tx);
+	/* The three-word impedance layout is not used by the MT6580 backend. */
+	if (!mipi_tx->driver_data->mt6580)
+		mtk_mipi_tx_get_calibration_datal(mipi_tx);
 
 	return devm_of_clk_add_hw_provider(dev, of_clk_hw_simple_get, &mipi_tx->pll_hw);
 }

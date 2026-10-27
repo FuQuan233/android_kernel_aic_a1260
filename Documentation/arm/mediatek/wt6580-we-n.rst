@@ -3108,3 +3108,25 @@ to #126. The temporary logger/script were removed, and it had installed no
 wake alarm or wake lock. Runtime summary, cable and suspend details are in
 battery-stock-1850/runtime-summary.json, cable.log, cable-status.txt,
 suspend-details.txt and after-cable.txt.
+
+MIPI26 reference dependency and board-rail audit (build #127)
+-----------------------------------------------------------
+
+The PHY now consumes the real TOP bit4 -> AP_PLL_CON0 bit5 -> MIPI PLL
+reference chain. The old image left both reference gates on after display
+off. New CCF prepare/unprepare gates preserve the factory order, retain
+LK scanout until handover and close on the final PHY release. Three screen
+cycles produced actual 1/0/1 gate states, no reference leak and zero RDMA
+underflows/abnormal events. The user confirmed picture/touch before and
+after physical unplug/deep/replug, including automatic screen-on. Android
+deep stopped clocks for 42.626483335 seconds and restored CPU0/L2, MAINPLL,
+USB and display; one initial charging-event freezer abort preceded the
+successful automatic retry, with no device resume failure.
+
+See mt6580-mipi26m.rst for implementation ordering, the current-LK versus
+firmware comparison, Evidence IDs and the limits of the measurement. The
+current kernel and current LK both have null panel power callbacks; touch
+VCC is confirmed VGP1/2.8V, while touch IOVCC and physical panel supplies
+remain unproven. They were not guessed from a matching nominal voltage.
+DSI engine/digital parents and undocumented D14 consumers remain tracked.
+The standard product boot/kernel are #127; normal ADB startup stays shell.

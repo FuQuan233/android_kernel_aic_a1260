@@ -212,6 +212,110 @@ static struct clk_hw *mt6580_register_pll(struct device *dev, void __iomem *con,
 	return ret ? ERR_PTR(ret) : &pll->hw;
 }
 
+/* The PHY PLL powers up in .prepare, so its reference gates must also use
+ * prepare callbacks. Ordinary enable callbacks would run after PLL setup
+ * and disable the reference before the PLL's unprepare callback.
+ */
+struct mt6580_mipi26m_clk {
+	struct clk_hw hw;
+	struct device *dev;
+	void __iomem *base;
+	bool top;
+};
+
+static int mt6580_mipi26m_is_prepared(struct clk_hw *hw)
+{
+	struct mt6580_mipi26m_clk *gate = container_of(hw, struct mt6580_mipi26m_clk, hw);
+	u32 value = readl(gate->base + (gate->top ? 0x20 : 0));
+
+	return !!(value & BIT(gate->top ? 4 : 5));
+}
+
+static int mt6580_mipi26m_prepare(struct clk_hw *hw)
+{
+	struct mt6580_mipi26m_clk *gate = container_of(hw, struct mt6580_mipi26m_clk, hw);
+	struct clk_hw *parent = clk_hw_get_parent(hw);
+	unsigned long flags;
+	u32 value;
+
+	/* APMIXED registers before TOPCKGEN; do not use its temporary orphan. */
+	if (!parent || !clk_hw_get_rate(parent))
+		return -EPROBE_DEFER;
+
+	spin_lock_irqsave(&mt6580_usb_clk_lock, flags);
+	if (gate->top) {
+		/* MIPI_26M_DBG_EN is active high, unlike the adjacent gate bits. */
+		writel(BIT(4), gate->base + 0x50);
+		value = readl(gate->base + 0x20);
+	} else {
+		value = readl(gate->base);
+		writel(value | BIT(5), gate->base);
+		value = readl(gate->base);
+	}
+	spin_unlock_irqrestore(&mt6580_usb_clk_lock, flags);
+
+	if (!(value & BIT(gate->top ? 4 : 5))) {
+		dev_err(gate->dev, "%s reference enable did not latch\n", clk_hw_get_name(hw));
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static void mt6580_mipi26m_unprepare(struct clk_hw *hw)
+{
+	struct mt6580_mipi26m_clk *gate = container_of(hw, struct mt6580_mipi26m_clk, hw);
+	unsigned long flags;
+	u32 value;
+
+	spin_lock_irqsave(&mt6580_usb_clk_lock, flags);
+	if (gate->top) {
+		writel(BIT(4), gate->base + 0x80);
+		value = readl(gate->base + 0x20);
+	} else {
+		value = readl(gate->base);
+		writel(value & ~BIT(5), gate->base);
+		value = readl(gate->base);
+	}
+	spin_unlock_irqrestore(&mt6580_usb_clk_lock, flags);
+
+	if (value & BIT(gate->top ? 4 : 5))
+		dev_err(gate->dev, "%s reference disable did not latch\n", clk_hw_get_name(hw));
+}
+
+static const struct clk_ops mt6580_mipi26m_ops = {
+	.prepare = mt6580_mipi26m_prepare,
+	.unprepare = mt6580_mipi26m_unprepare,
+	.is_prepared = mt6580_mipi26m_is_prepared,
+	.is_enabled = mt6580_mipi26m_is_prepared,
+};
+
+static struct clk_hw *mt6580_register_mipi26m(struct device *dev,
+					   void __iomem *base, bool top)
+{
+	const char *parent = top ? "dummy26m" : "mt6580_mipi26m_top";
+	struct clk_init_data init = {
+		.name = top ? "mt6580_mipi26m_top" : "mt6580_mipi26m",
+		.ops = &mt6580_mipi26m_ops,
+		.parent_names = &parent,
+		.num_parents = 1,
+		/* Preserve LK scanout until the PHY explicitly takes ownership. */
+		.flags = CLK_IGNORE_UNUSED,
+	};
+	struct mt6580_mipi26m_clk *gate;
+	int ret;
+
+	gate = devm_kzalloc(dev, sizeof(*gate), GFP_KERNEL);
+	if (!gate)
+		return ERR_PTR(-ENOMEM);
+	gate->dev = dev;
+	gate->base = base;
+	gate->top = top;
+	gate->hw.init = &init;
+	ret = devm_clk_hw_register(dev, &gate->hw);
+	return ret ? ERR_PTR(ret) : &gate->hw;
+}
+
 static const struct mtk_gate_regs mt6580_mfg_regs = {
 	.sta_ofs = 0, .set_ofs = 4, .clr_ofs = 8,
 };
@@ -743,14 +847,14 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	struct clk_hw *source;
 	void __iomem *base;
 	bool top = of_device_is_compatible(dev->of_node, "mediatek,mt6580-topckgen");
-	unsigned int count = 5;
+	unsigned int count = 6;
 	unsigned int i;
 	int ret;
 
 	if (of_device_is_compatible(dev->of_node, "mediatek,mt6580-mfgcfg"))
 		return mtk_clk_simple_probe(pdev);
 	if (top)
-		count = 19;
+		count = 20;
 
 	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
@@ -846,6 +950,7 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 		data->hws[CLK_MT6580_TOP_SPM] = devm_clk_hw_register_gate(dev,
 			"mt6580_spm", "dummy26m", CLK_IS_CRITICAL, base + 0x24, 26,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
+		data->hws[CLK_MT6580_TOP_MIPI26M] = mt6580_register_mipi26m(dev, base, true);
 
 	} else {
 		data->hws[CLK_MT6580_APMIXED_MAINPLL] =
@@ -869,6 +974,8 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 		data->hws[CLK_MT6580_APMIXED_USB48M] = devm_clk_hw_register_gate(dev,
 			"mt6580_usb48m", "mt6580_usb_48m_src", 0,
 			base + 0x140, 28, 0, &mt6580_usb_clk_lock);
+		/* Parent preparation opens TOP first; unprepare closes APMIXED first. */
+		data->hws[CLK_MT6580_APMIXED_MIPI26M] = mt6580_register_mipi26m(dev, base, false);
 	}
 	for (i = 0; i < count; i++)
 		if (IS_ERR(data->hws[i]))

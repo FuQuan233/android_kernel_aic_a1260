@@ -668,6 +668,7 @@
 			reset-gpios = <&pio 2 GPIO_ACTIVE_LOW>;
 			pinctrl-names = "default";
 			pinctrl-0 = <&touch_pins>;
+			/* The BSP switches VGP1 only; a separate IO rail is unconfirmed. */
 			vcc-supply = <&vtouch>;
 			touchscreen-size-x = <480>;
 			touchscreen-size-y = <800>;

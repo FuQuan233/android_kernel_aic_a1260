@@ -176,7 +176,7 @@
 	mipi_tx: phy@14018000 {
 		compatible = "mediatek,mt6580-mipi-tx";
 		reg = <0 0x14018000 0 0x1000>;
-		clocks = <&uart_clk>;
+		clocks = <&apmixedsys CLK_MT6580_APMIXED_MIPI26M>;
 		clock-output-names = "mt6580_mipi_tx";
 		#clock-cells = <0>;
 		#phy-cells = <0>;
