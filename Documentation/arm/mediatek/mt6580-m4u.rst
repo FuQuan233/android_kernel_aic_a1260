@@ -119,3 +119,9 @@ SMI source for genpd SRAM handshakes, including noirq restore. Two further
 deep cycles and four LARB1 runtime cycles passed with no display/M4U errors.
 See mt6580-larb1.rst for the #169 failure, #170 correction, qualification and
 remaining stock decoder interface work. Standard boot/kernel are now #170.
+
+Build #178 declares the codec memory consumer alongside RDMA in one M4U
+group. ARM automatic DMA setup shares its allocator/page table across those
+members and retains kernel DMA ownership. Real imported and coherent
+buffers and stock instance Create/Release are qualified separately in
+mt6580-vcodec-buffers.rst; codec jobs remain unimplemented.

@@ -1,0 +1,11 @@
+What:           /sys/devices/platform/1500b000.video-codec/state
+Date:           October 2026
+Contact:        FuQuan233
+Description:
+                Read-only codec buffer bridge counters: successful coherent
+                allocations and DMA-BUF imports, cumulative VMA mappings
+                (including fork/split), and currently live VMAs, buffers and
+                page-rounded charged bytes. A released handle with an active
+                coherent mapping still counts as live until its last unmap.
+                Counters are individually sampled. Reading does not access
+                MMIO, enable VCODEC clocks, or submit a codec DMA operation.

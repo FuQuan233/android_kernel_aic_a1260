@@ -1,0 +1,48 @@
+MT6580 private ARM32 decoder buffer preparation
+===============================================
+
+This is a privileged bring-up tool, not an Android media HAL. Do not install
+its interposer or legacy dependencies in /system or /vendor. The stock
+libraries must come from the user's own firmware; none are redistributed.
+
+Build with an Android ARM32 NDK compiler, for example:
+
+  make CC=/absolute/path/to/armv7a-linux-androideabi28-clang
+
+Enable CONFIG_MT6580_VCODEC and the board's M4U/LARB1 codec node. The native
+/dev/mt6580-vcodec interface requires root plus CAP_SYS_RAWIO. buffer-check
+uses a real system DMA heap import and a coherent allocation. It checks CPU
+cache API calls, owned handles, forked mappings and memory survival after
+RELEASE/close; it does not submit a decoder DMA job.
+
+For stock-create-check, copy only the required stock driver/dependencies and
+coherent legacy C++ runtime into a private /data/local/tmp directory. The
+loader must resolve them through LD_LIBRARY_PATH; preload the built bridge:
+
+  LD_LIBRARY_PATH=/data/local/tmp/private-codec/lib \
+  LD_PRELOAD=/data/local/tmp/private-codec/lib/libval-buffer-bridge.so \
+  /data/local/tmp/private-codec/stock-create-check \
+  /data/local/tmp/private-codec/lib/libvcodecdrv.so
+
+The bridge implements the recovered 96-byte VAL memory descriptor: normal
+memory uses system DMA-BUF plus an owned real M4U IOVA; type3 uses coherent
+DMA plus opaque mmap tokens. Only the low word of input ARM32 unions is
+consumed, matching stock callers. Alignment up to 4096 is supported; larger
+or non-power-of-two requests fail. MVA lookup accepts only recorded ranges,
+a live InitMVA handle and nonsecure/noncoherent decoder configuration.
+It rejects unknown external VA, rather than pinning arbitrary user pages.
+
+Legacy flush/invalidate optype1 synchronizes the allocation containing the
+range; optype0 synchronizes all tracked allocations. Every call performs the
+real DMA_BUF_IOCTL_SYNC for streaming imports; coherent memory uses a CPU
+barrier. This is not a hardware job fence. Correct cache ownership around
+real decode and integration with externally allocated output frames remain
+unqualified. Fork children cannot call the inherited bridge or release their
+parent's handles. The probe is intended for a private process with controlled
+library lifetime, not concurrent plugin unloading in a media service.
+
+Expected success reports four VAL memory kinds and 32 H.264 Create/Release
+rounds, with corresponding VAL_ALLOC lines and kernel live counters returning
+to zero. This does not call eVDecDrvInit, decode a bitstream, register a codec
+with Android, or replace missing /dev/Vcodec controls. See
+Documentation/arm/mediatek/mt6580-vcodec-buffers.rst for qualification.

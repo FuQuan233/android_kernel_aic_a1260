@@ -3410,3 +3410,16 @@ regressions. Standard boot/kernel are #170. See mt6580-larb1.rst for source,
 retained failure evidence and exact limits: the stock decoder loads and
 answers metadata queries in isolation, but actual decoder jobs, ION/Vcodec
 compatibility and Android media integration are still pending.
+
+Codec buffer preparation (#178)
+-------------------------------
+
+The codec memory consumer now shares the display's real ARM32 M4U domain
+and IOVA allocator. An ownership-aware privileged DMA-BUF/coherent bridge
+passes native mapping/VMA lifetime checks and the stock library's H.264
+Create/Release, including regression after two full deep cycles. Actual
+Init/decode/IRQ protocol and Android hardware media integration remain
+pending. See mt6580-vcodec-buffers.rst for exact qualifications, the initial
+single-device attach and pre-probe ownership failures, and the alarmtimer
+suspend cancellation retained in the final run. Standard boot/kernel are
+#178; system/vendor media libraries remain unchanged.

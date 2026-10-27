@@ -171,6 +171,18 @@
 		power-domains = <&scpsys MT6580_POWER_DOMAIN_ISP>;
 	};
 
+	vcodec: video-codec@1500b000 {
+		compatible = "mediatek,mt6580-vcodec";
+		reg = <0 0x1500b000 0 0x2000>;
+		interrupts = <GIC_SPI 137 IRQ_TYPE_LEVEL_LOW>;
+		clocks = <&imgsys CLK_MT6580_IMG_VCODEC>;
+		clock-names = "vcodec";
+		power-domains = <&scpsys MT6580_POWER_DOMAIN_ISP>;
+		iommus = <&m4u M4U_PORT_VENC_BSDMA_VDEC_POST0>,
+			 <&m4u M4U_PORT_VENC_CDMA_VDEC_CDMA>,
+			 <&m4u M4U_PORT_VENC_REC_VDEC_WDMA>;
+	};
+
 	rdma0: rdma@14009000 {
 		compatible = "mediatek,mt6580-disp-rdma";
 		reg = <0 0x14009000 0 0x1000>;

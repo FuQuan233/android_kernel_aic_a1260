@@ -670,6 +670,14 @@ config PKVM_IOMMU_TEMPLATE
 
 		Say N here unless you know what you are doing.
 
+config MT6580_VCODEC
+	bool "MediaTek MT6580 codec DMA buffer bridge"
+	depends on ARM_DMA_USE_IOMMU && OF && MTK_IOMMU=y && DMA_SHARED_BUFFER
+	help
+	  Provide privileged, per-file DMA-BUF imports and coherent allocations
+	  for MT6580 codec bring-up. Requires a real M4U DMA domain. This only
+	  prepares buffers; it does not program or run the video codec engine.
+
 source "drivers/misc/c2port/Kconfig"
 source "drivers/misc/eeprom/Kconfig"
 source "drivers/misc/cb710/Kconfig"

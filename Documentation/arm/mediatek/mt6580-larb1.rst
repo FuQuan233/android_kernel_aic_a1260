@@ -105,3 +105,9 @@ hardware; returning success from a dummy wait would be incorrect. Then a
 known bitstream must be decoded and frames checked, before integrating a
 modern Android codec service. MT8173 V4L2 compatibility is not assumed.
 Physical current, fault injection and actual video decoding remain untested.
+
+The #178 buffer-preparation follow-up is documented in
+mt6580-vcodec-buffers.rst. It adds real DMA-BUF/coherent mappings and passes
+stock H.264 Create/Release in a private process. Legacy control/IRQ and
+actual decode remain pending; the earlier no-codec-node statements describe
+the #170 stage only.
