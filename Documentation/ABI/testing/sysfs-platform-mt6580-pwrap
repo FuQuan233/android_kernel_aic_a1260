@@ -1,0 +1,29 @@
+What:		/sys/bus/platform/devices/.../link_state
+Date:		October 2026
+Contact:	FuQuan <i@fuquan.moe>
+Description:
+		Read-only MT6580 firmware PWRAP link diagnostics. Reading the
+		attribute performs one serialized, side-effect-free MT6350 DEW
+		read test at 0x018c, expecting 0x5aa5. It never resets the bus,
+		recalibrates timing, or retries a failed PMIC command.
+
+		init_done and wacs2 report a current raw WACS2 status snapshot.
+		read_test/error report the last test result; checks/failures
+		count tests since probe. Counters wrap at 32 bits. reads/writes
+		count attempted transactions, including failures and read tests.
+		errors/timeouts/init_lost count transport failures, timeout
+		failures, and failures with INIT_DONE absent. stale_valid_clears
+		counts acknowledgements of VALID seen before a new command;
+		it does not prove that every acknowledgement followed a timeout.
+
+		last_error/reg/write/stage/status retain the latest failed
+		transport operation even after later successes. Stage 0 waits
+		for idle before issuing a command, stage 1 waits for a read
+		result, and stage 2 waits for write completion. With no recorded
+		failure these fields are zero. A signature mismatch increments
+		test failures, not transport errors.
+
+		Counters and the saved failure are snapshotted under a spinlock;
+		the live WACS2 status is sampled separately and can change as
+		other PMIC users run. The attribute makes no cold-initialization
+		or destructive-recovery capability available to userspace.

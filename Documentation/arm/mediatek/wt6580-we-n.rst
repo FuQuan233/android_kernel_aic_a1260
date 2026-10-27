@@ -3130,3 +3130,46 @@ VCC is confirmed VGP1/2.8V, while touch IOVCC and physical panel supplies
 remain unproven. They were not guessed from a matching nominal voltage.
 DSI engine/digital parents and undocumented D14 consumers remain tracked.
 The standard product boot/kernel are #127; normal ADB startup stays shell.
+
+PWRAP late-result recovery and link checks (build #129)
+-------------------------------------------------------
+
+The retained-firmware WACS2 driver now acknowledges a late previous read
+result throughout its idle wait, checks INIT_DONE on each poll, and returns
+bounded errors without replaying commands. Probe, suspend preparation and
+post-restoration checks require MT6350 DEW 0x018c=0x5aa5. A read-only
+link_state attribute records checks, failed transactions and stale-result
+acknowledgements. Atomic access for final power-off is preserved.
+
+The exact old BSP idle/ready waits and read-test support this normal path.
+Its full cold initialization resets both wrapper and SPI slave, scans
+timing, changes DIO/cipher/CRC and lacks complete failure rollback. It has
+not been installed as a live timeout reset; independent cold startup is
+still pending. See mt6580-pwrap-link.rst for source details and limits.
+
+A host fault harness compiles the actual driver transaction functions and
+the kernel atomic polling macros with latched-VALID MMIO. It reproduces
+the previous driver's timeout and passes nine repaired-path scenarios with
+ASAN/UBSAN, covering late completion, timeout, initialization loss and no
+command replay. These are simulated faults, not destructive hardware tests.
+
+Build #129 booted Android with ordinary shell ADB, four CPUs and default
+deep. All seven CPU frequencies from 604500 to 1300000 kHz matched their
+requests; VPROC ranged from 1150 to 1300 mV and normal schedutil/limits
+were restored. Two explicit RTC deep intervals stopped clocks for
+9.202197294 and 9.242877378 seconds; an additional automatic interval after
+cleanup lasted 24.754382505 seconds. Final statistics were three successes,
+zero failures, CPU0/L2 cold recoveries three, MAINPLL down/up three/three,
+and zero PWRAP/SPM restoration error. The 8 MiB RAM SHA256 matched.
+
+The post-reconnect link snapshot recorded 33036 read attempts, 6727 write
+attempts, 23 passing signature checks, and zero transport error, timeout,
+initialization loss or stale-result acknowledgement. No real bus fault was
+observed, so the hardware recovery branch itself is not claimed tested.
+Battery/temperature/RTC reads and 500000 uA USB input limit were normal;
+display output resumed with zero RDMA underflow/abnormal events. ADB
+returned automatically and was explicitly returned to shell after checks.
+Test files, alarm and wake lock were cleaned. Standard product boot/kernel
+are now boot-pwrap-link.img/kernel-pwrap-link, build #129. Evidence is in
+out/a1260-runtime-pm/pwrap-link/{fault-model.log,first-boot.txt,cpufreq.log,
+deep.log,post-reconnect.txt,normal-adb.txt,summary.json}.

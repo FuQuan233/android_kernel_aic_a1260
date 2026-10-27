@@ -742,7 +742,7 @@ static void mt6580_spm_finish(void)
 	}
 	if (ret) {
 		spm->last_error = ret;
-		dev_err(spm->dev, "PWRAP suspend slots did not restore: %d\n", ret);
+		dev_err(spm->dev, "PWRAP suspend recovery/link check failed: %d\n", ret);
 	}
 }
 

@@ -12,6 +12,7 @@
 #include <linux/panic.h>
 #include <linux/regmap.h>
 #include <linux/soc/mediatek/mt6580-pwrap.h>
+#include <linux/spinlock.h>
 
 #define WACS2_CMD	0x9c
 #define WACS2_RDATA	0xa0
@@ -20,6 +21,22 @@
 #define WACS_IDLE	0
 #define WACS_VALID	6
 #define WACS_INIT_DONE	BIT(21)
+#define MT6350_DEW_READ_TEST	0x18c
+#define MT6350_READ_TEST_VALUE	0x5aa5
+
+enum mt6580_pwrap_wait_stage {
+	PWRAP_WAIT_IDLE,
+	PWRAP_WAIT_READ,
+	PWRAP_WAIT_WRITE,
+};
+
+struct mt6580_pwrap_link_stats {
+	u32 reads, writes, errors, timeouts, init_lost, stale_valid_clears;
+	u32 checks, check_errors, test_value;
+	int test_error, last_error;
+	u32 last_reg, last_status, last_stage;
+	bool last_write;
+};
 
 /* PCM's AUXADC workaround uses slots 4/5, not the normal VCORE slot 0. */
 #define DVFS_ADR4	0x104
@@ -65,6 +82,8 @@ struct mt6580_pwrap {
 	void __iomem *base;
 	struct regmap *regmap;
 	struct mutex phase_lock;
+	spinlock_t stats_lock;
+	struct mt6580_pwrap_link_stats link;
 	u32 saved_slots[ARRAY_SIZE(suspend_slot_regs)];
 	u32 suspend_slots[ARRAY_SIZE(suspend_slot_regs)];
 	unsigned int saved_auxadc, resume_auxadc, restored_auxadc;
@@ -83,6 +102,26 @@ struct mt6580_pwrap {
 	unsigned int retention_resume[4], retention_restored[4];
 	bool suspend_phase;
 };
+
+static int mt6580_pwrap_link_check(struct mt6580_pwrap *wrp)
+{
+	unsigned int value = 0;
+	unsigned long flags;
+	int ret;
+
+	/* Fixed, side-effect-free DEW signature, also used by the MT6580 BSP. */
+	ret = regmap_read(wrp->regmap, MT6350_DEW_READ_TEST, &value);
+	if (!ret && value != MT6350_READ_TEST_VALUE)
+		ret = -EIO;
+	spin_lock_irqsave(&wrp->stats_lock, flags);
+	wrp->link.checks++;
+	if (ret)
+		wrp->link.check_errors++;
+	wrp->link.test_value = value;
+	wrp->link.test_error = ret;
+	spin_unlock_irqrestore(&wrp->stats_lock, flags);
+	return ret;
+}
 
 static int mt6580_pwrap_retention_snapshot(struct mt6580_pwrap *wrp, unsigned int *values)
 {
@@ -340,6 +379,9 @@ int mt6580_pwrap_prepare_suspend(struct device *dev, enum mt6580_vproc_sleep_mod
 		ret = -EBUSY;
 		goto out;
 	}
+	ret = mt6580_pwrap_link_check(wrp);
+	if (ret)
+		goto out;
 	/* CPUFreq has already selected its suspend OPP. Observe the actual
 	 * selector before any optional bank transaction changes ownership.
 	 */
@@ -389,11 +431,12 @@ EXPORT_SYMBOL_GPL(mt6580_pwrap_prepare_suspend);
 int mt6580_pwrap_finish_suspend(struct device *dev)
 {
 	struct mt6580_pwrap *wrp = dev_get_drvdata(dev);
-	bool bank_active;
+	bool bank_active, check_link;
 	int ret = 0, restore;
 
 	mutex_lock(&wrp->phase_lock);
 	bank_active = wrp->bank_active;
+	check_link = wrp->suspend_phase;
 	if (wrp->bank_active) {
 		/* Sample hardware ownership before returning to the software bank. */
 		wrp->vproc_resume_error = mt6580_pwrap_snapshot_vproc(wrp, wrp->vproc_resume);
@@ -426,6 +469,8 @@ restore_slots:
 		if (!ret)
 			ret = restore;
 	}
+	if (!ret && check_link)
+		ret = mt6580_pwrap_link_check(wrp);
 	mutex_unlock(&wrp->phase_lock);
 	return ret;
 }
@@ -505,42 +550,122 @@ static ssize_t sleep_voltage_show(struct device *dev, struct device_attribute *a
 }
 static DEVICE_ATTR_RO(sleep_voltage);
 
+static ssize_t link_state_show(struct device *dev, struct device_attribute *attr,
+			       char *buf)
+{
+	struct mt6580_pwrap *wrp = dev_get_drvdata(dev);
+	struct mt6580_pwrap_link_stats link;
+	unsigned long flags;
+	u32 status;
+
+	mt6580_pwrap_link_check(wrp);
+	spin_lock_irqsave(&wrp->stats_lock, flags);
+	link = wrp->link;
+	spin_unlock_irqrestore(&wrp->stats_lock, flags);
+	status = readl(wrp->base + WACS2_RDATA);
+	return sysfs_emit(buf,
+		"init_done=%u wacs2=%08x\n"
+		"read_test=%04x expected=%04x error=%d checks=%u failures=%u\n"
+		"reads=%u writes=%u errors=%u timeouts=%u init_lost=%u stale_valid_clears=%u\n"
+		"last_error=%d reg=%04x write=%u stage=%u status=%08x\n",
+		!!(status & WACS_INIT_DONE), status,
+		link.test_value, MT6350_READ_TEST_VALUE, link.test_error,
+		link.checks, link.check_errors, link.reads, link.writes,
+		link.errors, link.timeouts, link.init_lost, link.stale_valid_clears,
+		link.last_error, link.last_reg, link.last_write,
+		link.last_stage, link.last_status);
+}
+static DEVICE_ATTR_RO(link_state);
+
 static struct attribute *mt6580_pwrap_attrs[] = {
 	&dev_attr_spm_phase.attr,
 	&dev_attr_sleep_voltage.attr,
+	&dev_attr_link_state.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(mt6580_pwrap);
 
-/* regmap serializes all users, including RTC reboot and regulator accesses. */
+static u32 mt6580_pwrap_poll_status(struct mt6580_pwrap *wrp, bool clear_stale,
+				  unsigned int *clears)
+{
+	u32 status = readl(wrp->base + WACS2_RDATA);
+
+	/* A previous timed-out read may complete while we wait for IDLE.
+	 * Only discard it before issuing the next command, never while waiting
+	 * for the current command's result. Do not touch an uninitialized bus.
+	 */
+	if (clear_stale && (status & WACS_INIT_DONE) &&
+	    FIELD_GET(WACS_FSM, status) == WACS_VALID) {
+		writel(1, wrp->base + WACS2_VLDCLR);
+		(*clears)++;
+	}
+	return status;
+}
+
+static int mt6580_pwrap_wait(struct mt6580_pwrap *wrp, unsigned int fsm,
+			    bool clear_stale, u32 *status, unsigned int *clears)
+{
+	int ret;
+
+	/* Keep polling atomic: final PMIC power-off has interrupts disabled. */
+	ret = read_poll_timeout_atomic(mt6580_pwrap_poll_status, *status,
+			!(*status & WACS_INIT_DONE) || FIELD_GET(WACS_FSM, *status) == fsm,
+			10, 10000, false, wrp, clear_stale, clears);
+	if (!(*status & WACS_INIT_DONE))
+		return -ENODEV;
+	return ret;
+}
+
+/* regmap serializes all users, including RTC reboot and regulator accesses.
+ * A failed transaction is never retried: writes may already have committed,
+ * and reads such as interrupt status may have side effects.
+ */
 static int mt6580_pwrap_xfer(struct mt6580_pwrap *wrp, unsigned int reg,
 			   unsigned int *value, bool write)
 {
+	enum mt6580_pwrap_wait_stage stage = PWRAP_WAIT_IDLE;
+	unsigned int clears = 0;
+	unsigned long flags;
 	u32 status;
 	int ret;
 
-	status = readl(wrp->base + WACS2_RDATA);
-	if (!(status & WACS_INIT_DONE))
-		return -ENODEV;
-	if (FIELD_GET(WACS_FSM, status) == WACS_VALID)
-		writel(1, wrp->base + WACS2_VLDCLR);
-	ret = readl_poll_timeout_atomic(wrp->base + WACS2_RDATA, status,
-				FIELD_GET(WACS_FSM, status) == WACS_IDLE, 10, 10000);
+	ret = mt6580_pwrap_wait(wrp, WACS_IDLE, true, &status, &clears);
 	if (ret)
-		return ret;
+		goto out;
 
 	writel((write ? BIT(31) : 0) | ((reg >> 1) << 16) |
 	       (write ? *value : 0), wrp->base + WACS2_CMD);
+	stage = write ? PWRAP_WAIT_WRITE : PWRAP_WAIT_READ;
+	ret = mt6580_pwrap_wait(wrp, write ? WACS_IDLE : WACS_VALID,
+				false, &status, &clears);
+	if (!ret && !write) {
+		*value = status & 0xffff;
+		writel(1, wrp->base + WACS2_VLDCLR);
+	}
+out:
+	/* This separate lock only protects diagnostics, never encloses a bus
+	 * access, and can also be taken by the read-only sysfs snapshot.
+	 */
+	spin_lock_irqsave(&wrp->stats_lock, flags);
 	if (write)
-		return readl_poll_timeout_atomic(wrp->base + WACS2_RDATA, status,
-				FIELD_GET(WACS_FSM, status) == WACS_IDLE, 10, 10000);
-	ret = readl_poll_timeout_atomic(wrp->base + WACS2_RDATA, status,
-				FIELD_GET(WACS_FSM, status) == WACS_VALID, 10, 10000);
-	if (ret)
-		return ret;
-	*value = status & 0xffff;
-	writel(1, wrp->base + WACS2_VLDCLR);
-	return 0;
+		wrp->link.writes++;
+	else
+		wrp->link.reads++;
+	wrp->link.stale_valid_clears += clears;
+	if (ret) {
+		wrp->link.errors++;
+		if (ret == -ETIMEDOUT)
+			wrp->link.timeouts++;
+		if (ret == -ENODEV)
+			wrp->link.init_lost++;
+		wrp->link.last_error = ret;
+		wrp->link.last_reg = reg;
+		wrp->link.last_write = write;
+		wrp->link.last_stage = stage;
+		wrp->link.last_status = status;
+	}
+	spin_unlock_irqrestore(&wrp->stats_lock, flags);
+	return ret;
 }
 
 static int mt6580_pwrap_read(void *context, unsigned int reg, unsigned int *value)
@@ -578,6 +703,7 @@ static int mt6580_pwrap_probe(struct platform_device *pdev)
 	if (IS_ERR(wrp->base))
 		return PTR_ERR(wrp->base);
 	mutex_init(&wrp->phase_lock);
+	spin_lock_init(&wrp->stats_lock);
 	/* Keep clocks for PMIC IRQ, regulator and final atomic power-off users.
 	 * Older bring-up DTs have no clocks and retain firmware gate ownership.
 	 */
@@ -590,6 +716,10 @@ static int mt6580_pwrap_probe(struct platform_device *pdev)
 	if (IS_ERR(regmap))
 		return PTR_ERR(regmap);
 	wrp->regmap = regmap;
+	ret = mt6580_pwrap_link_check(wrp);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret, "MT6350 DEW read test failed\n");
+	dev_info(&pdev->dev, "firmware link verified (DEW=%04x)\n", MT6350_READ_TEST_VALUE);
 	platform_set_drvdata(pdev, wrp);
 	return devm_of_platform_populate(&pdev->dev);
 }
