@@ -3,6 +3,16 @@
 WT6580 WE N / Android 17 kernel bring-up
 ======================================
 
+Reading this bring-up log
+------------------------
+
+This file keeps staged results in chronological sections. Later builds
+supersede historical restrictions, including the earlier s2idle-only,
+firmware-held DISP and temporary initial-root ADB configurations. See the
+final "Current remaining work and normal ADB startup" section for the
+2026-10-27 audit, and device/aic/a1260/TODO.md in the Android device tree
+for the ordered board-level backlog.
+
 Base and scope
 --------------
 
@@ -2981,3 +2991,60 @@ repository as patches/health-loop-drain-before-rearm.patch and README.md.
 Evidence is under out/a1260-runtime-pm/healthloop, including API evidence,
 strace, timerfd snapshots, summary.json and final.txt. No further kernel
 or runtime power-policy change was made for this userspace fix.
+
+Current remaining work and normal ADB startup (2026-10-27)
+--------------------------------------------------------
+
+The temporary initial-root ADB choice was removed from the device product
+and first-stage ramdisk. The replacement helper is tools/prepare_ramdisk.py
+in the Android device tree; it removes service.adb.root while retaining the
+existing static first-stage fsck. The standalone default is ramdisk-fsck.img.
+boot-normal-adb.img retains the exact validated #121 kernel and deep policy,
+and is copied to the Android product's boot.img. No kernel executable was
+rebuilt for this change.
+
+After flashing and reboot, ADB starts as uid 2000 (shell), service.adb.root
+is unset, ro.secure=1 and ro.debuggable=1. Normal userdebug on-demand root
+support and ADB authorization settings are unchanged. Android completed
+boot; four CPUs, schedutil at 604500..1300000 kHz, default deep, activity
+and SurfaceFlinger services were present. Evidence is in
+out/a1260-runtime-pm/normal-adb-{startup,final,flash}.txt.
+
+This audit does not establish complete SoC support. Remaining areas are:
+
+* Shared rail consumers and the physical panel/touch I/O supply mapping;
+  the panel fixed regulator remains a placeholder. DSI parent clocks,
+  the undocumented D14 consumer and active DDR PLL policy remain unresolved.
+  Sleep rail voltage and whole-device standby current require instruments.
+* PWRAP cold initialization and full fault recovery: the current wrapper
+  requires firmware's WACS2 INIT_DONE and rejects an uninitialized link.
+* Shared pinctrl/EINT routing outside GPIO0..15 and the dedicated PMIC route.
+* Runtime coordinated CPU deep idle and a complete CPU/interconnect/memory
+  DCM policy. cpuidle currently exposes hardware WFI only; the separately
+  validated system deep-suspend path must not be confused with runtime idle.
+* M4U/IOMMU, video codecs and HACC integration. hw_random reports no provider
+  and crypto drivers are software; usable RNG hardware and HACC interfaces
+  require BSP evidence before any register programming. eMMC stays at the
+  qualified 8-bit 52 MHz mode; higher modes have not been qualified.
+* Wi-Fi, Bluetooth/HCI, physical audio, original IR functions, special-key
+  application actions and AW9106 LEDs. No WLAN, sound card or video device
+  is currently instantiated. An empty deferred-probe list covers only
+  declared devices, not these missing functions.
+* Critical-temperature shutdown, prolonged GPU/memory pressure and two-finger
+  touch remain unverified. Host USB bus-suspend/remote-wake qualification is
+  incomplete; bulk-transfer work remains deferred at the user's request.
+
+The battery model is recorded separately as unfinished calibration work.
+It follows the reference BSP's OAM second-observer approach; that locally
+ported BSP does not prove equivalence with the factory firmware. The
+1397 mAh capacity and OCV/resistance/temperature tables are not calibrated
+to the installed cell. Sleep current is unobserved, and reboot persistence
+and aging compensation have not been ported. Stable overnight percentage
+therefore does not measure zero drain. No battery-model code was changed
+by this audit.
+
+The ordered next work is rail/clock dependency identification, PWRAP and
+EINT completion, then runtime power optimization and missing peripherals.
+The Android device TODO keeps detailed source paths and evidence. Runtime
+snapshots are in out/a1260-runtime-pm/soc-audit-before-normal-adb.txt; some
+optional-device probes in that snapshot intentionally report absent paths.

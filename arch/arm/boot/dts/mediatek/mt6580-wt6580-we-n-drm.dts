@@ -25,7 +25,7 @@
 		default-brightness-level = <192>;
 	};
 
-	/* The MT6350 supply remains enabled by LK until its driver is ported. */
+	/* Physical panel rail is unconfirmed; preserve LK supply setup. */
 	panel_supply: regulator-panel {
 		compatible = "regulator-fixed";
 		regulator-name = "lk-panel-supply";
