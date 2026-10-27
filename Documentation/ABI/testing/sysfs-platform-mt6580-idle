@@ -1,0 +1,16 @@
+What:           /sys/devices/platform/.../10006000.power-controller:suspend/idle_state
+Date:           October 2026
+Contact:        FuQuan233
+Description:
+                Read-only MT6580 runtime CPU0 idle diagnostics. Reports
+                attempts, actual reset entries, PCM runs, WFI aborts, entry
+                blockers, context checks and the last wake cause. Diagnostic
+                PCM runs with runtime_cpu_powerdown=N are accounted as WFI
+                and do not increment the actual CPU reset entry count.
+
+                Admission includes both CPU topology and cpuidle disable
+                bits (bit 0 user, bit 1 driver), flags and CPU0's governor
+                latency constraint. CPU0-DORMANT is enabled only with CPU0
+                alone online and disabled before secondary CPU startup.
+                Four online CPUs remain on WFI/DCM. These counters are not
+                current/power measurements and do not establish multicore power-down.

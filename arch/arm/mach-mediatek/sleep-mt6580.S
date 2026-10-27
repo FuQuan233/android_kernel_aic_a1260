@@ -7,6 +7,53 @@
 	.text
 	.arm
 
+/* CPU0 alone, IRQ/FIQ masked, Cortex-A7 L2 retained. The BSP flushes L1
+ * but only cleans L2 in this mode. No stack access until both levels have
+ * reached PoC, and no exclusive operation after ACTLR.SMP is cleared.
+ */
+ENTRY(mt6580_cache_retention_exit)
+	push	{r4-r10, lr}
+	mrc	p15, 0, r0, c1, c0, 0
+	bic	r0, r0, #4
+	mcr	p15, 0, r0, c1, c0, 0
+	dsb
+	isb
+	bl	v7_flush_dcache_louis
+	/* Complete L1 maintenance before L2 (Cortex-A7 erratum 814220). */
+	dsb
+	mov	r0, #2
+	mcr	p15, 2, r0, c0, c0, 0
+	isb
+	mrc	p15, 1, r1, c0, c0, 0
+	and	r2, r1, #7
+	add	r2, r2, #4
+	ubfx	r3, r1, #3, #10
+	clz	r4, r3
+	ubfx	r5, r1, #13, #15
+1:
+	mov	r6, r5
+2:
+	mov	r9, r6, lsl r2
+	orr	r9, r9, r3, lsl r4
+	orr	r9, r9, #2
+	mcr	p15, 0, r9, c7, c10, 2
+	subs	r6, r6, #1
+	bge	2b
+	subs	r3, r3, #1
+	bge	1b
+	mov	r0, #0
+	mcr	p15, 2, r0, c0, c0, 0
+	dsb
+	isb
+	clrex
+	mrc	p15, 0, r0, c1, c0, 1
+	bic	r0, r0, #(1 << 6)
+	mcr	p15, 0, r0, c1, c0, 1
+	isb
+	dsb
+	pop	{r4-r10, pc}
+ENDPROC(mt6580_cache_retention_exit)
+
 ENTRY(mt6580_cpu_resume)
 	/* Restore writable L2 control before cpu_resume enables caches. */
 	ldr_l	r0, mt6580_saved_l2ctlr

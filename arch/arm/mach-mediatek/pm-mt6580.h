@@ -6,6 +6,7 @@
 
 extern u32 mt6580_saved_l2ctlr;
 void mt6580_cpu_resume(void);
+void mt6580_cache_retention_exit(void);
 void mt6580_save_banked(u32 *regs);
 void mt6580_restore_banked(u32 *regs);
 void mt6580_l2_erratum_entry(void);

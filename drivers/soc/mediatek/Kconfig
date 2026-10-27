@@ -73,6 +73,7 @@ config MTK_MT6580_SPM
 	depends on USB_MUSB_MEDIATEK=y
 	depends on COMMON_CLK_MT6580_USB=y
 	depends on CPU_PM && ARM_CPU_SUSPEND
+	select ARM_ERRATA_814220
 	help
 	  Execute the BSP PCM program for standby and automatic deep system
 	  suspend, with timer/external wakeup and MT6350 command slots. Deep

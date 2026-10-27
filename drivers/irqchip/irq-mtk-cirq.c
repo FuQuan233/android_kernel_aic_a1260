@@ -285,6 +285,23 @@ static void mtk_cirq_resume(void)
 	writel_relaxed(value, reg);
 }
 
+int mt6580_cirq_idle_enter(void)
+{
+	if (!irqs_disabled() || !cirq_data ||
+	    cirq_data->offsets != mtk_cirq_regoffs_v1 ||
+	    cirq_data->ext_irq_start != 32 || cirq_data->ext_irq_end != 157)
+		return -ENODEV;
+	/* A system-suspend transaction must keep ownership of its latches. */
+	if (readl(mtk_cirq_reg(cirq_data, CIRQ_CONTROL)) & (CIRQ_EN | CIRQ_EDGE))
+		return -EBUSY;
+	return mtk_cirq_suspend();
+}
+
+void mt6580_cirq_idle_exit(void)
+{
+	mtk_cirq_resume();
+}
+
 static struct syscore_ops mtk_cirq_syscore_ops = {
 	.suspend	= mtk_cirq_suspend,
 	.resume		= mtk_cirq_resume,

@@ -7,11 +7,16 @@
 #include <linux/iopoll.h>
 #include <linux/irq.h>
 #include <linux/math64.h>
+#include <linux/moduleparam.h>
+#include <linux/cpuidle.h>
+#include <linux/cpu.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/panic.h>
 #include <linux/smp.h>
+#include <linux/sched.h>
+#include <linux/soc/mediatek/mt6580-idle.h>
 #include <linux/soc/mediatek/mt6580-pwrap.h>
 #include <linux/soc/mediatek/mt6580-uart.h>
 #include <linux/soc/mediatek/mt6580-usb.h>
@@ -25,6 +30,7 @@
 #include <asm/proc-fns.h>
 
 #include "mt6580-spm-pcm.h"
+#include "mt6580-idle-pcm.h"
 
 #define PCM_CON0		0x310
 #define PCM_CON1		0x314
@@ -96,7 +102,7 @@
 
 static const u16 pcm_saved_regs[] = {
 	PCM_CON0, PCM_CON1, PCM_IM_PTR, PCM_IM_LEN,
-	0x340, 0x344, 0x348, 0x34c,
+	0x340, 0x344, 0x348, 0x34c, 0x3d0, 0x3d4, 0x3d8, 0x3dc,
 	PCM_DATA_INI, PCM_MAS_PAUSE_MASK, PCM_TIMER_VAL, SPM_CLK_CON, SPM_CLK_SETTLE,
 	SPM_AP_STANDBY, SPM_WAKE_MASK, SPM_CPU_WAKE, SPM_ISR_MASK,
 	PCM_FLAGS, PCM_SRC_REQ, 0xb00, 0xb04, PCM_DEBUG_FLAG,
@@ -134,6 +140,27 @@ struct mt6580_pcm_wake {
 	bool mainpll_requested;
 };
 
+struct mt6580_runtime_idle {
+	void *pcm;
+	dma_addr_t dma;
+	u32 saved[ARRAY_SIZE(pcm_saved_regs)];
+	struct mt6580_cpu0_context cpu;
+	struct mt6580_gic_idle_context gic;
+	u32 attempts, entries, pcm_runs, rejected, failures;
+	u32 blocked_cpus, blocked_domains, blocked_irq, blocked_pcm, blocked_cirq, blocked_gic;
+	int admission_error;
+	u32 r11, r12, assert_pc, ticks, isr, forced;
+	u32 power_before, power_after, power2_before, power2_after;
+	u64 counter_start, counter_end, max_ticks;
+	int error;
+	bool started, disabled, powerdown;
+};
+
+/* Qualification can isolate the PCM/interrupt transaction from CPU reset. */
+static bool runtime_cpu_powerdown = true;
+module_param(runtime_cpu_powerdown, bool, 0644);
+MODULE_PARM_DESC(runtime_cpu_powerdown, "Allow CPU0 power-down in runtime idle");
+
 struct mt6580_spm {
 	struct device *dev;
 	struct device *pwrap;
@@ -164,6 +191,7 @@ struct mt6580_spm {
 	suspend_state_t requested_state;
 	struct mt6580_axi_context axi;
 	bool sleep_clock_ready;
+	bool suspend_active;
 	suspend_state_t last_state;
 	unsigned int deep_requests, deep_fallbacks;
 	u32 fallback_source, fallback_r0, fallback_infra;
@@ -173,6 +201,7 @@ struct mt6580_spm {
 	int irq;
 	bool irq_wake;
 	struct mt6580_pcm_wake wake;
+	struct mt6580_runtime_idle idle;
 	int last_error;
 };
 
@@ -199,7 +228,13 @@ static int mt6580_pcm_reset(struct mt6580_spm *spm)
 			(val & PCM_FSM_MASK) == PCM_FSM_DEFAULT, 1, 10000);
 }
 
-static int mt6580_pcm_load(struct mt6580_spm *spm)
+static const u16 pcm_vector_regs[] = {
+	0x340, 0x344, 0x348, 0x34c, 0x3d0, 0x3d4, 0x3d8, 0x3dc,
+};
+
+static int mt6580_pcm_load_image(struct mt6580_spm *spm, dma_addr_t dma,
+				unsigned int words, const u32 *vectors,
+				unsigned int nr_vectors)
 {
 	u32 val;
 	int i, ret;
@@ -213,28 +248,39 @@ static int mt6580_pcm_load(struct mt6580_spm *spm)
 	 */
 	writel(PCM_KEY | BIT(3) | BIT(6) | BIT(10) | BIT(11) | BIT(12) | BIT(14),
 	       spm->base + PCM_CON1);
-	writel(lower_32_bits(spm->pcm_dma), spm->base + PCM_IM_PTR);
-	writel(ARRAY_SIZE(mt6580_suspend_pcm) - 1, spm->base + PCM_IM_LEN);
+	writel(lower_32_bits(dma), spm->base + PCM_IM_PTR);
+	writel(words - 1, spm->base + PCM_IM_LEN);
 	/* Coherent DMA buffer must be visible before starting instruction fetch. */
 	dma_wmb();
 	writel(PCM_KEY | PCM_IM_SLEEP_DVS | PCM_IM_KICK, spm->base + PCM_CON0);
 	writel(PCM_KEY | PCM_IM_SLEEP_DVS, spm->base + PCM_CON0);
 	ret = readl_poll_timeout_atomic(spm->base + PCM_FSM_STA, val,
 			(val & PCM_IM_STATE_MASK) == PCM_IM_READY, 1, 10000);
-	spm->loaded_fsm = val;
 	if (ret)
 		return ret;
-	for (i = 0; i < ARRAY_SIZE(mt6580_pcm_vectors); i++)
-		writel(mt6580_pcm_vectors[i], spm->base + 0x340 + i * 4);
+	for (i = 0; i < ARRAY_SIZE(pcm_vector_regs); i++)
+		writel(i < nr_vectors ? vectors[i] : 0, spm->base + pcm_vector_regs[i]);
 	if (readl(spm->base + PCM_PWR_IO_EN))
 		return -EIO;
-	spm->loads++;
 	return 0;
 }
 
-static int mt6580_pcm_restore(struct mt6580_spm *spm)
+static int mt6580_pcm_load(struct mt6580_spm *spm)
 {
-	int i, ret, irq_ret;
+	int ret = mt6580_pcm_load_image(spm, spm->pcm_dma,
+			ARRAY_SIZE(mt6580_suspend_pcm), mt6580_pcm_vectors,
+			ARRAY_SIZE(mt6580_pcm_vectors));
+
+	spm->loaded_fsm = readl(spm->base + PCM_FSM_STA);
+	if (!ret)
+		spm->loads++;
+	return ret;
+}
+
+static int mt6580_pcm_restore_regs(struct mt6580_spm *spm, const u32 *saved,
+				  int *irq_error)
+{
+	int i, ret;
 	u32 value;
 
 	/* Stop our interrupt source before resetting/restoring its controller. */
@@ -246,7 +292,7 @@ static int mt6580_pcm_restore(struct mt6580_spm *spm)
 	writel(0, spm->base + SPM_CPU_WAKE);
 	writel(PCM_RETURN, spm->base + SPM_ISR_STATUS);
 	writel(1, spm->base + PCM_SW_INT_CLEAR);
-	irq_ret = irq_set_irqchip_state(spm->irq, IRQCHIP_STATE_PENDING, false);
+	*irq_error = irq_set_irqchip_state(spm->irq, IRQCHIP_STATE_PENDING, false);
 	ret = mt6580_pcm_reset(spm);
 	if (ret)
 		return ret;
@@ -256,12 +302,23 @@ static int mt6580_pcm_restore(struct mt6580_spm *spm)
 	for (i = 2; i < ARRAY_SIZE(pcm_saved_regs); i++) {
 		if (pcm_saved_regs[i] == SPM_CLK_SETTLE)
 			continue;
-		writel(spm->saved[i], spm->base + pcm_saved_regs[i]);
+		writel(saved[i], spm->base + pcm_saved_regs[i]);
 	}
-	value = spm->saved[1] & 0xffff;
+	value = saved[1] & 0xffff;
 	writel(PCM_KEY | value, spm->base + PCM_CON1);
-	value = spm->saved[0] & 0xffff & ~(BIT(0) | PCM_IM_KICK | PCM_SW_RESET);
+	value = saved[0] & 0xffff & ~(BIT(0) | PCM_IM_KICK | PCM_SW_RESET);
 	writel(PCM_KEY | value, spm->base + PCM_CON0);
+	ret = mt6580_pcm_idle(spm);
+	return ret;
+}
+
+static int mt6580_pcm_restore(struct mt6580_spm *spm)
+{
+	int irq_error;
+	int ret = mt6580_pcm_restore_regs(spm, spm->saved, &irq_error);
+
+	if (ret)
+		return ret;
 	spm->restored_fsm = readl(spm->base + PCM_FSM_STA);
 	spm->wake.clk_restored = readl(spm->base + SPM_CLK_CON);
 	if (spm->wake.settle_changed) {
@@ -282,8 +339,251 @@ static int mt6580_pcm_restore(struct mt6580_spm *spm)
 		spm->wake.settle_restored = readl(spm->base + SPM_CLK_SETTLE);
 	}
 	ret = mt6580_pcm_idle(spm);
-	return ret ? ret : irq_ret;
+	return ret ? ret : irq_error;
 }
+
+/* Runtime idle never calls device PM, regmap, CCF, or timekeeping suspend.
+ * A running watchdog stays owned by its driver. Its independent PCM timer
+ * bounds residency to 20 ms; the normal broadcast event can wake us earlier.
+ */
+static int __cpuidle mt6580_idle_wait(unsigned long arg)
+{
+	struct mt6580_spm *spm = (void *)arg;
+	u32 val;
+
+	if (!(readl(spm->base + SPM_ISR_STATUS) & PCM_RETURN)) {
+		spm->idle.forced++;
+		writel(1, spm->base + SPM_CPU_WAKE);
+	}
+	return readl_poll_timeout_atomic(spm->base + SPM_ISR_STATUS, val,
+					val & PCM_RETURN, 1, 10000);
+}
+
+static int __cpuidle mt6580_idle_finish(unsigned long arg)
+{
+	struct mt6580_spm *spm = (void *)arg;
+	u32 con0;
+
+	/* Catch an interrupt or a hotplug attempt before giving PCM ownership.
+	 * A later edge remains latched in CIRQ; a pending level aborts WFI.
+	 */
+	if (need_resched() || num_online_cpus() != 1 || mt6580_gic_idle_ready())
+		return -EBUSY;
+	con0 = readl(spm->base + PCM_CON0) & ~(PCM_KICK | PCM_IM_KICK);
+	spm->idle.started = true;
+	writel(PCM_KEY | con0 | PCM_KICK, spm->base + PCM_CON0);
+	writel(PCM_KEY | con0, spm->base + PCM_CON0);
+	cpu_do_idle();
+	return 0;
+}
+
+int mt6580_spm_cpu0_idle(void)
+{
+	struct mt6580_spm *spm = READ_ONCE(mt6580_spm);
+	struct mt6580_runtime_idle *idle;
+	u32 con1, src, power, power2;
+	int i, ret, restore, gic_restore, irq_restore;
+
+	if (!spm || !irqs_disabled())
+		return -ENODEV;
+	idle = &spm->idle;
+	if (system_state != SYSTEM_RUNNING)
+		return -EBUSY;
+	if (READ_ONCE(idle->disabled))
+		return -EIO;
+	if (READ_ONCE(spm->suspend_active))
+		return -EBUSY;
+	/* Match the MT6580 BSP single-CPU criterion, including hardware status.
+	 * Never try to turn off an online sibling, or enter during CPU teardown.
+	 */
+	if (smp_processor_id() || num_online_cpus() != 1) {
+		idle->blocked_cpus++;
+		return -EBUSY;
+	}
+	power = readl(spm->base + SPM_PWR_STATUS);
+	power2 = readl(spm->base + SPM_PWR_STATUS2);
+	if ((power | power2) & GENMASK(12, 10)) {
+		idle->blocked_cpus++;
+		return -EBUSY;
+	}
+	/* Initial runtime profile admits no active display/GPU transaction. */
+	if ((power | power2) & (BIT(3) | BIT(4))) {
+		idle->blocked_domains++;
+		return -EBUSY;
+	}
+	if (need_resched() || mt6580_gic_idle_ready()) {
+		idle->blocked_irq++;
+		return -EBUSY;
+	}
+	if (mt6580_pcm_idle(spm)) {
+		idle->blocked_pcm++;
+		return -EBUSY;
+	}
+	ret = mt6580_cirq_idle_enter();
+	if (ret) {
+		idle->blocked_cirq++;
+		idle->admission_error = ret;
+		return ret;
+	}
+	ret = mt6580_gic_idle_enter(&idle->gic, spm->irq);
+	if (ret) {
+		idle->blocked_gic++;
+		idle->admission_error = ret;
+		mt6580_cirq_idle_exit();
+		return ret;
+	}
+	idle->attempts++;
+	idle->admission_error = 0;
+	idle->powerdown = READ_ONCE(runtime_cpu_powerdown);
+	idle->started = false;
+	idle->power_before = power;
+	idle->power2_before = power2;
+	idle->counter_start = __arch_counter_get_cntpct();
+	for (i = 0; i < ARRAY_SIZE(pcm_saved_regs); i++)
+		idle->saved[i] = readl(spm->base + pcm_saved_regs[i]);
+	ret = mt6580_pcm_load_image(spm, idle->dma,
+			ARRAY_SIZE(mt6580_idle_pcm), mt6580_idle_vectors,
+			ARRAY_SIZE(mt6580_idle_vectors));
+	if (ret)
+		goto restore;
+	/* Retain R0/crystal control, APSRC/F26M, infra, DDRPHY and all PLLs.
+	 * Only CPU0 power control is connected to PCM's R7 output.
+	 */
+	writel(readl(spm->base + SPM_POWER_ON_VAL0), spm->base + PCM_DATA_INI);
+	writel(BIT(16), spm->base + PCM_PWR_IO_EN);
+	writel(0, spm->base + PCM_PWR_IO_EN);
+	writel(readl(spm->base + SPM_POWER_ON_VAL1), spm->base + PCM_DATA_INI);
+	writel(BIT(23), spm->base + PCM_PWR_IO_EN);
+	writel(0, spm->base + PCM_PWR_IO_EN);
+	writel(0, spm->base + PCM_DATA_INI);
+	writel(~0U, spm->base + PCM_MAS_PAUSE_MASK);
+	writel(PCM_RETAIN_FLAGS & ~(idle->powerdown ? BIT(0) : 0), spm->base + PCM_FLAGS);
+	writel(0, spm->base + 0xb00);
+	src = readl(spm->base + PCM_SRC_REQ) | PCM_APSRC_REQ | PCM_F26M_REQ;
+	writel(src, spm->base + PCM_SRC_REQ);
+	writel(readl(spm->base + SPM_CLK_CON) | BIT(5), spm->base + SPM_CLK_CON);
+	writel((readl(spm->base + SPM_AP_STANDBY) & ~GENMASK(7, 4)) | BIT(4) | BIT(6),
+	       spm->base + SPM_AP_STANDBY);
+	for (i = 0; i < 8; i++)
+		writel(!i, spm->base + 0xf00 + i * 4);
+	/* GPT is the generic broadcast event. CIRQ preserves external edges.
+	 * CPU0_IRQ covers a level becoming pending at the entry boundary.
+	 */
+	writel(~(BIT(0) | BIT(4) | BIT(22) | BIT(26)), spm->base + SPM_WAKE_MASK);
+	writel(PCM_RETURN, spm->base + SPM_ISR_STATUS);
+	writel(1, spm->base + PCM_SW_INT_CLEAR);
+	writel((readl(spm->base + SPM_ISR_MASK) & BIT(2)) | GENMASK(15, 9),
+	       spm->base + SPM_ISR_MASK);
+	writel(655, spm->base + PCM_TIMER_VAL);
+	con1 = readl(spm->base + PCM_CON1) | PCM_TIMER_EN;
+	writel(PCM_KEY | con1, spm->base + PCM_CON1);
+	writel(PCM_R7_OUTPUT, spm->base + PCM_PWR_IO_EN);
+	if (idle->powerdown)
+		ret = mt6580_cpu0_idle(&idle->cpu, mt6580_idle_finish, mt6580_idle_wait,
+				     (unsigned long)spm);
+	else {
+		if (is_idle_task(current))
+			ct_cpuidle_enter();
+		ret = mt6580_idle_finish((unsigned long)spm);
+		if (is_idle_task(current))
+			ct_cpuidle_exit();
+	}
+	if (idle->started) {
+		/* Even a cache/notifier abort must release PCM power ownership. */
+		restore = mt6580_idle_wait((unsigned long)spm);
+		if (restore)
+			panic("MT6580 runtime PCM failed to release CPU power: %d", restore);
+		idle->r11 = readl(spm->base + PCM_REG11);
+		idle->r12 = readl(spm->base + PCM_REG12);
+		idle->assert_pc = readl(spm->base + PCM_DATA_INI);
+		idle->ticks = readl(spm->base + PCM_TIMER_OUT);
+		idle->isr = readl(spm->base + SPM_ISR_STATUS);
+		idle->power_after = readl(spm->base + SPM_PWR_STATUS);
+		idle->power2_after = readl(spm->base + SPM_PWR_STATUS2);
+		if (!ret && (idle->assert_pc || idle->r11 != 0x55aa55aa ||
+			     power != idle->power_after || power2 != idle->power2_after ||
+			     readl(spm->base + PCM_FLAGS) !=
+				(PCM_RETAIN_FLAGS & ~(idle->powerdown ? BIT(0) : 0)) ||
+			     readl(spm->base + PCM_SRC_REQ) != src ||
+			     readl(spm->base + PCM_PWR_IO_EN) != PCM_R7_OUTPUT))
+			ret = -EIO;
+	}
+restore:
+	restore = mt6580_pcm_restore_regs(spm, idle->saved, &irq_restore);
+	if (!restore)
+		restore = irq_restore;
+	/* cpu_cluster_pm_exit has restored the GIC before flushing edge latches. */
+	gic_restore = mt6580_gic_idle_exit(&idle->gic);
+	mt6580_cirq_idle_exit();
+	idle->counter_end = __arch_counter_get_cntpct();
+	idle->max_ticks = max(idle->max_ticks, idle->counter_end - idle->counter_start);
+	if (restore)
+		panic("MT6580 runtime PCM rollback failed: %d", restore);
+	if (gic_restore)
+		panic("MT6580 runtime GIC rollback failed: %d", gic_restore);
+	/* 26 MHz stays requested: CNT must account for the PCM residency too.
+	 * Allow one millisecond for the independent 32 kHz sample boundaries.
+	 */
+	if (!ret && idle->started &&
+	    mul_u64_u32_div(idle->counter_end - idle->counter_start,
+			    NSEC_PER_SEC, arch_timer_get_rate()) + NSEC_PER_MSEC <
+	    div_u64((u64)idle->ticks * NSEC_PER_SEC, 32768))
+		ret = -EIO;
+	idle->error = ret == -EBUSY ? 0 : ret;
+	if (ret && ret != -EBUSY) {
+		idle->failures++;
+		WRITE_ONCE(idle->disabled, true);
+		return ret;
+	}
+	if (ret || !idle->started || (idle->powerdown && idle->cpu.result)) {
+		idle->rejected++;
+		return -EBUSY;
+	}
+	idle->pcm_runs++;
+	if (!idle->powerdown)
+		return 1; /* The caller accounts this diagnostic WFI as state 0. */
+	idle->entries++;
+	return 0;
+}
+
+static ssize_t idle_state_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct mt6580_spm *spm = dev_get_drvdata(dev);
+	struct mt6580_runtime_idle *s = &spm->idle;
+	ssize_t n;
+
+	n = sysfs_emit(buf, "profile=cpu0-l2-retained version=pcm_deepidle_v14.0_new disabled=%u "
+		      "powerdown=%u attempts=%u entries=%u pcm_runs=%u rejected=%u failures=%u error=%d\n",
+		      s->disabled, READ_ONCE(runtime_cpu_powerdown), s->attempts,
+		      s->entries, s->pcm_runs, s->rejected, s->failures, s->error);
+	n += sysfs_emit_at(buf, n, "blocked cpus=%u domains=%u irq=%u pcm=%u cirq=%u gic=%u error=%d\n",
+			  s->blocked_cpus, s->blocked_domains, s->blocked_irq, s->blocked_pcm,
+			  s->blocked_cirq, s->blocked_gic, s->admission_error);
+#if IS_ENABLED(CONFIG_ARM_MT6580_CPUIDLE)
+	{
+		struct cpuidle_device *cpu0 = per_cpu(cpuidle_devices, 0);
+		struct cpuidle_driver *drv = cpu0 ? cpuidle_get_cpu_driver(cpu0) : NULL;
+
+		if (drv && drv->state_count > 2)
+			n += sysfs_emit_at(buf, n, "admission online=%u disable=%llu flags=%x latency_ns=%lld\n",
+					  num_online_cpus(), cpu0->states_usage[2].disable,
+					  drv->states[2].flags, cpuidle_governor_latency_req(0));
+	}
+#endif
+	n += sysfs_emit_at(buf, n, "cpu retained=%u aborted=%u l2_lost=%u errata=%u "
+			  "boot=%08x/%08x cache=%08x/%08x timer=%x/%x watchdog=%x/%x\n",
+			  s->cpu.retained_resumes, s->cpu.aborts, s->cpu.cold_resumes,
+			  s->cpu.errata_runs, s->cpu.boot_before, s->cpu.boot_after,
+			  s->cpu.cache_config, s->cpu.cache_after, s->cpu.timer_ctrl,
+			  s->cpu.timer_ctrl_after, s->cpu.wdt_before, s->cpu.wdt_after);
+	n += sysfs_emit_at(buf, n, "wake r11=%08x r12=%08x assert=%x ticks=%u isr=%x forced=%u "
+			  "power=%x/%x power2=%x/%x counter=%llu/%llu max_ticks=%llu\n",
+			  s->r11, s->r12, s->assert_pc, s->ticks, s->isr, s->forced,
+			  s->power_before, s->power_after, s->power2_before, s->power2_after,
+			  s->counter_start, s->counter_end, s->max_ticks);
+	return n;
+}
+static DEVICE_ATTR_RO(idle_state);
 
 static int mt6580_pcm_capture(struct mt6580_spm *spm)
 {
@@ -814,13 +1114,20 @@ static int mt6580_spm_valid(suspend_state_t state)
 
 static int mt6580_spm_begin(suspend_state_t state)
 {
+	WRITE_ONCE(mt6580_spm->suspend_active, true);
 	mt6580_spm->requested_state = state;
 	return 0;
+}
+
+static void mt6580_spm_end(void)
+{
+	WRITE_ONCE(mt6580_spm->suspend_active, false);
 }
 
 static const struct platform_suspend_ops mt6580_spm_ops = {
 	.valid = mt6580_spm_valid,
 	.begin = mt6580_spm_begin,
+	.end = mt6580_spm_end,
 	.prepare_late = mt6580_spm_prepare_late,
 	.enter = mt6580_spm_enter,
 	.finish = mt6580_spm_finish,
@@ -1174,6 +1481,7 @@ static DEVICE_ATTR_RW(voltage_bank_control);
 
 static struct attribute *mt6580_spm_attrs[] = {
 	&dev_attr_state.attr,
+	&dev_attr_idle_state.attr,
 	&dev_attr_pcm_timer_ms.attr,
 	&dev_attr_cpu0_mode.attr,
 	&dev_attr_r0_control.attr,
@@ -1404,6 +1712,11 @@ static int mt6580_spm_probe(struct platform_device *pdev)
 	if (!spm->pcm)
 		return -ENOMEM;
 	memcpy(spm->pcm, mt6580_suspend_pcm, sizeof(mt6580_suspend_pcm));
+	spm->idle.pcm = dmam_alloc_coherent(dev, sizeof(mt6580_idle_pcm),
+					    &spm->idle.dma, GFP_KERNEL);
+	if (!spm->idle.pcm)
+		return -ENOMEM;
+	memcpy(spm->idle.pcm, mt6580_idle_pcm, sizeof(mt6580_idle_pcm));
 	spm->irq = platform_get_irq(pdev, 0);
 	if (spm->irq < 0)
 		return spm->irq;

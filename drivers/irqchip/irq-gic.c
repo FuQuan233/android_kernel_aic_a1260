@@ -40,6 +40,7 @@
 #include <linux/irqchip.h>
 #include <linux/irqchip/chained_irq.h>
 #include <linux/irqchip/arm-gic.h>
+#include <linux/soc/mediatek/mt6580-irq.h>
 #include <trace/hooks/gic.h>
 
 #include <asm/cputype.h>
@@ -149,6 +150,103 @@ static inline void __iomem *__get_base(union gic_base *base)
 #define gic_data_dist_base(d)	((d)->dist_base.common_base)
 #define gic_data_cpu_base(d)	((d)->cpu_base.common_base)
 #define enable_frankengic()	do { } while(0)
+#endif
+
+#ifdef CONFIG_MACH_MT6580
+int __cpuidle mt6580_gic_idle_ready(void)
+{
+	struct gic_chip_data *gic = &gic_data[0];
+	void __iomem *base = gic_data_dist_base(gic);
+	unsigned int i;
+	u32 enabled, routed;
+
+	if (!base || !gic->gic_irqs || !irqs_disabled())
+		return -ENODEV;
+	for (i = 0; i < gic->gic_irqs; i += 32) {
+		enabled = readl_relaxed(base + GIC_DIST_ENABLE_SET + i / 8);
+		if (enabled & readl_relaxed(base + GIC_DIST_PENDING_SET + i / 8))
+			return -EBUSY;
+		/* CIRQ covers SPIs 32..157, hence GIC INTIDs 64..189.
+		 * SGIs/PPIs use CPU PM plus the broadcast clock event instead.
+		 * Never consume IAR or clear a pending interrupt to make entry fit.
+		 */
+		if (!i)
+			continue;
+		routed = i >= 64 && i < 160 ? ~0U :
+			 i == 160 ? GENMASK(29, 0) : 0;
+		if (enabled & ~routed)
+			return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
+int mt6580_gic_idle_enter(struct mt6580_gic_idle_context *ctx, unsigned int irq)
+{
+	struct gic_chip_data *gic = &gic_data[0];
+	struct irq_data *data = irq_get_irq_data(irq);
+	void __iomem *dist = gic_data_dist_base(gic);
+	void __iomem *cpu = gic_data_cpu_base(gic);
+	unsigned int i;
+	int ret;
+
+	ret = mt6580_gic_idle_ready();
+	if (ret)
+		return ret;
+	while (data && data->parent_data)
+		data = data->parent_data;
+	if (!data || data->domain != gic->domain || data->hwirq < 32 ||
+	    !cpu || ctx->active || gic->gic_irqs > ARRAY_SIZE(ctx->enables) * 32)
+		return -EINVAL;
+	ctx->irq = data->hwirq;
+	ctx->words = DIV_ROUND_UP(gic->gic_irqs, 32);
+	ctx->pmr = readl(cpu + GIC_CPU_PRIMASK);
+	/* Generic GIC CPU/cluster PM restores default priorities. Preserve
+	 * the runtime policy too, including banked PPI/SGI priorities.
+	 */
+	for (i = 0; i < ctx->words * 8; i++)
+		ctx->priorities[i] = readl(dist + GIC_DIST_PRI + i * 4);
+	for (i = 0; i < ctx->words; i++) {
+		ctx->enables[i] = readl(dist + GIC_DIST_ENABLE_SET + i * 4);
+		writel(~0U, dist + GIC_DIST_ENABLE_CLEAR + i * 4);
+	}
+	/* BSP priority-0 SPM interrupt alone may end WFI. Normal IRQ edges
+	 * stay in CIRQ until PCM has completed the power-up sequence.
+	 */
+	writeb(0, dist + GIC_DIST_PRI + ctx->irq);
+	writel(BIT(ctx->irq % 32), dist + GIC_DIST_ENABLE_SET + (ctx->irq / 32) * 4);
+	writel(0x10, cpu + GIC_CPU_PRIMASK);
+	isb();
+	ctx->active = true;
+	return 0;
+}
+
+int mt6580_gic_idle_exit(struct mt6580_gic_idle_context *ctx)
+{
+	struct gic_chip_data *gic = &gic_data[0];
+	void __iomem *dist = gic_data_dist_base(gic);
+	unsigned int i;
+	int ret = 0;
+
+	if (!ctx->active)
+		return 0;
+	for (i = 0; i < ctx->words; i++) {
+		writel(~0U, dist + GIC_DIST_ENABLE_CLEAR + i * 4);
+		writel(ctx->enables[i], dist + GIC_DIST_ENABLE_SET + i * 4);
+		if (readl(dist + GIC_DIST_ENABLE_SET + i * 4) != ctx->enables[i])
+			ret = -EIO;
+	}
+	for (i = 0; i < ctx->words * 8; i++) {
+		writel(ctx->priorities[i], dist + GIC_DIST_PRI + i * 4);
+		if (readl(dist + GIC_DIST_PRI + i * 4) != ctx->priorities[i])
+			ret = -EIO;
+	}
+	writel(ctx->pmr, gic_data_cpu_base(gic) + GIC_CPU_PRIMASK);
+	if (readl(gic_data_cpu_base(gic) + GIC_CPU_PRIMASK) != ctx->pmr)
+		ret = -EIO;
+	isb();
+	ctx->active = false;
+	return ret;
+}
 #endif
 
 static inline void __iomem *gic_dist_base(struct irq_data *d)

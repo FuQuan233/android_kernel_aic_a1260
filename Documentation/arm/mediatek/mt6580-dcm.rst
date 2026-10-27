@@ -7,8 +7,9 @@ Scope and evidence
 CONFIG_COMMON_CLK_MT6580_DCM opts into the CPU Mode 1 and infra/peripheral
 bus policy, implemented by the existing clock-bank owners. DDR/EMI block
 configuration, MCUSYS/L2 divider and gating, USB/PMIC DCM and memory PLL
-policy remain outside this change. Runtime cpuidle remains WFI; this does
-not introduce runtime dormant or replace the existing system deep path.
+policy remain outside DCM ownership. Four online CPUs use WFI/DCM; the
+separate CPU0-only dormant path is described in mt6580-cpuidle.rst. System
+deep sleep remains a separate path.
 
 The reference sources are android_kernel_mediatek_k80/drivers/misc/mediatek/
 base/power/mt6580/mt_dcm.c and mt_dcm.h. The actual normal kernel backup was

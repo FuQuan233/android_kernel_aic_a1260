@@ -2,6 +2,7 @@
 /* MT6580 retained-power standby and CPU0 resume-entry coordination. */
 #include <linux/init.h>
 #include <linux/cpu_pm.h>
+#include <linux/cpuidle.h>
 #include <linux/io.h>
 #include <linux/math64.h>
 #include <linux/of.h>
@@ -157,16 +158,26 @@ struct mt6580_cpu0_finisher {
 	unsigned int mode;
 };
 
-static int mt6580_cpu0_finish(unsigned long arg)
+static int __cpuidle mt6580_cpu0_finish(unsigned long arg)
 {
 	struct mt6580_cpu0_finisher *finish = (void *)arg;
-	u32 sctlr = get_cr(), actlr = get_auxcr();
+	u32 sctlr = get_cr(), actlr;
 	int ret;
 
-	if (finish->mode == 2)
+	/* get_auxcr() uses non-volatile asm: the compiler may sink its read
+	 * past cache shutdown into the WFI-abort branch, thereby saving an
+	 * ACTLR with SMP already clear. Capture the original value here.
+	 */
+	asm volatile("mrc p15, 0, %0, c1, c0, 1" : "=r" (actlr) : : "memory");
+	/* Match the BSP's L1 flush / L2 clean policy for retained L2. Both
+	 * paths publish the reset context to PoC before leaving coherency.
+	 */
+	if (finish->mode == 3)
+		mt6580_cache_retention_exit();
+	else if (finish->mode == 2)
 		v7_exit_coherency_flush(all);
 	ret = finish->idle(finish->arg);
-	if (finish->mode == 2) {
+	if (finish->mode >= 2) {
 		/* WFI returned without a reset: restore coherency/cache state. */
 		set_auxcr(actlr);
 		dsb(sy);
@@ -179,17 +190,19 @@ static int mt6580_cpu0_finish(unsigned long arg)
 	return -EIO;
 }
 
-int mt6580_cpu0_suspend(struct mt6580_cpu0_context *ctx, unsigned int mode,
+static int __cpuidle mt6580_cpu0_enter(struct mt6580_cpu0_context *ctx, unsigned int mode,
 		       int (*idle)(unsigned long), int (*wait)(unsigned long),
 		       unsigned long arg)
 {
 	struct mt6580_cpu0_finisher finish = { .idle = idle, .arg = arg, .mode = mode };
 	unsigned long flags = arch_local_save_flags();
+	bool idle_task = mode == 3 && is_idle_task(current);
+	bool rcu_idle = false;
 	int ret, status, restore;
 
 	if (!mt6580_cpu_boot || !mt6580_cpu_config || !mt6580_cpu_wdt || !irqs_disabled() ||
 	    num_online_cpus() != 1 || cpu_logical_map(smp_processor_id()) ||
-	    !mode || mode > 2)
+	    !mode || mode > 3)
 		return -EINVAL;
 	if (mode == 2 && !IS_ENABLED(CONFIG_HOTPLUG_CPU))
 		return -EOPNOTSUPP;
@@ -202,7 +215,17 @@ int mt6580_cpu0_suspend(struct mt6580_cpu0_context *ctx, unsigned int mode,
 	ret = cpu_cluster_pm_enter();
 	if (ret)
 		goto cpu_exit;
-	ret = mt6580_resume_watchdog_prepare(ctx, mode == 1);
+	if (mode == 3) {
+		/* Runtime idle has a short independent PCM timeout. Do not stop,
+		 * feed, reprogram or otherwise take ownership of watchdogd's timer.
+		 */
+		ctx->wdt_before = readl(mt6580_cpu_wdt);
+		ctx->wdt_length = readl(mt6580_cpu_wdt + 4);
+		ctx->wdt_armed = ctx->wdt_before;
+		ret = 0;
+	} else {
+		ret = mt6580_resume_watchdog_prepare(ctx, mode == 1);
+	}
 	if (ret) {
 		if (ret != -EBUSY && mode == 1)
 			mt6580_resume_watchdog_restore(ctx, true);
@@ -217,14 +240,18 @@ int mt6580_cpu0_suspend(struct mt6580_cpu0_context *ctx, unsigned int mode,
 	asm volatile("mrc p15, 1, %0, c9, c0, 2" : "=r" (ctx->l2ctlr));
 	mt6580_saved_l2ctlr = ctx->l2ctlr;
 	ctx->cache_config = readl(mt6580_cpu_config);
-	writel((ctx->cache_config & ~BIT(4)) | (mode == 1 ? BIT(4) : 0),
+	writel((ctx->cache_config & ~BIT(4)) | (mode != 2 ? BIT(4) : 0),
 	       mt6580_cpu_config);
 	mt6580_save_banked(ctx->banked);
 	writel(ctx->boot_resume, mt6580_cpu_boot + BOOT_ADDR);
 	dsb(sy);
+	if (idle_task) {
+		ct_cpuidle_enter();
+		rcu_idle = true;
+	}
 	status = cpu_suspend((unsigned long)&finish, mt6580_cpu0_finish);
 	ret = status < 0 ? status : 0;
-	if (mode == 2 && !ret && wait)
+	if (mode >= 2 && !ret && wait)
 		ret = wait(arg);
 	if (mode == 2 && !status && !ret && IS_ENABLED(CONFIG_HOTPLUG_CPU)) {
 		ret = mt6580_cpu0_l2_recover();
@@ -257,6 +284,8 @@ int mt6580_cpu0_suspend(struct mt6580_cpu0_context *ctx, unsigned int mode,
 		ctx->resumes++;
 		if (mode == 2)
 			ctx->cold_resumes++;
+		else if (mode == 3)
+			ctx->retained_resumes++;
 	} else if (!ret && status == 1) {
 		ctx->aborts++;
 	}
@@ -265,6 +294,12 @@ int mt6580_cpu0_suspend(struct mt6580_cpu0_context *ctx, unsigned int mode,
 		ret = restore;
 	ctx->result = ret ? ret : status;
 cluster_exit:
+	/* CPU reset returns before the platform's vector/cache/timer policy
+	 * is restored. Stay in RCU idle until that restoration is complete,
+	 * then notify the GIC/VFP/timer clients with RCU watching again.
+	 */
+	if (rcu_idle)
+		ct_cpuidle_exit();
 	cpu_cluster_pm_exit();
 cpu_exit:
 	cpu_pm_exit();
@@ -274,6 +309,22 @@ fiq_exit:
 	if (!(flags & PSR_F_BIT))
 		local_fiq_enable();
 	return ret;
+}
+
+int mt6580_cpu0_suspend(struct mt6580_cpu0_context *ctx, unsigned int mode,
+		       int (*idle)(unsigned long), int (*wait)(unsigned long),
+		       unsigned long arg)
+{
+	if (!mode || mode > 2)
+		return -EINVAL;
+	return mt6580_cpu0_enter(ctx, mode, idle, wait, arg);
+}
+
+int mt6580_cpu0_idle(struct mt6580_cpu0_context *ctx,
+		     int (*idle)(unsigned long), int (*wait)(unsigned long),
+		     unsigned long arg)
+{
+	return mt6580_cpu0_enter(ctx, 3, idle, wait, arg);
 }
 
 static int mt6580_suspend_valid(suspend_state_t state)

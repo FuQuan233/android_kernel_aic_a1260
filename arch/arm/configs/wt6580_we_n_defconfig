@@ -1,3 +1,5 @@
+# Cortex-A7 r0p3: order L1/L2 set-way cache maintenance.
+CONFIG_ARM_ERRATA_814220=y
 CONFIG_LOCALVERSION="-wt6580-bringup"
 # CONFIG_LOCALVERSION_AUTO is not set
 CONFIG_SYSVIPC=y
