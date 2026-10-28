@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config MT6580_CONSYS
+	bool "MT6580 integrated connectivity management and STP"
+	depends on ARCH_MEDIATEK && OF && PM && REGULATOR && COMMON_CLK && NET
+	select CRC16
+	select CRC32
+	select ZLIB_DEFLATE
+	help
+	  Real CONSYS power, BTIF/STP transport, ROM-patch loader and WMT
+	  function management for the integrated MT6580 connectivity block.
+	  The associated WLAN driver communicates with its firmware via AHB.

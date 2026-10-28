@@ -55,6 +55,8 @@
 		reg = <0 0x10006000 0 0x1000>;
 		#power-domain-cells = <1>;
 		infracfg = <&infracfg>;
+		resets = <&watchdog MT6580_TOPRGU_CONNSYS_MCU_RST>;
+		reset-names = "conn";
 		clocks = <&topckgen CLK_MT6580_TOP_MPLL_D5>,
 			 <&topckgen CLK_MT6580_TOP_MFG>,
 			 <&topckgen CLK_MT6580_TOP_SMI>;
@@ -72,6 +74,38 @@
 			clocks = <&topckgen CLK_MT6580_TOP_SPM>;
 			clock-names = "spm";
 		};
+	};
+
+	consys: connectivity@18070000 {
+		compatible = "mediatek,mt6580-consys";
+		reg = <0 0x18070000 0 0x200>,
+		      <0 0x10000000 0 0x2000>,
+		      <0 0x10005000 0 0x1000>,
+		      <0 0x10006000 0 0x1000>,
+		      <0 0x1100e000 0 0x1000>,
+		      <0 0x10205000 0 0x1000>;
+		reg-names = "mcu", "top", "gpio", "spm", "btif", "emi-mpu";
+		interrupts = <GIC_SPI 154 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_SPI 67 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-names = "bgf", "btif";
+		clocks = <&topckgen CLK_MT6580_TOP_BTIF>;
+		clock-names = "btif";
+		power-domains = <&scpsys MT6580_POWER_DOMAIN_CONN>;
+		memory-region = <&conn_memory>;
+		vcn18-supply = <&vcn18>;
+		vcn28-supply = <&vcn28>;
+		vcn33-wifi-supply = <&vcn33_wifi>;
+		vcn33-bt-supply = <&vcn33_bt>;
+		/* The actual board's clkbuf-config is <2 2 1 1>: CONN XO is
+		 * hardware-controlled. Retain that ownership, never force SW mode.
+		 */
+		mediatek,clkbuf-hardware-controlled;
+	};
+
+	wifi: wifi@180f0000 {
+		compatible = "mediatek,WIFI";
+		reg = <0 0x180f0000 0 0x5c>;
+		interrupts = <GIC_SPI 155 IRQ_TYPE_LEVEL_LOW>;
 	};
 
 	/* This remote has no modem service; quiesce MD/ABB before MD1 off. */

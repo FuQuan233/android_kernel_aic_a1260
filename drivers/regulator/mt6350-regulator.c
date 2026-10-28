@@ -14,6 +14,12 @@
 #define MT6350_VEMC_CON0	0x0508
 #define MT6350_VEMC_CON1	0x052e
 #define MT6350_VIO18_CON0	0x0556
+#define MT6350_VCN18_CTRL	0x0510
+#define MT6350_VCN18_EN	0x0512
+#define MT6350_VCN28_VSEL	0x041a
+#define MT6350_VCN28_EN	0x041c
+#define MT6350_VCN33_BT	0x0416
+#define MT6350_VCN33_WIFI	0x0418
 #define MT6350_VPROC_CTRL	0x0216
 #define MT6350_VPROC_EN	0x021a
 #define MT6350_VPROC_VOSEL	0x021e
@@ -111,6 +117,47 @@ static const struct regulator_ops mt6350_fixed_ldo_ops = {
 	.is_enabled = mt6350_ldo_is_enabled,
 };
 
+/* CONSYS rails have distinct SW-enable and HW-control selectors. VCN33
+ * shares its voltage selector and QI bit between BT/WLAN; report the
+ * requesting channel's enable, rather than the other channel's shared QI.
+ */
+static int mt6350_vcn18_enable(struct regulator_dev *rdev)
+{
+	int ret = regmap_update_bits(rdev->regmap, MT6350_VCN18_CTRL, BIT(1), 0);
+
+	return ret ? ret : regulator_enable_regmap(rdev);
+}
+
+static int mt6350_conn_enable(struct regulator_dev *rdev)
+{
+	u32 hw = rdev->desc->enable_reg == MT6350_VCN33_BT ? BIT(5) : BIT(14);
+
+	return regmap_update_bits(rdev->regmap, rdev->desc->enable_reg,
+				hw | rdev->desc->enable_mask, rdev->desc->enable_mask);
+}
+
+static const struct regulator_ops mt6350_vcn18_ops = {
+	.list_voltage = regulator_list_voltage_linear,
+	.enable = mt6350_vcn18_enable,
+	.disable = regulator_disable_regmap,
+	.is_enabled = mt6350_ldo_is_enabled,
+};
+
+static const struct regulator_ops mt6350_conn_ops = {
+	.list_voltage = regulator_list_voltage_table,
+	.map_voltage = regulator_map_voltage_iterate,
+	.get_voltage_sel = regulator_get_voltage_sel_regmap,
+	.set_voltage_sel = regulator_set_voltage_sel_regmap,
+	.enable = mt6350_conn_enable,
+	.disable = regulator_disable_regmap,
+	.is_enabled = regulator_is_enabled_regmap,
+};
+
+static const unsigned int mt6350_vcn28_voltages[] = { 1800000, 2800000 };
+static const unsigned int mt6350_vcn33_voltages[] = {
+	3300000, 3400000, 3500000, 3600000,
+};
+
 static const unsigned int mt6350_vemc_voltages[] = { 3000000, 3300000 };
 
 static const struct regulator_ops mt6350_vemc_ops = {
@@ -142,6 +189,43 @@ static const struct regulator_desc mt6350_board_ldos[] = {
 		.volt_table = mt6350_vemc_voltages,
 		.vsel_reg = MT6350_VEMC_CON1, .vsel_mask = BIT(7),
 		.enable_reg = MT6350_VEMC_CON0, .enable_mask = BIT(14),
+		.enable_time = 264,
+	},
+	{
+		.name = "vcn18", .of_match = "ldo_vcn18", .id = 6,
+		.type = REGULATOR_VOLTAGE, .owner = THIS_MODULE,
+		.ops = &mt6350_vcn18_ops, .n_voltages = 1, .min_uV = 1800000,
+		.enable_reg = MT6350_VCN18_EN, .enable_mask = BIT(14),
+		.enable_time = 300,
+	},
+	{
+		.name = "vcn28", .of_match = "ldo_vcn28", .id = 7,
+		.type = REGULATOR_VOLTAGE, .owner = THIS_MODULE,
+		.ops = &mt6350_conn_ops,
+		.n_voltages = ARRAY_SIZE(mt6350_vcn28_voltages),
+		.volt_table = mt6350_vcn28_voltages,
+		.vsel_reg = MT6350_VCN28_VSEL, .vsel_mask = BIT(6),
+		.enable_reg = MT6350_VCN28_EN, .enable_mask = BIT(12),
+		.enable_time = 264,
+	},
+	{
+		.name = "vcn33_bt", .of_match = "ldo_vcn33_bt", .id = 8,
+		.type = REGULATOR_VOLTAGE, .owner = THIS_MODULE,
+		.ops = &mt6350_conn_ops,
+		.n_voltages = ARRAY_SIZE(mt6350_vcn33_voltages),
+		.volt_table = mt6350_vcn33_voltages,
+		.vsel_reg = MT6350_VCN33_BT, .vsel_mask = GENMASK(3, 2),
+		.enable_reg = MT6350_VCN33_BT, .enable_mask = BIT(7),
+		.enable_time = 264,
+	},
+	{
+		.name = "vcn33_wifi", .of_match = "ldo_vcn33_wifi", .id = 9,
+		.type = REGULATOR_VOLTAGE, .owner = THIS_MODULE,
+		.ops = &mt6350_conn_ops,
+		.n_voltages = ARRAY_SIZE(mt6350_vcn33_voltages),
+		.volt_table = mt6350_vcn33_voltages,
+		.vsel_reg = MT6350_VCN33_BT, .vsel_mask = GENMASK(3, 2),
+		.enable_reg = MT6350_VCN33_WIFI, .enable_mask = BIT(12),
 		.enable_time = 264,
 	},
 };

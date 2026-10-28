@@ -11,6 +11,14 @@ config WLAN_VENDOR_MEDIATEK
 	  your specific card in the following questions.
 
 if WLAN_VENDOR_MEDIATEK
+config MT6580_WLAN
+	bool "MT6580 integrated AHB wireless LAN"
+	depends on ARCH_MEDIATEK && CFG80211 && MT6580_CONSYS
+	select CFG80211_WEXT
+	help
+	  MediaTek's integrated MT6580 WLAN with the original firmware protocol
+	  and AHB programmed I/O transport. Requires the MT6580 CONSYS/WMT core.
+
 source "drivers/net/wireless/mediatek/mt7601u/Kconfig"
 source "drivers/net/wireless/mediatek/mt76/Kconfig"
 endif # WLAN_VENDOR_MEDIATEK

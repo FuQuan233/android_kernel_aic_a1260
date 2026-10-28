@@ -1456,7 +1456,7 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 	if (of_device_is_compatible(dev->of_node, "mediatek,mt6580-mfgcfg"))
 		return mtk_clk_simple_probe(pdev);
 	if (top)
-		count = 21;
+		count = 22;
 
 	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
@@ -1527,6 +1527,13 @@ static int mt6580_usb_clk_probe(struct platform_device *pdev)
 		 */
 		data->hws[CLK_MT6580_TOP_SEJ] = devm_clk_hw_register_gate(dev,
 			"mt6580_sej_bus", NULL, CLK_IGNORE_UNUSED, base + 0x24, 21,
+			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
+
+		/* BSP CG_CTRL1 BTIF_SW_CG. The FIFO transport does not require
+		 * a fabricated baud/source rate; preserve the unknown parent.
+		 */
+		data->hws[CLK_MT6580_TOP_BTIF] = devm_clk_hw_register_gate(dev,
+			"mt6580_btif_bus", NULL, CLK_IGNORE_UNUSED, base + 0x24, 12,
 			CLK_GATE_SET_TO_DISABLE, &mt6580_usb_clk_lock);
 
 		/* AXI is divided by ten in the I2C controller. */

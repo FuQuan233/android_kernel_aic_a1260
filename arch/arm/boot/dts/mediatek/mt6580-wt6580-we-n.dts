@@ -291,7 +291,8 @@
 		ranges;
 
 		/* Keep the vendor kernel's dynamic connectivity/modem carve-outs. */
-		connectivity {
+		conn_memory: connectivity {
+			compatible = "mediatek,consys-reserve-memory";
 			size = <0 0x200000>;
 			alignment = <0 0x200000>;
 			no-map;
@@ -383,6 +384,30 @@
 
 		regulators {
 			compatible = "mediatek,mt6350-regulator";
+
+			vcn18: ldo_vcn18 {
+				regulator-name = "vcn18";
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+			};
+
+			vcn28: ldo_vcn28 {
+				regulator-name = "vcn28";
+				regulator-min-microvolt = <2800000>;
+				regulator-max-microvolt = <2800000>;
+			};
+
+			vcn33_bt: ldo_vcn33_bt {
+				regulator-name = "vcn33-bt";
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3600000>;
+			};
+
+			vcn33_wifi: ldo_vcn33_wifi {
+				regulator-name = "vcn33-wifi";
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3600000>;
+			};
 
 			vproc: buck_vproc {
 				regulator-name = "vproc";

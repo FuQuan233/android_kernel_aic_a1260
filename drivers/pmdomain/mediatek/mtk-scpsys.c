@@ -3,6 +3,7 @@
  * Copyright (c) 2015 Pengutronix, Sascha Hauer <kernel@pengutronix.de>
  */
 #include <linux/clk.h>
+#include <linux/export.h>
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -12,6 +13,8 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/regulator/consumer.h>
+#include <linux/reset.h>
+#include <linux/soc/mediatek/mt6580-consys.h>
 #include <linux/soc/mediatek/infracfg.h>
 
 #include <dt-bindings/power/mt2701-power.h>
@@ -28,6 +31,8 @@
 #define MTK_SCPD_ACTIVE_WAKEUP		BIT(0)
 #define MTK_SCPD_FWAIT_SRAM		BIT(1)
 #define MTK_SCPD_ALWAYS_ON		BIT(2)
+#define MTK_SCPD_KEEP_BOOT_STATE		BIT(3)
+#define MTK_SCPD_CONNSYS_RESET		BIT(4)
 #define MTK_SCPD_CAPS(_scpd, _x)	((_scpd)->data->caps & (_x))
 
 #define SPM_VDE_PWR_CON			0x0210
@@ -160,7 +165,25 @@ struct scp {
 	struct regmap *infracfg;
 	struct scp_ctrl_reg ctrl_reg;
 	bool bus_prot_reg_update;
+	struct reset_control *conn_reset;
 };
+
+/* TOPRGU owns the shared register lock and key. Keep a single exclusive
+ * reset consumer: domain callbacks and the WMT platform use this narrow API.
+ * MT6580 SCPSYS is built in and suppresses unbind, so the handle is permanent
+ * after successful provider initialization.
+ */
+static struct reset_control *mt6580_conn_reset;
+
+int mt6580_connsys_mcu_reset(bool assert)
+{
+	struct reset_control *rst = READ_ONCE(mt6580_conn_reset);
+
+	if (!rst)
+		return -EPROBE_DEFER;
+	return assert ? reset_control_assert(rst) : reset_control_deassert(rst);
+}
+EXPORT_SYMBOL_GPL(mt6580_connsys_mcu_reset);
 
 struct scp_subdomain {
 	int origin;
@@ -315,6 +338,12 @@ static int scpsys_power_on(struct generic_pm_domain *genpd)
 	u32 val;
 	int ret, tmp;
 
+	if (MTK_SCPD_CAPS(scpd, MTK_SCPD_CONNSYS_RESET)) {
+		ret = mt6580_connsys_mcu_reset(true);
+		if (ret)
+			return ret;
+	}
+
 	ret = scpsys_regulator_enable(scpd);
 	if (ret < 0)
 		return ret;
@@ -376,6 +405,11 @@ static int scpsys_power_off(struct generic_pm_domain *genpd)
 	ret = scpsys_bus_protect_enable(scpd);
 	if (ret < 0)
 		goto out;
+	if (MTK_SCPD_CAPS(scpd, MTK_SCPD_CONNSYS_RESET)) {
+		ret = mt6580_connsys_mcu_reset(true);
+		if (ret)
+			goto out;
+	}
 
 	ret = scpsys_sram_disable(scpd, ctl_addr);
 	if (ret < 0)
@@ -474,6 +508,11 @@ static struct scp *init_scp(struct platform_device *pdev,
 				PTR_ERR(scp->infracfg));
 		return ERR_CAST(scp->infracfg);
 	}
+	if (of_device_is_compatible(pdev->dev.of_node, "mediatek,mt6580-scpsys")) {
+		scp->conn_reset = devm_reset_control_get_exclusive(&pdev->dev, "conn");
+		if (IS_ERR(scp->conn_reset))
+			return ERR_CAST(scp->conn_reset);
+	}
 
 	for (i = 0; i < num; i++) {
 		struct scp_domain *scpd = &scp->domains[i];
@@ -543,7 +582,19 @@ static void mtk_register_power_domains(struct platform_device *pdev,
 		 * software.  The unused domains will be switched off during
 		 * late_init time.
 		 */
-		on = !WARN_ON(genpd->power_on(genpd) < 0);
+		if (MTK_SCPD_CAPS(scpd, MTK_SCPD_KEEP_BOOT_STATE)) {
+			/* MCU reset/analog supplies must be sequenced by WMT. Do not
+			 * run an unrequested CONSYS power cycle during registration.
+			 */
+			ret = scpsys_domain_is_on(scpd);
+			if (ret < 0) {
+				dev_warn(&pdev->dev, "%s power status disagrees\n", genpd->name);
+				ret = 1; /* Keep an uncertain domain from being treated as off. */
+			}
+			on = ret;
+		} else {
+			on = !WARN_ON(genpd->power_on(genpd) < 0);
+		}
 
 		pm_genpd_init(genpd, NULL, !on);
 	}
@@ -1024,6 +1075,16 @@ static const struct scp_subdomain scp_subdomain_mt8173[] = {
 
 /* MT6580 BSP MTCMOS sequences. Domain IDs are independent of other SoCs. */
 static const struct scp_domain_data scp_domain_data_mt6580[] = {
+	[MT6580_POWER_DOMAIN_CONN] = {
+		.name = "conn",
+		.sta_mask = PWR_STATUS_CONN,
+		.ctl_offs = SPM_CONN_PWR_CON,
+		.sram_pdn_bits = BIT(8),
+		.bus_prot_mask = 0x310,
+		.clk_id = { CLK_NONE },
+		.caps = MTK_SCPD_ACTIVE_WAKEUP | MTK_SCPD_KEEP_BOOT_STATE |
+			MTK_SCPD_CONNSYS_RESET,
+	},
 	[MT6580_POWER_DOMAIN_MD1] = {
 		.name = "md1",
 		.sta_mask = PWR_STATUS_MD1,
@@ -1189,6 +1250,8 @@ static int scpsys_probe(struct platform_device *pdev)
 	if (IS_ERR(scp))
 		return PTR_ERR(scp);
 
+	if (scp->conn_reset)
+		WRITE_ONCE(mt6580_conn_reset, scp->conn_reset);
 	mtk_register_power_domains(pdev, scp, soc->num_domains);
 
 	pd_data = &scp->pd_data;

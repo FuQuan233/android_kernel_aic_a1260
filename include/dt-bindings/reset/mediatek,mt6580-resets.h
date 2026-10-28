@@ -4,5 +4,6 @@
 
 /* TOPRGU SWSYSRST bit verified by the MT6580 PMIC wrapper BSP. */
 #define MT6580_TOPRGU_PWRAP_SPI_RST	11
+#define MT6580_TOPRGU_CONNSYS_MCU_RST	12
 
 #endif

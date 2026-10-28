@@ -88,8 +88,9 @@ struct mtk_wdt_data {
 };
 
 static const struct mtk_wdt_data mt6580_data = {
-	.toprgu_sw_rst_num = MT6580_TOPRGU_PWRAP_SPI_RST + 1,
-	.supported_resets = BIT(MT6580_TOPRGU_PWRAP_SPI_RST),
+	.toprgu_sw_rst_num = MT6580_TOPRGU_CONNSYS_MCU_RST + 1,
+	.supported_resets = BIT(MT6580_TOPRGU_PWRAP_SPI_RST) |
+			    BIT(MT6580_TOPRGU_CONNSYS_MCU_RST),
 };
 
 static const struct mtk_wdt_data mt2712_data = {
@@ -163,7 +164,7 @@ static int toprgu_reset_update(struct reset_controller_dev *rcdev,
 	struct mtk_wdt_dev *data =
 		 container_of(rcdev, struct mtk_wdt_dev, rcdev);
 
-	/* Only the verified PWRAP SPI reset is exposed on MT6580. */
+	/* MT6580 exposes only the verified PWRAP SPI and CONSYS MCU bits. */
 	if (data->supported_resets && !(data->supported_resets & BIT(id)))
 		return -EINVAL;
 	spin_lock_irqsave(&data->lock, flags);

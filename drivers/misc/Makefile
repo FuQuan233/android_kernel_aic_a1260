@@ -79,3 +79,4 @@ obj-$(CONFIG_MISC_RP1)		+= rp1/
 obj-$(CONFIG_PKVM_SMC_FILTER)	+= pkvm-smc/
 obj-$(CONFIG_PKVM_IOMMU_TEMPLATE)  += pkvm-iommu-temp/
 obj-$(CONFIG_MT6580_VCODEC)	+= mt6580-vcodec.o
+obj-$(CONFIG_MT6580_CONSYS)	+= mediatek/mt6580-connectivity/
