@@ -49,6 +49,22 @@ hardware indications are counted separately. WAKE must go low for 64--96us
 then high, following the original BSP, before waiting for the real firmware
 wake response. A repeated write of one fails after firmware idle.
 
+After that real sleep acknowledgement, the transport synchronizes/disables
+its RX IRQ, masks IER and waits at most 100ms for TX empty. Unread RX bytes
+or pending/running parser work veto idle. Only an empty transport releases
+its CCF clock vote. Wake restores the clock and IER/IRQ before the firmware
+wake request; no FIFO reset is performed across this retained idle state.
+Close handles both active and gated states without an unbalanced IRQ depth
+or a gated-register access. Debug reads also refuse gated MMIO. All process
+I/O and clock transitions share a mutex, but RX work is never flushed while
+holding it because an STP callback may need to send an ACK.
+
+The read-only ``btif_state`` attribute beside the native platform ``state``
+reports cached transport ownership, gate/restore/wake counters, idle vetoes,
+timeouts and RX overruns. Reading it does not wake BTIF or access its gated
+registers. Check ``mt6580_btif_bus`` in CCF and TOPCG_CTRL1 bit12 separately
+for the physical gate, rather than treating cached flags as hardware proof.
+
 The source Android dispatcher configures BTIF and validates/responds to
 real srh_patch requests. It does not take the original launcher's permanent
 LPBK vote. Firmware/configuration loading occurs on function-on after vendor
@@ -77,10 +93,8 @@ external ICMP traffic passed; steady five-packet samples had no loss and
 netdev TX/RX errors remained zero. Firmware-idle Wi-Fi disable released CONN
 and its radio supply; re-enable and scanning passed.
 
-The current BTIF light-idle path retains its AP bus clock. It is not the
-original BSP's complete TX-drain/CCF-gating state machine. SPM refuses
-DDR/infra/MAINPLL removal while CONN is on. Complete connected deep sleep,
-long throughput/pressure runs, persistent fallback MAC and advanced wireless
+SPM refuses DDR/infra/MAINPLL removal while CONN is on. Complete connected
+deep sleep, long throughput/pressure runs, persistent fallback MAC and advanced wireless
 features remain separate work. No permanent test wakelock is required.
 
 The final #192 image also tightens that cipher advertisement. MIUI HTTP and
@@ -89,3 +103,31 @@ validate the Android network. After validation, a subsequent radio cycle
 automatically re-associated, acquired DHCP and passed three gateway probes.
 Apple time.apple.com SNTP returned a real cached time result; no test server
 override was installed.
+
+Kernel #193 follows the BSP TX-drain/BTIF CCF gate ordering. On a connected
+radio, idle reported one successful gate, CCF prepare/enable=0/0 with
+hardware=N and TOPCG_CTRL1 changed from 0x98a18a3c to 0x98a19a3c (bit12).
+With that gate still closed, gateway and external ICMP samples each received
+all five packets and default-route HTTPS returned 200. Initial probes made
+before boot-time DHCP had no route; these are retained in the evidence and
+not counted as successful connectivity tests. Radio disable restored BTIF
+and issued a real wake pulse before releasing CONN and the radio supply;
+re-enable associated and acquired DHCP, then gated BTIF again. No RX FIFO
+overflow, raw hardware overrun, idle timeout or MPU violation was observed.
+
+The Android stack currently lacks disconnected screen-off scan fallback:
+it requests unsupported hardware PNO and retries, while waking the screen
+allows an ordinary scan and reconnect. Software PNO configuration/qualification
+remains separate work; this does not advertise a nonexistent firmware offload.
+
+The physical unplug/screen-off/replug experiment completed and restored a
+validated network with five of five gateway replies, but it did not complete
+system suspend: success=0, fail=3, including two device-suspend aborts with
+``WLAN TX THREAD`` pending. With WoWLAN deliberately unadvertised,
+``wiphy_suspend()`` calls ``cfg80211_leave_all()``; the disconnect OID wakes
+the TX thread and aborts the transition. The inherited AHB platform
+suspend/resume callbacks are no-ops. Integrating qualified cfg80211/WoWLAN,
+firmware suspend/ownership and wake IRQ handling is required next. No claim
+of retained connected suspend or deeper DDR/PLL collapse follows from this
+experiment. BTIF remained gated with zero overruns/timeouts/MPU violations
+and the kernel remained untainted after recovery.

@@ -391,8 +391,8 @@ VOID wmt_plat_aif_cb_reg(device_audio_if_cb callback) { WRITE_ONCE(audio_callbac
 VOID wmt_plat_func_ctrl_cb_reg(func_ctrl_cb callback) { WRITE_ONCE(function_callback, callback); }
 VOID wmt_plat_thermal_ctrl_cb_reg(thermal_query_ctrl_cb callback) { WRITE_ONCE(thermal_callback, callback); }
 VOID wmt_plat_deep_idle_ctrl_cb_reg(deep_idle_ctrl_cb callback) { WRITE_ONCE(deep_callback, callback); }
-/* WMT PSM calls these only after a real firmware sleep acknowledgement.
- * BTIF SLEEP_EN therefore follows the protocol, not a made-up PM success. */
+/* WMT PSM enters after the firmware sleep acknowledgement and restores the
+ * AP BTIF clock before requesting a real firmware wake acknowledgement. */
 int mt_combo_plt_enter_deep_idle(COMBO_IF source)
 {
  deep_idle_ctrl_cb callback = READ_ONCE(deep_callback);
