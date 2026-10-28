@@ -286,6 +286,74 @@ static GL_HIF_DMA_OPS_T *pfWlanDmaOps;
 
 static BOOLEAN WlanDmaFatalErr;
 
+/* Provision the actual factory record before the first radio start.
+ * This is separate from unprovisioned units' per-boot random fallback.
+ * Write-once ownership prevents changing a live station across cycles.
+ */
+static DEFINE_MUTEX(fallback_mac_lock);
+static u8 fallback_mac[ETH_ALEN];
+static bool fallback_mac_ready;
+static u8 factory_mac[ETH_ALEN];
+static bool factory_mac_ready, factory_mac_sealed;
+
+VOID mt6580_get_fallback_mac(u8 *address)
+{
+	mutex_lock(&fallback_mac_lock);
+	if (!fallback_mac_ready) {
+		eth_random_addr(fallback_mac);
+		fallback_mac_ready = true;
+	}
+	ether_addr_copy(address, fallback_mac);
+	mutex_unlock(&fallback_mac_lock);
+}
+
+BOOLEAN mt6580_get_factory_mac(u8 *address)
+{
+	bool available;
+
+	mutex_lock(&fallback_mac_lock);
+	factory_mac_sealed = true;
+	available = factory_mac_ready;
+	if (available)
+		ether_addr_copy(address, factory_mac);
+	mutex_unlock(&fallback_mac_lock);
+	return available;
+}
+
+static ssize_t factory_mac_address_show(struct device *dev,
+	struct device_attribute *attribute, char *buffer)
+{
+	ssize_t bytes;
+
+	mutex_lock(&fallback_mac_lock);
+	bytes = factory_mac_ready ? sysfs_emit(buffer, "%pM\n", factory_mac) :
+				     sysfs_emit(buffer, "unset\n");
+	mutex_unlock(&fallback_mac_lock);
+	return bytes;
+}
+
+static ssize_t factory_mac_address_store(struct device *dev,
+	struct device_attribute *attribute, const char *buffer, size_t count)
+{
+	u8 address[ETH_ALEN];
+	int error = 0;
+
+	if ((count != 17 && (count != 18 || buffer[17] != '\n')) ||
+	    !mac_pton(buffer, address) || !is_valid_ether_addr(address))
+		return -EINVAL;
+	mutex_lock(&fallback_mac_lock);
+	if ((factory_mac_ready && !ether_addr_equal(factory_mac, address)) ||
+	    (factory_mac_sealed && !factory_mac_ready)) {
+		error = -EBUSY;
+	} else if (!factory_mac_ready) {
+		ether_addr_copy(factory_mac, address);
+		factory_mac_ready = true;
+	}
+	mutex_unlock(&fallback_mac_lock);
+	return error ? error : count;
+}
+static DEVICE_ATTR_RW(factory_mac_address);
+
 #if (CONF_HIF_DEV_MISC == 1)
 static const struct file_operations MtkAhbOps = {
 	.owner = THIS_MODULE,
@@ -1929,6 +1997,7 @@ static int HifAhbMiscClose(IN struct inode *Inodep, IN struct file *Filp)
 /*----------------------------------------------------------------------------*/
 static int HifAhbPltmProbe(IN struct platform_device *PDev)
 {
+	int error;
 	/*
 	   TODO: reference codes
 	   struct resource *regs;
@@ -1956,8 +2025,14 @@ static int HifAhbPltmProbe(IN struct platform_device *PDev)
 	   }
 	 */
 	HifAhbPDev = PDev;
-	if (device_init_wakeup(&PDev->dev, true))
-		return -ENOMEM;
+	error = device_init_wakeup(&PDev->dev, true);
+	if (error)
+		return error;
+	error = device_create_file(&PDev->dev, &dev_attr_factory_mac_address);
+	if (error) {
+		device_init_wakeup(&PDev->dev, false);
+		return error;
+	}
 
 	printk("HifAhbPltmProbe\n");
 
@@ -2001,6 +2076,8 @@ static int HifAhbPltmProbe(IN struct platform_device *PDev)
 /*----------------------------------------------------------------------------*/
 static void HifAhbPltmRemove(IN struct platform_device *PDev)
 {
+	device_remove_file(&PDev->dev, &dev_attr_factory_mac_address);
+	device_init_wakeup(&PDev->dev, false);
 #if (MTK_WCN_SINGLE_MODULE == 0)
 	mtk_wcn_wmt_wlan_unreg();
 #endif /* MTK_WCN_SINGLE_MODULE */

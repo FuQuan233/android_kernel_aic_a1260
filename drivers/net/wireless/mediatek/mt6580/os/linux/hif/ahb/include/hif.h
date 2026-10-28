@@ -318,6 +318,9 @@ VOID HifGdmaInit(GL_HIF_INFO_T *HifInfo);
 /*----------------------------------------------------------------------------*/
 VOID HifPdmaInit(GL_HIF_INFO_T *HifInfo);
 
+BOOLEAN mt6580_get_factory_mac(u8 *address);
+VOID mt6580_get_fallback_mac(u8 *address);
+
 /*******************************************************************************
 *                              F U N C T I O N S
 ********************************************************************************

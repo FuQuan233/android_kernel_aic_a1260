@@ -208,3 +208,47 @@ netdev error checks passed; taint remained zero. Other saved networks were
 temporarily excluded from autojoin for isolation and restored afterward.
 This is not qualification of complete connected DDR/infra/MAINPLL collapse
 or long-term standby current.
+
+Factory identity
+----------------
+
+A1260's proinfo layout was checked against the original LK and an early
+backup of this same unit, rather than inferred from an eMMC CID or the
+ordering of two MAC addresses. The live proinfo and early proinfo backup
+have the same SHA256:
+``77c5f84819699b81a604ecab9655a7b2a71a129d498b4f87c9cf54640420973e``.
+The original nvdata image has SHA256
+``2bbb33dea7ce88e1ad1849a5116fdb59d1e0eb1f451384551faa822fcd1d932a``.
+Read-only debugfs extraction establishes these relationships:
+
+* proinfo+0x6e: six Wi-Fi octets, matching APCFG/APRDEB/WIFI+4.
+* proinfo+0x68: six Bluetooth octets, matching APCFG/APRDEB/BT_Addr+0.
+* proinfo+0x74: serial, up to 19 ASCII alphanumeric bytes, terminated by NUL.
+  The original LK reads 19 bytes into a cleared 20-byte buffer and validates
+  the alphanumeric ranges. This serial rule is corroborated independently
+  of the nvdata MAC records.
+
+Android board initialization reads only these bounded fields. It supplies
+the Wi-Fi value through ``factory_mac_address`` before the first radio
+start. The driver seals that selection, preserves valid NVRAM precedence
+and retains the original firmware BASIC_CONFIG command. No factory
+partition or RF calibration is rewritten. The Bluetooth field is documented
+for later Bluetooth bring-up; this change does not initialize Bluetooth.
+
+On an unprovisioned unit, a random local fallback is cached across radio
+off/on cycles within one boot. It is not described as a factory address or
+as persistent across reboot. No MAC is derived from a CID, serial or hash.
+
+Kernel #197 qualification (2026-10-28): early provisioning preceded the
+first firmware start, and the provisioned sysfs value and active wlan0 MAC
+matched the original Wi-Fi record. Two complete radio off/on cycles each
+released CONN and reconnected with the same factory address. A subsequent
+normal reboot retained it and all three Android/USB serial properties.
+Each of the four connected snapshots passed five gateway probes with no
+loss and HTTPS200, with zero netdev errors and kernel taint. Invalid zero
+and multicast writes returned EINVAL, a different valid address returned
+EBUSY, and repeating the factory value was accepted. Proinfo and the
+installed RF payload hashes were unchanged. Raw host ADB output and the
+USB iSerial reported the original 16-character printable serial. The old
+reported invisible character was not independently reproduced before the
+fix; no USB packet-boundary root cause is claimed.

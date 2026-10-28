@@ -1,0 +1,17 @@
+What:		/sys/devices/platform/180f0000.wifi/factory_mac_address
+Date:		October 2026
+Contact:		A1260 kernel maintainers
+Description:
+		Factory Wi-Fi MAC supplied by privileged board initialization before
+		the first radio start. Accepts six colon-separated hexadecimal octets,
+		optionally followed by a newline. Multicast, all-zero and broadcast
+		addresses are rejected. Reads return the provisioned address or unset.
+
+		The address is write-once for this boot. Repeating the same value is
+		allowed; a different value returns EBUSY. If the radio has already
+		consulted an unset value, subsequent provisioning also returns EBUSY.
+		No active netdev address or calibration record is modified by a write.
+
+		A valid NVRAM address retains precedence. Otherwise the driver uses
+		this factory value, then a valid embedded NIC address, then a locally
+		administered random fallback cached for the rest of the boot.

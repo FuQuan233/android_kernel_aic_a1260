@@ -3750,8 +3750,10 @@ WLAN_STATUS wlanUpdateNetworkAddress(IN P_ADAPTER_T prAdapter)
             #else
 	    || EQUAL_MAC_ADDR(aucZeroMacAddr, rMacAddr)) {
             #endif
-		/* eFUSE has a valid address, don't do anything */
-		if (prAdapter->fgIsEmbbededMacAddrValid == TRUE) {
+		if (mt6580_get_factory_mac(rMacAddr)) {
+			pr_info("mt6580-wlan: using provisioned factory MAC\n");
+		} else if (prAdapter->fgIsEmbbededMacAddrValid == TRUE) {
+			/* Keep the NIC's valid eFUSE address when no factory override exists. */
 #if CFG_SHOW_MACADDR_SOURCE
 			DBGLOG(INIT, INFO, ("Using embedded MAC address"));
 #endif
@@ -3760,11 +3762,8 @@ WLAN_STATUS wlanUpdateNetworkAddress(IN P_ADAPTER_T prAdapter)
 #if CFG_SHOW_MACADDR_SOURCE
 			DBGLOG(INIT, INFO, ("Using dynamically generated MAC address"));
 #endif
-            /* No factory address was provided by NVRAM or NIC capability.
-             * Use a real locally administered random fallback, never a vendor
-             * OUI synthesized from jiffies, and never rewrite calibration. */
-            eth_random_addr(rMacAddr);
-            pr_warn("mt6580-wlan: using locally administered fallback MAC\n");
+			mt6580_get_fallback_mac(rMacAddr);
+			pr_warn("mt6580-wlan: using boot-random local fallback MAC\n");
 
 		}
 	} else {
