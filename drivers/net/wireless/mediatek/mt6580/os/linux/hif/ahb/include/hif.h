@@ -131,6 +131,10 @@ typedef struct _GL_HIF_DMA_OPS_T {	/* DMA Operators */
 
 typedef struct _GL_HIF_INFO_T {
 	int irq;
+	bool wake_armed;
+	u32 pm_suspends, pm_resumes, pm_irqs;
+	u32 pm_fw_owned, pm_sleepy, pm_flags, pm_whlpcr;
+	int pm_error;
 
 	/* General */
 	VOID *Dev;		/* struct device */

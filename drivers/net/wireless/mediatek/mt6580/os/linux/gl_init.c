@@ -879,6 +879,11 @@ static const UINT_32 mtk_cipher_suites[] = {
 
 #include "modern_cfg80211.h"
 static struct cfg80211_ops mtk_wlan_ops = {
+#ifdef CONFIG_PM
+    .suspend = mt6580_suspend,
+    .resume = mt6580_resume,
+    .set_wakeup = mt6580_set_wakeup,
+#endif
     .change_virtual_intf = mt6580_change_iface,
     .add_key = mt6580_add_key,
     .get_key = mt6580_get_key,
@@ -2067,6 +2072,13 @@ static INT_32 wlanNetRegister(struct wireless_dev *prWdev)
 			i4DevIdx = -1;
 		}
 
+		if (i4DevIdx != -1 && device_create_file(&prWdev->netdev->dev,
+						       &dev_attr_pm_state)) {
+			unregister_netdev(prWdev->netdev);
+			wiphy_unregister(prWdev->wiphy);
+			wlanClearDevIdx(prWdev->netdev);
+			i4DevIdx = -1;
+		}
 		if (i4DevIdx != -1)
 			prGlueInfo->fgIsRegistered = TRUE;
 	} while (FALSE);
@@ -2094,6 +2106,7 @@ static VOID wlanNetUnregister(struct wireless_dev *prWdev)
 
 	prGlueInfo = (P_GLUE_INFO_T) wiphy_priv(prWdev->wiphy);
 
+	device_remove_file(&prWdev->netdev->dev, &dev_attr_pm_state);
 	wlanClearDevIdx(prWdev->netdev);
 	unregister_netdev(prWdev->netdev);
 	wiphy_unregister(prWdev->wiphy);
@@ -2134,7 +2147,7 @@ static const struct net_device_ops wlan_netdev_ops = {
 
 #ifdef CONFIG_PM
 static const struct wiphy_wowlan_support wlan_wowlan_support = {
-	.flags = WIPHY_WOWLAN_DISCONNECT | WIPHY_WOWLAN_ANY,
+	.flags = WIPHY_WOWLAN_ANY,
 };
 #endif
 /*----------------------------------------------------------------------------*/
@@ -2209,7 +2222,7 @@ static struct wireless_dev *wlanNetCreate(PVOID pvData)
 	prWdev->wiphy->vendor_events = NULL;
 	prWdev->wiphy->n_vendor_events = 0;
 #ifdef CONFIG_PM
-	prWdev->wiphy->wowlan = NULL; /* WoWLAN is not yet qualified. */
+	prWdev->wiphy->wowlan = &wlan_wowlan_support;
 #endif
 	/* 4 <2> Create Glue structure */
 	prGlueInfo = (P_GLUE_INFO_T) wiphy_priv(prWdev->wiphy);

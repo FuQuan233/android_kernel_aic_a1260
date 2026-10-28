@@ -131,3 +131,51 @@ firmware suspend/ownership and wake IRQ handling is required next. No claim
 of retained connected suspend or deeper DDR/PLL collapse follows from this
 experiment. BTIF remained gated with zero overruns/timeouts/MPU violations
 and the kernel remained untainted after recovery.
+
+Retained STA suspend
+--------------------
+
+The cfg80211 PM bridge implements only ``WIPHY_WOWLAN_ANY``. In this
+standard mode the radio continues normal operation, and its ordinary AHB
+HIF interrupt can wake the host. The supplicant overlay requests
+``wowlan_triggers=any``; a configured cfg80211 suspend therefore keeps the
+STA association instead of issuing the disconnect OID observed on #193.
+The physical WLAN device is wake-capable. Suspend enables IRQ wake and
+resume balances it, including unwind after another device aborts suspend.
+IRQ teardown also releases an outstanding wake vote. Unsupported wake
+patterns, magic packet, GTK rekey and ARP offloads are not advertised.
+
+The bridge does not call the legacy IP-filter suspend helpers: their IPv6
+cast is invalid, and enabling unqualified offloads would change the meaning
+of ANY. Genuine firmware sleepy events and ownership handshakes/readback
+continue in the original driver. Neither firmware ownership nor a firmware
+sleep acknowledgement is manufactured. The cached netdev ``pm_state``
+attribute records suspend/resume, IRQs observed while armed, and suspend-time
+ownership/WHLPCR. Reading it does not perform MMIO. Check system suspend
+statistics, SPM state and wake reasons independently of callback counts.
+
+CONN and DDR remain powered under the existing SPM guard. This retained
+mode is separate from complete connected DDR/infra/MAINPLL collapse.
+
+Kernel #194 qualification (2026-10-28): the physical unplug/screen-off/replug
+cycle completed with seven successful system suspends and seven balanced
+cfg80211 suspend/resume callbacks. Each wake was recorded as IRQ99
+``AHB_SLAVE_HIF`` by the kernel, not inferred from callback counts. Before
+suspend, firmware-owned=1, sleepy=1, flags=0 and WHLPCR=0x1
+agreed with the real firmware ownership protocol. SPM recorded state3,
+cpu0_mode=0, fallback=1 and r0 blocker=0x4: the CONN guard correctly selected
+retained standby instead of removing DDR/infra/MAINPLL. One unplug-time
+``mt6350-usb`` wake event canceled suspend; no WLAN TX THREAD abort remained.
+The same IPv4 address was present before and after all recorder snapshots;
+there was no suspend-triggered carrier-off. After replug, the network was
+validated, all five gateway pings returned and HTTPS returned 200, with zero
+netdev TX/RX errors. IRQ wake was disarmed on resume, BTIF remained gated,
+MPU violations stayed zero and the kernel remained untainted. ANY can wake
+for ordinary radio traffic; selective wake/offload, long-duration power
+measurement and complete connected deep sleep remain unqualified.
+An additional radio off/on cycle released CONN/LDO, restored the saved STA
+connection, re-enabled ANY on the newly registered wiphy and passed three
+gateway probes without loss. The wiphy index changes across function cycles;
+diagnostics must resolve the current netdev's phy80211 link instead of
+assuming phy0. The first post-cycle diagnostic used that stale name and was
+corrected; it was not a missing wiphy or failed WoWLAN configuration.

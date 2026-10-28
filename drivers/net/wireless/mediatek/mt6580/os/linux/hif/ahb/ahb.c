@@ -813,6 +813,10 @@ VOID glBusFreeIrq(PVOID pvData, PVOID pvCookie)
 	GLUE_INFO_T *glue = pvCookie;
 
 	if (pvData && glue && glue->rHifInfo.irq > 0) {
+		if (glue->rHifInfo.wake_armed) {
+			disable_irq_wake(glue->rHifInfo.irq);
+			WRITE_ONCE(glue->rHifInfo.wake_armed, false);
+		}
 		free_irq(glue->rHifInfo.irq, pvData);
 		glue->rHifInfo.irq = 0;
 	}
@@ -1596,6 +1600,10 @@ static irqreturn_t HifAhbISR(IN int Irq, IN void *Arg)
 	}
 
 	HIF_REG_WRITEL(HifInfo, MCR_WHLPCR, WHLPCR_INT_EN_CLR);
+	if (READ_ONCE(HifInfo->wake_armed)) {
+		HifInfo->pm_irqs++;
+		pm_wakeup_event(HifInfo->Dev, 100);
+	}
 
 #if 0
 	wlanISR(GlueInfo->prAdapter, TRUE);
@@ -1948,6 +1956,8 @@ static int HifAhbPltmProbe(IN struct platform_device *PDev)
 	   }
 	 */
 	HifAhbPDev = PDev;
+	if (device_init_wakeup(&PDev->dev, true))
+		return -ENOMEM;
 
 	printk("HifAhbPltmProbe\n");
 
