@@ -1,0 +1,29 @@
+What:           /dev/stpbt
+Date:           October 2026
+Contact:        AIC A1260 bring-up maintainers
+Description:
+                Exclusive H4 byte stream for the MT6580 STP BT task. Opening
+                takes the Bluetooth WMT function vote; closing releases only
+                that vote, preserving a concurrent Wi-Fi owner. A second open
+                returns EBUSY. This is not a Linux hci_uart or AF_BLUETOOTH
+                interface. Userspace supplies calibration and HCI initialization.
+
+                Reads support blocking, O_NONBLOCK and poll. An empty nonblocking
+                read returns EAGAIN. Writes are limited to 4096 bytes and return
+                EAGAIN when STP has no credit. Poll writability is advisory;
+                callers must handle EAGAIN. A WMT reset faults the open stream:
+                reads/writes return EIO and poll reports ERR/HUP. Close/reopen
+                and controller initialization are required after such a reset.
+                Legacy vendor ioctls and in-kernel NVRAM file I/O are absent.
+
+What:           /sys/class/misc/stpbt/state
+Date:           October 2026
+Contact:        AIC A1260 bring-up maintainers
+Description:
+                Read-only cached counters, without MMIO or a power transition:
+                opened, fault, opens, closes, rx, tx and events. rx/tx are
+                successfully delivered byte counts; events counts STP receive
+                notifications. Counters are cumulative since driver startup.
+                opened also includes an in-progress open; fault is cleared on
+                the next exclusive open. A receive notification issues a bounded
+                250ms wakeup event rather than holding a permanent wake lock.
