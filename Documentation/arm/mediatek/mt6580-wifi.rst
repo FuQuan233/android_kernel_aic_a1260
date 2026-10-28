@@ -115,10 +115,11 @@ and issued a real wake pulse before releasing CONN and the radio supply;
 re-enable associated and acquired DHCP, then gated BTIF again. No RX FIFO
 overflow, raw hardware overrun, idle timeout or MPU violation was observed.
 
-The Android stack currently lacks disconnected screen-off scan fallback:
+At the #193 checkpoint Android lacked disconnected screen-off scan fallback:
 it requests unsupported hardware PNO and retries, while waking the screen
 allows an ordinary scan and reconnect. Software PNO configuration/qualification
-remains separate work; this does not advertise a nonexistent firmware offload.
+was still pending at that checkpoint. The later software fallback described
+below does not advertise a nonexistent firmware offload.
 
 The physical unplug/screen-off/replug experiment completed and restored a
 validated network with five of five gateway replies, but it did not complete
@@ -179,3 +180,31 @@ gateway probes without loss. The wiphy index changes across function cycles;
 diagnostics must resolve the current netdev's phy80211 link instead of
 assuming phy0. The first post-cycle diagnostic used that stale name and was
 corrected; it was not a missing wiphy or failed WoWLAN configuration.
+
+Android software scan fallback
+------------------------------
+
+The A1260 vendor RRO enables the Wi-Fi module's permitted
+``config_wifiSwPnoEnabled`` customization. The one-shot shell initializer
+defaults DeviceConfig ``wifi/software_pno_enabled`` to true only if unset.
+Both gates are required by this framework. Its existing ``SwPnoScanState``
+uses real single scans when firmware scheduled scan is unavailable, keeping
+the framework's normal mobility/fast/slow backoff and alarm cancellation.
+No firmware PNO capability, polling daemon or permanent wake lock is added.
+The kernel remains #194 with retained ANY-mode suspend and the CONN guard.
+
+On 2026-10-28 the RRO and both gates survived normal boot. With the screen
+asleep throughout a normal radio off/on cycle, Android explicitly entered
+Software PNO, associated and acquired DHCP; five gateway probes and HTTPS200
+passed with no netdev errors. A separate physical unplug/AP-off/AP-on/replug
+experiment verified loss detection, scheduled 20s and 40s retries and a
+return to the same test network before USB was reconnected, while wakefulness
+was Asleep. AlarmManager recorded two actual software-PNO wakeups and then
+canceled the pending 300s retry after connection. The system completed six
+retained suspends; two additional attempts were canceled by alarmtimer with
+-EBUSY. The cfg80211 wake vote was balanced across all eight callbacks and
+unwind paths. Gateway probes (five of five), HTTPS200, validation, MPU and
+netdev error checks passed; taint remained zero. Other saved networks were
+temporarily excluded from autojoin for isolation and restored afterward.
+This is not qualification of complete connected DDR/infra/MAINPLL collapse
+or long-term standby current.
