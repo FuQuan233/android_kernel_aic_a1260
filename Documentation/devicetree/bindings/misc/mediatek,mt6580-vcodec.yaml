@@ -11,9 +11,10 @@ maintainers:
 
 description:
   MT6580 decoder MISC and VLD share a two-page window in the ISP domain.
-  Its memory traffic uses LARB1 POST0, CDMA and WDMA ports. The initial
-  driver manages owned DMA buffers and decoder jobs through M4U. H.264 also
-  uses the separate MP4-VENC register block as an auxiliary engine. This is
+  Decoder and MPEG4/H263 encoder memory traffic uses LARB1 POST0/BSDMA,
+  CDMA, WDMA/REC, MVQP and MC ports. Both engines share the power domain
+  and one serialized hardware owner. H.264 decoding also uses the separate
+  MP4-VENC register block as an auxiliary engine. This is
   not compatible with MT8173 V4L2 hardware.
 
 properties:
@@ -31,7 +32,9 @@ properties:
       - const: mp4-venc
 
   interrupts:
-    maxItems: 1
+    items:
+      - description: VDEC level-low interrupt
+      - description: MP4-VENC level-low interrupt
 
   clocks:
     maxItems: 1
@@ -44,9 +47,11 @@ properties:
 
   iommus:
     items:
-      - description: LARB1 port 3, decoder POST0
-      - description: LARB1 port 9, decoder CDMA
-      - description: LARB1 port 10, decoder WDMA
+      - description: LARB1 port 3, decoder POST0 / encoder BSDMA
+      - description: LARB1 port 9, decoder / encoder CDMA
+      - description: LARB1 port 10, decoder WDMA / encoder REC
+      - description: LARB1 port 7, encoder MVQP
+      - description: LARB1 port 8, encoder MC
 
 required:
   - compatible

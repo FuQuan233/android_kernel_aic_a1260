@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Privileged MT6580 DMA buffers and native hybrid H.264 job prototype. */
+/* Privileged MT6580 DMA buffers and serialized native hybrid codec jobs. */
 #include <linux/atomic.h>
+#include <linux/bitops.h>
 #include <linux/capability.h>
 #include <linux/clk.h>
 #include <linux/compat.h>
@@ -32,6 +33,7 @@
 #include <uapi/linux/mt6580-vcodec.h>
 #include <asm/dma-iommu.h>
 #include <asm/dma-mapping.h>
+#include <dt-bindings/memory/mtk-memory-port.h>
 
 #define VC_ALLOC_LIMIT SZ_32M
 #define VC_FILE_LIMIT SZ_64M
@@ -43,6 +45,16 @@
 #define VC_AUX_BASE MT6580_VCODEC_REG_AUX_BASE
 #define VC_IRQ_STATUS 0x10
 #define VC_IRQ_ACK 0x0c
+#define VC_ENC_IRQ_ENABLE 0x668
+#define VC_ENC_IRQ_ACK 0x678
+#define VC_ENC_IRQ_STATUS 0x67c
+#define VC_REQUIRED_LARB1_PORTS (BIT(3) | BIT(7) | BIT(8) | BIT(9) | BIT(10))
+
+enum vc_engine {
+	VC_DECODER,
+	VC_ENCODER,
+	VC_ENGINE_COUNT,
+};
 
 struct vc_job;
 struct vc_buffer;
@@ -82,7 +94,8 @@ struct vc_device {
 	phys_addr_t aux_reg_start;
 	struct clk *clock;
 	struct wakeup_source *wake;
-	int irq;
+	int irq[VC_ENGINE_COUNT];
+	u32 larb1_ports;
 	atomic64_t jobs;
 	atomic64_t irqs;
 	atomic64_t timeouts;
@@ -134,6 +147,7 @@ struct vc_job {
 	u32 buffer_count;
 	struct completion done;
 	u64 handle;
+	u32 driver_type;
 	bool active;
 	bool stopping;
 	int result;
@@ -375,6 +389,43 @@ static struct vc_job *vc_find_job(struct vc_file *ctx, u64 handle)
 	return NULL;
 }
 
+static bool vc_driver_type_valid(u32 driver_type)
+{
+	return driver_type == MT6580_VCODEC_H264_DRIVER ||
+		driver_type == MT6580_VCODEC_MP4_ENC_DRIVER;
+}
+
+static enum vc_engine vc_job_engine(const struct vc_job *job)
+{
+	return job->driver_type == MT6580_VCODEC_MP4_ENC_DRIVER ?
+		VC_ENCODER : VC_DECODER;
+}
+
+static int vc_job_irq(struct vc_device *vc, const struct vc_job *job)
+{
+	return vc->irq[vc_job_engine(job)];
+}
+
+static u32 vc_job_irq_status(struct vc_device *vc, const struct vc_job *job)
+{
+	if (vc_job_engine(job) == VC_ENCODER)
+		return readl(vc->aux_regs + VC_ENC_IRQ_STATUS);
+	return readl(vc->regs + VC_IRQ_STATUS);
+}
+
+static void vc_job_irq_ack(struct vc_device *vc, const struct vc_job *job,
+			   u32 status)
+{
+	if (vc_job_engine(job) == VC_ENCODER) {
+		/* MT6580 MP4-VENC acknowledges even status 2 by writing 1. */
+		writel(1, vc->aux_regs + VC_ENC_IRQ_ACK);
+		readl(vc->aux_regs + VC_ENC_IRQ_STATUS);
+	} else {
+		writel(status, vc->regs + VC_IRQ_ACK);
+		readl(vc->regs + VC_IRQ_STATUS);
+	}
+}
+
 static bool vc_buffer_range(struct vc_buffer *buf, u32 offset, size_t size)
 {
 	return buf && buf->cpu && !(offset & 3) &&
@@ -501,7 +552,7 @@ static void vc_finish_job(struct vc_device *vc, struct vc_job *job,
 	if (result && !wait_event_timeout(vc->power_changed,
 		atomic64_read(&vc->off_generations) != off_generation,
 		msecs_to_jiffies(200))) {
-		/* The old BSP has no established VDEC break/reset sequence.
+		/* Neither engine has an established break/reset sequence here.
 		 * Keep every possible DMA object mapped if stopping is unproven.
 		 */
 		atomic64_inc(&vc->poweroff_errors);
@@ -518,7 +569,7 @@ static void vc_finish_job(struct vc_device *vc, struct vc_job *job,
 		 * buffer set includes RELEASEd-but-mapped objects, not just OAL.
 		 * The wake source also stays held: recovery requires a reboot.
 		 */
-		dev_err(vc->dev, "VDEC stop unproven; DMA buffers quarantined until reboot\n");
+		dev_err(vc->dev, "Codec stop unproven; DMA buffers quarantined until reboot\n");
 	} else {
 		__pm_relax(vc->wake);
 		vc_binding_put(&job->binding);
@@ -543,7 +594,12 @@ static irqreturn_t vc_irq_thread(int irq, void *data)
 		mutex_unlock(&vc->job_lock);
 		return IRQ_HANDLED;
 	}
-	status = readl(vc->regs + VC_IRQ_STATUS);
+	if (irq != vc_job_irq(vc, job)) {
+		/* A late thread from the other masked engine cannot finish this job. */
+		mutex_unlock(&vc->job_lock);
+		return IRQ_NONE;
+	}
+	status = vc_job_irq_status(vc, job);
 	if (!status) {
 		atomic64_inc(&vc->spurious);
 		mutex_unlock(&vc->job_lock);
@@ -552,8 +608,7 @@ static irqreturn_t vc_irq_thread(int irq, void *data)
 	for (i = 0; i < job->binding.count; i++)
 		WRITE_ONCE(job->binding.status[2 * i + 1],
 			   vc_read_registered(vc, job->binding.offsets[i]));
-	writel(status, vc->regs + VC_IRQ_ACK);
-	readl(vc->regs + VC_IRQ_STATUS); /* flush ACK before clock removal */
+	vc_job_irq_ack(vc, job, status); /* flush ACK before clock removal */
 	disable_irq_nosync(irq);
 	atomic64_inc(&vc->irqs);
 	vc_finish_job(vc, job, 0, status);
@@ -577,14 +632,13 @@ static void vc_cancel_job(struct vc_job *job, int result)
 		return;
 	}
 	job->stopping = true;
-	disable_irq_nosync(vc->irq);
+	disable_irq_nosync(vc_job_irq(vc, job));
 	mutex_unlock(&vc->job_lock);
 	/* A queued IRQ thread may need job_lock; never wait under that lock. */
-	synchronize_irq(vc->irq);
+	synchronize_irq(vc_job_irq(vc, job));
 	mutex_lock(&vc->job_lock);
-	status = readl(vc->regs + VC_IRQ_STATUS);
-	writel(status, vc->regs + VC_IRQ_ACK);
-	readl(vc->regs + VC_IRQ_STATUS);
+	status = vc_job_irq_status(vc, job);
+	vc_job_irq_ack(vc, job, status);
 	if (result == -ETIMEDOUT)
 		atomic64_inc(&vc->timeouts);
 	else
@@ -630,6 +684,10 @@ static int vc_acquire_job(struct vc_file *ctx,
 		goto unlock;
 	}
 	old = vc_find_job(ctx, request->handle);
+	if (old && old->driver_type != request->driver_type) {
+		ret = -EINVAL;
+		goto unlock;
+	}
 	if (old) {
 		list_del_init(&old->node);
 		ctx->job_count--;
@@ -649,6 +707,7 @@ static int vc_acquire_job(struct vc_file *ctx,
 	INIT_LIST_HEAD(&job->node);
 	job->ctx = ctx;
 	job->handle = request->handle;
+	job->driver_type = request->driver_type;
 	job->result = -EINPROGRESS;
 	kref_get(&ctx->ref);
 	vc_binding_get(&job->binding, &ctx->binding);
@@ -667,10 +726,14 @@ static int vc_acquire_job(struct vc_file *ctx,
 		goto relax;
 	}
 	/* Discard stale IRQ state before exposing the lock to userspace. */
-	status = readl(vc->regs + VC_IRQ_STATUS);
+	status = vc_job_irq_status(vc, job);
 	if (status)
-		writel(status, vc->regs + VC_IRQ_ACK);
-	readl(vc->regs + VC_IRQ_STATUS);
+		vc_job_irq_ack(vc, job, status);
+	if (vc_job_engine(job) == VC_ENCODER) {
+		/* The MT6580 BSP enables this only after the shared power chain. */
+		writel(1, vc->aux_regs + VC_ENC_IRQ_ENABLE);
+		readl(vc->aux_regs + VC_ENC_IRQ_ENABLE);
+	}
 	WRITE_ONCE(job->binding.header->completed, 0);
 	WRITE_ONCE(job->binding.header->timeout, 0);
 	WRITE_ONCE(job->binding.header->count, job->binding.count);
@@ -681,7 +744,7 @@ static int vc_acquire_job(struct vc_file *ctx,
 	ctx->job_count++;
 	vc->owner = job;
 	atomic64_inc(&vc->jobs);
-	enable_irq(vc->irq);
+	enable_irq(vc_job_irq(vc, job));
 	mutex_unlock(&vc->job_lock);
 	return 0;
 relax:
@@ -714,7 +777,7 @@ static long vc_job_ioctl(struct vc_file *ctx, unsigned int cmd,
 	}
 	if (copy_from_user(&request, user, sizeof(request)))
 		return -EFAULT;
-	if (request.driver_type != MT6580_VCODEC_H264_DRIVER ||
+	if (!vc_driver_type_valid(request.driver_type) ||
 	    !request.handle || request.irq_status || request.reserved ||
 	    request.timeout_ms > VC_JOB_TIMEOUT_MAX ||
 	    (cmd == MT6580_VCODEC_JOB_RELEASE && request.timeout_ms))
@@ -723,6 +786,10 @@ static long vc_job_ioctl(struct vc_file *ctx, unsigned int cmd,
 		return vc_acquire_job(ctx, &request);
 	mutex_lock(&vc->job_lock);
 	job = vc_find_job(ctx, request.handle);
+	if (job && job->driver_type != request.driver_type) {
+		mutex_unlock(&vc->job_lock);
+		return -EINVAL;
+	}
 	if (job)
 		kref_get(&job->ref);
 	mutex_unlock(&vc->job_lock);
@@ -794,6 +861,56 @@ static void vc_close_jobs(struct vc_file *ctx)
 	mutex_unlock(&vc->job_lock);
 }
 
+/* Firmware IDs are binding evidence, not the old global /dev/m4u port enum. */
+static int vc_m4u_ports(struct device *dev, u32 *ports)
+{
+	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
+	struct dma_iommu_mapping *mapping = to_dma_iommu_mapping(dev);
+	u32 mask = 0;
+	unsigned int i;
+
+	if (!mapping || !mapping->domain ||
+	    mapping->domain != iommu_get_domain_for_dev(dev) ||
+	    !fwspec || !fwspec->num_ids)
+		return -ENODEV;
+	for (i = 0; i < fwspec->num_ids; i++) {
+		u32 id = fwspec->ids[i];
+		u32 port = MTK_M4U_TO_PORT(id);
+
+		if (MTK_M4U_TO_LARB(id) != 1 || port > 10 ||
+		    id != MTK_M4U_ID(1, port))
+			return -EINVAL;
+		mask |= BIT(port);
+	}
+	if ((mask & VC_REQUIRED_LARB1_PORTS) != VC_REQUIRED_LARB1_PORTS)
+		return -ENODEV;
+	*ports = mask;
+	return 0;
+}
+
+static long vc_get_caps(struct vc_file *ctx, void __user *user)
+{
+	struct vc_device *vc = ctx->vc;
+	struct mt6580_vcodec_caps caps = {
+		.driver_mask = BIT(MT6580_VCODEC_MP4_ENC_DRIVER) |
+			       BIT(MT6580_VCODEC_H264_DRIVER),
+		.flags = MT6580_VCODEC_CAP_M4U,
+	};
+	int ret;
+
+	mutex_lock(&vc->job_lock);
+	if (READ_ONCE(vc->removing))
+		ret = -ENODEV;
+	else
+		ret = vc_m4u_ports(vc->dev, &caps.larb1_ports);
+	if (!ret && caps.larb1_ports != vc->larb1_ports)
+		ret = -ENODEV; /* This driver does not support rebinding live ports. */
+	mutex_unlock(&vc->job_lock);
+	if (ret)
+		return ret;
+	return copy_to_user(user, &caps, sizeof(caps)) ? -EFAULT : 0;
+}
+
 static long vc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct vc_file *ctx = file->private_data;
@@ -803,6 +920,8 @@ static long vc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	int ret = 0;
 	u32 id;
 
+	if (cmd == MT6580_VCODEC_GET_CAPS)
+		return vc_get_caps(ctx, user);
 	if (cmd == MT6580_VCODEC_OAL_BIND || cmd == MT6580_VCODEC_OAL_UNBIND ||
 	    cmd == MT6580_VCODEC_JOB_ACQUIRE || cmd == MT6580_VCODEC_JOB_WAIT ||
 	    cmd == MT6580_VCODEC_JOB_RELEASE)
@@ -1124,16 +1243,18 @@ static int vc_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct resource *resource;
 	struct vc_device *vc;
+	u32 larb1_ports;
 	int ret;
 
 	static_assert(sizeof(struct mt6580_vcodec_buffer) == 32);
 	static_assert(sizeof(struct mt6580_vcodec_oal) == 84);
 	static_assert(sizeof(struct mt6580_vcodec_job) == 24);
+	static_assert(sizeof(struct mt6580_vcodec_caps) == 16);
 	static_assert(sizeof(struct vc_oal_header) == 16);
-	if (!to_dma_iommu_mapping(dev) ||
-	    !iommu_get_domain_for_dev(dev) ||
-	    to_dma_iommu_mapping(dev)->domain != iommu_get_domain_for_dev(dev))
-		return dev_err_probe(dev, -ENODEV, "M4U DMA domain required\n");
+	ret = vc_m4u_ports(dev, &larb1_ports);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "M4U DMA domain and LARB1 codec ports required\n");
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
 		return dev_err_probe(dev, ret, "32-bit DMA mask required\n");
@@ -1143,6 +1264,7 @@ static int vc_probe(struct platform_device *pdev)
 	if (!vc)
 		return -ENOMEM;
 	vc->dev = dev;
+	vc->larb1_ports = larb1_ports;
 	mutex_init(&vc->lock);
 	mutex_init(&vc->job_lock);
 	init_waitqueue_head(&vc->job_idle);
@@ -1166,16 +1288,19 @@ static int vc_probe(struct platform_device *pdev)
 	vc->clock = devm_clk_get(dev, "vcodec");
 	if (IS_ERR(vc->clock))
 		return dev_err_probe(dev, PTR_ERR(vc->clock), "Missing VCODEC gate\n");
-	vc->irq = platform_get_irq(pdev, 0);
-	if (vc->irq < 0)
-		return vc->irq;
-	if (irq_get_trigger_type(vc->irq) != IRQ_TYPE_LEVEL_LOW)
-		return dev_err_probe(dev, -EINVAL, "VDEC requires level-low IRQ\n");
-	ret = devm_request_threaded_irq(dev, vc->irq, NULL, vc_irq_thread,
-					IRQF_ONESHOT | IRQF_NO_AUTOEN,
-					dev_name(dev), vc);
-	if (ret)
-		return dev_err_probe(dev, ret, "Cannot request VDEC IRQ\n");
+	for (int i = 0; i < VC_ENGINE_COUNT; i++) {
+		vc->irq[i] = platform_get_irq(pdev, i);
+		if (vc->irq[i] < 0)
+			return vc->irq[i];
+		if (irq_get_trigger_type(vc->irq[i]) != IRQ_TYPE_LEVEL_LOW)
+			return dev_err_probe(dev, -EINVAL,
+					     "Codec IRQ %d requires level-low trigger\n", i);
+		ret = devm_request_threaded_irq(dev, vc->irq[i], NULL, vc_irq_thread,
+					       IRQF_ONESHOT | IRQF_NO_AUTOEN,
+					       dev_name(dev), vc);
+		if (ret)
+			return dev_err_probe(dev, ret, "Cannot request codec IRQ %d\n", i);
+	}
 	vc->wake = wakeup_source_register(dev, "mt6580-vcodec-job");
 	if (!vc->wake)
 		return -ENOMEM;

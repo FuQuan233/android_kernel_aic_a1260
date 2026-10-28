@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 #include "../../include/uapi/linux/mt6580-vcodec.h"
 #include "val-buffer-bridge.h"
@@ -365,4 +366,63 @@ __attribute__((destructor)) static void release_all(void)
 	if (codec_fd >= 0)
 		close(codec_fd);
 	pthread_mutex_unlock(&lock);
+}
+
+/* The old utility configures its five global M4U ports through /dev/m4u.
+ * Modern port ownership is established by the actual DT/IOMMU consumer.
+ * Accept only the recovered nonsecure virtual-port-array request and prove
+ * that the native driver is attached to every required port; never report
+ * an unknown legacy M4U request as a successful configuration.
+ */
+int eVideoSetParam(uint32_t command, const void *parameters, uint32_t reserved)
+{
+	const uint8_t *bytes = parameters;
+	uint32_t codec, port;
+	struct mt6580_vcodec_caps caps = {0};
+	const uint32_t ports = (1U << 3) | (1U << 7) | (1U << 8) |
+		(1U << 9) | (1U << 10);
+	int rc = VAL_INVALID_PARAMETER;
+
+	if (owner_pid != getpid() || command != 2 || !parameters || reserved)
+		return rc;
+	memcpy(&codec, bytes, sizeof(codec));
+	memcpy(&port, bytes + 4, sizeof(port));
+	/* The original caller initializes only the first ten bytes. */
+	if (codec > 1 || port != UINT32_MAX || bytes[8] || bytes[9] != 1)
+		return rc;
+	pthread_mutex_lock(&lock);
+	if (open_codec() >= 0 &&
+	    !ioctl(codec_fd, MT6580_VCODEC_GET_CAPS, &caps) &&
+	    (caps.flags & MT6580_VCODEC_CAP_M4U) &&
+	    (caps.larb1_ports & ports) == ports &&
+	    (caps.driver_mask & (1U << (codec ? MT6580_VCODEC_H264_DRIVER :
+					 MT6580_VCODEC_MP4_ENC_DRIVER))))
+		rc = VAL_OK;
+	pthread_mutex_unlock(&lock);
+	if (rc)
+		fprintf(stderr, "VAL_M4U_CONFIG_REJECTED codec=%u ports=%x flags=%x errno=%d\n",
+			codec, caps.larb1_ports, caps.flags, errno);
+	return rc;
+}
+
+
+/* Select the original decoder's full B-frame path in this private process.
+ * The BSP defaults simp_b_frame to 1, which changes decoded pixels. Keep all
+ * other properties on the normal system-property/default path; do not alter
+ * DRVB/devinfo validation or emulate a hardware completion here.
+ */
+int property_get(const char *key, char *value, const char *default_value)
+{
+    int length;
+    if (!key || !value) return 0;
+    if (!strcmp(key, "h264dec.simp_b_frame")) {
+        value[0] = '0'; value[1] = 0;
+        return 1;
+    }
+    length = __system_property_get(key, value);
+    if (length > 0) return length;
+    length = default_value ? (int)strnlen(default_value, PROP_VALUE_MAX - 1) : 0;
+    if (length) memcpy(value, default_value, (size_t)length);
+    value[length] = 0;
+    return length;
 }

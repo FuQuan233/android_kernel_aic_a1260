@@ -38,8 +38,10 @@ struct mt6580_vcodec_buffer {
 #define MT6580_VCODEC_RELEASE \
 	_IOW('V', 0x82, struct mt6580_vcodec_buffer)
 
-/* Native privileged hybrid H.264 interface; no legacy ioctl emulation. */
+/* Native privileged hybrid codec interface; no legacy ioctl emulation. */
 #define MT6580_VCODEC_H264_DRIVER 6
+/* MT6580 MPEG4/H263 hybrid encoder, not the software H.264 encoder. */
+#define MT6580_VCODEC_MP4_ENC_DRIVER 1
 #define MT6580_VCODEC_OAL_MAX_REGS 16
 /* mmap2's page offset is 32-bit on ARM. Reserve its upper half for MMIO. */
 #define MT6580_VCODEC_MMAP_REGS (1ULL << 43)
@@ -83,16 +85,17 @@ struct mt6580_vcodec_oal {
 };
 
 /**
- * struct mt6580_vcodec_job - one hybrid H.264 hardware lock/completion
- * @driver_type: must be MT6580_VCODEC_H264_DRIVER
+ * struct mt6580_vcodec_job - one serialized hybrid codec lock/completion
+ * @driver_type: MT6580_VCODEC_H264_DRIVER or MT6580_VCODEC_MP4_ENC_DRIVER
  * @timeout_ms: ACQUIRE lock wait or WAIT completion wait, at most 30000 ms;
  *              0 is a nonblocking check (WAIT returns EAGAIN while pending,
  *              without cancelling); RELEASE requires 0
  * @handle: nonzero per-file context cookie, also matched by WAIT/RELEASE
- * @irq_status: WAIT output raw VDEC IRQ status; input must be 0
+ * @irq_status: WAIT output raw status from the selected engine; input must be 0
  * @reserved: must be 0
  *
- * ACQUIRE enables the real power/clock chain and IRQ, holding a wake source.
+ * ACQUIRE serializes both engines through one shared owner, enables the real
+ * power/clock chain and the selected engine IRQ, holding a wake source.
  * Userspace may then access only its mapped VDEC/MP4-VENC windows. MMIO VMAs
  * themselves do not hold power: accessing them outside an acquired job is
  * forbidden by this privileged interface's caller contract. IRQ completion masks
@@ -124,5 +127,29 @@ struct mt6580_vcodec_job {
 #define MT6580_VCODEC_JOB_RELEASE \
 	_IOW('V', 0x86, struct mt6580_vcodec_job)
 #define MT6580_VCODEC_OAL_UNBIND _IO('V', 0x87)
+
+#define MT6580_VCODEC_CAP_M4U (1U << 0)
+
+/**
+ * struct mt6580_vcodec_caps - read-only native engine and M4U configuration
+ * @driver_mask: bit N indicates native driver_type N, not a video format
+ * @larb1_ports: bit N indicates bound LARB1 port N from the device fwspec
+ * @flags: MT6580_VCODEC_CAP_M4U proves an attached matching ARM DMA/M4U domain
+ * @reserved: output zero
+ *
+ * GET_CAPS ignores the input buffer and only copies these four output words.
+ * It does not configure a port, change a domain, map DMA or power an engine.
+ * Unsupported or absent IOMMU configuration makes the query fail rather than
+ * reporting ports which have not been bound to this device.
+ */
+struct mt6580_vcodec_caps {
+	__u32 driver_mask;
+	__u32 larb1_ports;
+	__u32 flags;
+	__u32 reserved;
+};
+
+#define MT6580_VCODEC_GET_CAPS \
+	_IOR('V', 0x88, struct mt6580_vcodec_caps)
 
 #endif /* _UAPI_LINUX_MT6580_VCODEC_H */

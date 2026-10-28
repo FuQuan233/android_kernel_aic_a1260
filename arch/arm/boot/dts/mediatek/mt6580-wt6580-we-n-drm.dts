@@ -175,13 +175,16 @@
 		compatible = "mediatek,mt6580-vcodec";
 		reg = <0 0x1500b000 0 0x2000>, <0 0x15009000 0 0x1000>;
 		reg-names = "vdec", "mp4-venc";
-		interrupts = <GIC_SPI 137 IRQ_TYPE_LEVEL_LOW>;
+		interrupts = <GIC_SPI 137 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_SPI 138 IRQ_TYPE_LEVEL_LOW>;
 		clocks = <&imgsys CLK_MT6580_IMG_VCODEC>;
 		clock-names = "vcodec";
 		power-domains = <&scpsys MT6580_POWER_DOMAIN_ISP>;
 		iommus = <&m4u M4U_PORT_VENC_BSDMA_VDEC_POST0>,
 			 <&m4u M4U_PORT_VENC_CDMA_VDEC_CDMA>,
-			 <&m4u M4U_PORT_VENC_REC_VDEC_WDMA>;
+			 <&m4u M4U_PORT_VENC_REC_VDEC_WDMA>,
+			 <&m4u M4U_PORT_VENC_MVQP>,
+			 <&m4u M4U_PORT_VENC_MC>;
 	};
 
 	rdma0: rdma@14009000 {

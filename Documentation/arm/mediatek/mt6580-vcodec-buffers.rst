@@ -4,11 +4,13 @@ MT6580 codec buffer bridge
 Scope and ABI
 -------------
 
-This implements buffer preparation for the stock ARM32 decoder. It does not
-create a V4L2/Codec2/OMX media service, program VDEC registers, enable its
-functional gate, or submit decode jobs. The Linux device is deliberately
-/dev/mt6580-vcodec, not a placeholder /dev/Vcodec returning success for
-unimplemented legacy commands. Access requires device-node permission plus CAP_SYS_RAWIO.
+This implements privileged owned buffers and real serialized codec jobs for
+stock ARM32 H.264 decoding and MPEG4/H263 hybrid encoding. Android Codec2
+services and the isolated private binary workers live in the device repository.
+The kernel provides power/clock ownership, bounded MMIO resources, actual IRQ
+completion and abort lifetime protection; it does not implement a generic V4L2
+or legacy OMX service. /dev/mt6580-vcodec never fabricates success for unknown
+/dev/Vcodec commands. Device-node permission plus CAP_SYS_RAWIO is required.
 
 The ioctl structure and field initialization rules are in
 include/uapi/linux/mt6580-vcodec.h. IMPORT uses the DMA-BUF API and validates
@@ -21,10 +23,10 @@ memory remains limited to 64 MiB until the last VMA releases it; coherent
 requests are individually limited to 32 MiB. Failed operations unwind all
 DMA mappings/attachments. A buffer or open fd does not hold ISP powered.
 
-The device node describes the BSP VDEC MISC/VLD two-page window at
-0x1500b000, SPI137 level-low and LARB1 POST0/CDMA/WDMA ports 3/9/10. The
-current driver does not map the MMIO window or request/enable the IRQ.
-The existing CLK_SMI SRAM handshake dependency still applies to ISP.
+The device node declares VDEC at 0x1500b000 (8 KiB), MP4-VENC at 0x15009000
+(4 KiB), SPI137/138 level-low, and the actual LARB1 codec ports 3/7/8/9/10.
+The two engines share one job owner because H.264 also uses the VENC auxiliary
+window. The existing CLK_SMI SRAM-handshake dependency applies to ISP.
 
 ARM32 shared DMA address space
 ------------------------------
@@ -241,3 +243,98 @@ two-FD Mali handle ABI. Logical Y/V/U plane metadata shares one image FD;
 YUV is GPU composed rather than advertised for direct KMS scanout. The device
 repository keeps the source patch and the local private-DSO packaging tool.
 No proprietary decoder library or efuse contents are committed here.
+
+
+Main/High profile and B-frame qualification (#183)
+------------------------------------------------
+
+Real VideoLAN x264 Main/High samples contain CABAC, B frames and (for High)
+8x8 transforms. Independent libavc and FFmpeg agree on the I420 reference.
+The worker bounds SPS parsing, admits only 8-bit 4:2:0 progressive video up to
+1280x720, and handles the High scaling-list syntax without guessing layouts.
+
+The original decoder defaults h264dec.simp_b_frame to a simplified B-frame
+path. The initial Main sample differed in 86 bytes (maximum error 23) in one
+frame; this was not accepted as rounding tolerance. Selecting the original
+simp_b_frame=0 control removed the differences. The private VAL adapter now
+selects only this quality control locally; other property reads retain normal
+system/default behavior and DRVB/devinfo validation is preserved. No global
+quality property is required. This is not a simulated decode or IRQ.
+
+Codec2 must notify a current work's picture immediately, using an INCOMPLETE
+clone followed by its terminal empty work. Merely filling the current work can
+delay B2's callback until after finish() has delivered a later P3 reference
+picture within the same transaction. The corrected callback order is tested
+against the original AU PTS, not coded-input FIFO order.
+
+Main and High each pass 24 frames at 128x96 and at 1280x720: all 96 pictures
+are pixel-exact, display PTS increases correctly, and data/empty EOS, flush and
+stop/reconfigure/start pass. Baseline's 48-frame lifecycle and the eight-frame
+Mali external-texture/GLES readback regression also pass on #183. Evidence is
+vcodec-profiles/*-final.txt, main-small-order-quality.txt, baseline-183.txt and
+surface-183.txt. No interlaced, >8-bit, adaptive-resolution or zero-copy path is
+claimed by these tests.
+
+MPEG4/H263 native engine (#183)
+------------------------------
+
+Native type 1 and type 6 jobs use the same device-wide owner, with immutable
+per-job engine selection and correct-engine ACQUIRE/WAIT/RELEASE checks.
+VENC uses auxiliary status +0x67c, ACK +0x678 written with 1, and enable +0x668;
+it does not use another SoC's AVC encoder +0x5c/+0x60 offsets. IRQ masking and
+lock-external synchronize_irq follow the selected engine. Both paths retain
+the same real ISP OFF proof and quarantine-on-unproven-stop contract.
+
+GET_CAPS is a 16-byte read-only native query. It verifies the actual ARM DMA
+mapping/domain and derives the port mask from this consumer's current IOMMU
+fwspec IDs. The required LARB1 ports must be bound; a changed or missing binding
+is rejected. The private adapter accepts only the recovered nonsecure virtual
+M4U-array configuration and verifies this query, rather than pretending that
+an absent legacy /dev/m4u was configured.
+
+The first MPEG4 native probe produces eight 128x96 frames with eight real VENC
+IRQs; the decoder IRQ does not advance. FFmpeg independently decodes eight
+pictures, with input/output PSNR about 48--51 dB. No timeouts/cancellations,
+faults/power errors or retained buffers remain. See venc-analysis/native-first.txt
+and native-first-quality.json. This alone does not qualify the asynchronous
+encoder worker or the Android encoder components; their later results must be
+recorded separately. The owner's MT6580 AVC encoder selects the original
+software backend, so it is never declared to be hardware AVC encoding.
+
+The asynchronous encoder worker later passes two 200-frame runs, including
+slot reuse and RESET/drain. A five-configuration qualification covers Simple
+Level 0 at 32 kbit/s, Level 6 at 128x96 and 1280x720/30 fps, and H263 QCIF/CIF.
+All forty frames independently decode with their original frame identity.
+The wrapper's public level field is ignored by its backend: a per-instance
+Open adapter invokes the real profile/level controls before Init and verifies
+the generated VOS byte without rewriting the stream. Original OMX evidence
+also establishes frame descriptor word 12 = timestamp high, word 13 = low;
+correcting those words restores increasing MPEG4 VOP timestamps. The backend's
+GetNextBitstream timestamp remains zero, so output association uses the
+qualified no-B FIFO rather than claiming a returned timestamp.
+
+The original FINAL shim passes partly uninitialized input to EncodeOneUnit.
+The worker populates the complete recovered 27-word FINAL input from retained
+and validated buffers/stride/ring state, then invokes the actual backend and
+GetNextBitstream. It does not rely on stale stack data or patch codec code.
+The legacy control adapter releases the last native job record before OAL
+DeInit, preserving the native IRQ synchronization/OFF-proof cancellation path;
+this prevents completed cookies accumulating across instance reconstruction.
+Host-forwarded socket partial-payload failures and the initial FINAL failure
+are retained as failures, separate from complete qualification runs.
+
+Android Codec2 qualification subsequently passes 96 ordinary-shell SDK
+inputImage frames across four configurations (MPEG4 L0/64k, L0/32k,
+L6 1280x720/4M, and H263 QCIF). Every configuration exercises data/empty EOS,
+stop/restart and release/recreate. Independent FFmpeg decoding verifies source
+identity, dimensions, packet PTS and actual MPEG4 levels. Both encoders also
+pass eight real Mali GLES input-Surface frames, with decoded RGB mean errors
+at most 6/255 and 3/255. Vendor-store flexible format descriptors select the
+qualified YV12 CPU buffer path; privileged MMIO remains in separate workers.
+Final store regression passes High720 CABAC/B-frame exact decoding and the
+H264-to-Mali Surface path. Native totals end at 160 jobs/IRQs with zero
+faults/timeouts/cancellations/power errors and zero live buffer ownership.
+Product boot/kernel use #183 and vendor contains the qualified components.
+Sustained throughput/rate-control precision, zero-copy and retained codec
+jobs across deep are not claimed. H263 raw temporal references remain the
+stock backend behavior; use the original C2/container presentation timestamps.

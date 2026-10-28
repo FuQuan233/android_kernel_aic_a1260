@@ -30,13 +30,17 @@ struct legacy_isr { uint32_t handle, handle_size, type, isr_fn,
 struct legacy_tids { uint32_t first, second, count, ids[16]; };
 struct oal_header { uint32_t completed, timeout, count, status; };
 struct oal_status { uint32_t address, value; };
-struct context { struct legacy_tids tids; uintptr_t header; uint32_t handle; };
+struct context {
+	struct legacy_tids tids;
+	uintptr_t header;
+	uint32_t handle, driver_type;
+};
 struct regmap { _Atomic uintptr_t va; _Atomic size_t size; _Atomic uint32_t offset; };
 static pthread_mutex_t control = PTHREAD_MUTEX_INITIALIZER;
 static int legacy_fds[128];
 static struct context contexts[SLOTS];
 static struct regmap registers[SLOTS];
-static unsigned int dec_users;
+static unsigned int dec_users, enc_users;
 static pid_t control_pid;
 static void *(*next_dlopen)(const char *, int);
 static pthread_once_t loader_once = PTHREAD_ONCE_INIT;
@@ -47,6 +51,11 @@ _Static_assert(sizeof(struct legacy_tids) == 76, "tids32");
 __attribute__((constructor)) static void control_init(void)
 {
 	control_pid = getpid();
+}
+static int driver_type_valid(uint32_t type)
+{
+	return type == MT6580_VCODEC_H264_DRIVER ||
+		type == MT6580_VCODEC_MP4_ENC_DRIVER;
 }
 static int raw_ioctl(int fd, unsigned long cmd, void *arg)
 {
@@ -123,6 +132,28 @@ static struct context *thread_context(void)
 			if (contexts[i].tids.ids[j] == tid) return &contexts[i];
 	return NULL;
 }
+/* IRQ completion drops the hardware owner, not its per-file result record.
+ * DeInit must release that record before forgetting the native cookie. A live
+ * job is cancelled by the kernel's normal IRQ synchronization/ISP-OFF path;
+ * an unsafe stop retains its quarantine references independently of this ctx.
+ */
+static int release_context_job(struct context *ctx, int fd)
+{
+	struct mt6580_vcodec_job job = {
+		.driver_type = ctx->driver_type,
+		.handle = ctx->handle,
+	};
+	int rc;
+
+	if (!ctx->handle) return 0;
+	if (!driver_type_valid(ctx->driver_type)) { errno = EINVAL; return -1; }
+	rc = raw_ioctl(fd, MT6580_VCODEC_JOB_RELEASE, &job);
+	/* EALREADY removed a completed record; ENOENT proves it is gone. */
+	if (rc && errno != EALREADY && errno != ENOENT) return rc;
+	ctx->handle = 0;
+	ctx->driver_type = 0;
+	return 0;
+}
 static int bind_oal(struct context *ctx, uintptr_t address)
 {
 	struct mt6580_vcodec_oal bind = {0};
@@ -197,27 +228,44 @@ int ioctl(int fd, int command, ...)
 		for (unsigned int i = 0; i < SLOTS; i++)
 			if (contexts[i].header == (uintptr_t)arg && arg) { ctx = &contexts[i]; break; }
 		if (!ctx) { errno = EINVAL; break; }
+		if (release_context_job(ctx, fd)) break;
 		rc = raw_ioctl(fd, MT6580_VCODEC_OAL_UNBIND, NULL);
 		if (!rc) memset(ctx, 0, sizeof(*ctx));
 		break;
 	case LEGACY(0x0d): {
 		struct legacy_lock *old = arg;
 		struct mt6580_vcodec_job job = {0};
-		if (!ctx || !ctx->header || !old || old->type != 6 || !old->handle) {
+		if (!ctx || !ctx->header || !old || !driver_type_valid(old->type) || !old->handle) {
 			errno = EINVAL; break;
+		}
+		if (ctx->handle && (ctx->handle != old->handle || ctx->driver_type != old->type)) {
+			struct mt6580_vcodec_job previous = {
+				.driver_type = ctx->driver_type,
+				.handle = ctx->handle,
+			};
+			/* Do not overwrite a cookie or cancel an in-flight older job just
+			 * because this context asks for a different lock. */
+			if (raw_ioctl(fd, MT6580_VCODEC_JOB_WAIT, &previous)) {
+				if (errno == EAGAIN) errno = EBUSY;
+				break;
+			}
+			if (release_context_job(ctx, fd)) break;
 		}
 		if (bind_oal(ctx, ctx->header)) break;
 		if (mt6580_bridge_sync(0)) break;
-		job.driver_type = 6; job.timeout_ms = old->timeout; job.handle = old->handle;
+		job.driver_type = old->type; job.timeout_ms = old->timeout; job.handle = old->handle;
 		rc = raw_ioctl(fd, MT6580_VCODEC_JOB_ACQUIRE, &job);
-		if (!rc) ctx->handle = old->handle;
+		if (!rc) {
+			ctx->handle = old->handle;
+			ctx->driver_type = old->type;
+		}
 		break;
 	}
 	case LEGACY(0x0b): {
 		struct legacy_isr *old = arg;
 		struct mt6580_vcodec_job job = {0};
-		if (!ctx || !old || old->type != 6) { errno = EINVAL; break; }
-		job.driver_type = 6; job.timeout_ms = old->timeout; job.handle = old->handle;
+		if (!ctx || !old || !driver_type_valid(old->type)) { errno = EINVAL; break; }
+		job.driver_type = old->type; job.timeout_ms = old->timeout; job.handle = old->handle;
 		/* WAIT may sleep; release the userspace bookkeeping lock for workers. */
 		pthread_mutex_unlock(&control);
 		rc = raw_ioctl(fd, MT6580_VCODEC_JOB_WAIT, &job);
@@ -231,13 +279,25 @@ int ioctl(int fd, int command, ...)
 	case LEGACY(0x33): {
 		struct legacy_lock *old = arg;
 		struct mt6580_vcodec_job job = {0};
-		if (!ctx || !old || old->type != 6) { errno = EINVAL; break; }
-		job.driver_type = 6; job.handle = old->handle;
+		if (!ctx || !old || !driver_type_valid(old->type)) { errno = EINVAL; break; }
+		job.driver_type = old->type; job.handle = old->handle;
 		rc = raw_ioctl(fd, MT6580_VCODEC_JOB_RELEASE, &job);
 		if (rc < 0 && errno == EALREADY) rc = 0;
-		if (!rc) mt6580_bridge_sync(1);
+		if (!rc) {
+			if (ctx->handle == old->handle && ctx->driver_type == old->type) {
+				ctx->handle = 0;
+				ctx->driver_type = 0;
+			}
+			mt6580_bridge_sync(1);
+		}
 		break;
 	}
+	case LEGACY(0x15):
+		if (!arg) { errno = EFAULT; break; }
+		*(uint32_t *)arg = ++enc_users; rc = 0; break;
+	case LEGACY(0x16):
+		if (!arg || !enc_users) { errno = EINVAL; break; }
+		*(uint32_t *)arg = --enc_users; rc = 0; break;
 	case LEGACY(0x17):
 		if (!arg) { errno = EFAULT; break; }
 		*(uint32_t *)arg = ++dec_users; rc = 0; break;
@@ -245,10 +305,10 @@ int ioctl(int fd, int command, ...)
 		if (!arg || !dec_users) { errno = EINVAL; break; }
 		*(uint32_t *)arg = --dec_users; rc = 0; break;
 	case LEGACY(0x27): case LEGACY(0x28):
-		/* BSP's H264 decode power-user commands do not program hardware;
+		/* BSP's codec power-user commands do not program hardware;
 		 * actual power is acquired/released with LOCK/IRQ/WAIT above.
 		 */
-		if (!arg || ((uint32_t *)arg)[2] != 6) { errno = EINVAL; break; }
+		if (!arg || !driver_type_valid(((uint32_t *)arg)[2])) { errno = EINVAL; break; }
 		rc = 0; break;
 	case LEGACY(0x34):
 		__sync_synchronize(); rc = 0; break;
@@ -344,7 +404,8 @@ void *dlopen(const char *path, int flags)
 	if (path && directory && !strncmp(path, "/vendor/lib/", 12)) {
 		const char *name = path + 12;
 		if (!strcmp(name, "libh264dec_xa.ca7.so") || !strcmp(name, "libh264dec_xb.ca7.so") ||
-		    !strcmp(name, "libh264dec_sd.ca7.so") || !strcmp(name, "libpowerhalwrap.so")) {
+		    !strcmp(name, "libh264dec_sd.ca7.so") || !strcmp(name, "libmp4enc_xa.ca7.so") ||
+		    !strcmp(name, "libpowerhalwrap.so")) {
 			int n = snprintf(mapped, sizeof(mapped), "%s/%s", directory, name);
 			if (n < 0 || n >= (int)sizeof(mapped)) { errno = ENAMETOOLONG; return NULL; }
 			fprintf(stderr, "LEGACY_DLOPEN %s\n", mapped);
